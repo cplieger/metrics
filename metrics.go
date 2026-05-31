@@ -157,12 +157,12 @@ func SetImageMetrics(images []ImageMetric) {
 
 // Registry holds a collection of metrics to be served.
 type Registry struct {
-	mu              sync.RWMutex
 	counters        []*Counter
 	gauges          []*Gauge
 	labeledCounters []*LabeledCounter
-	histograms      []*Histogram
 	prefix          string
+	histograms      []*Histogram
+	mu              sync.RWMutex
 	showImages      bool
 }
 
