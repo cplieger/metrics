@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// OpenMetrics content type per the specification.
+// OpenMetricsContentType is the content type per the OpenMetrics specification.
 const OpenMetricsContentType = "application/openmetrics-text; version=1.0.0; charset=utf-8"
 
 // NegotiateHandler returns an HTTP handler that performs content negotiation.
@@ -55,11 +55,7 @@ func (r *Registry) serveOpenMetrics(w http.ResponseWriter) {
 	for _, lh := range r.labeledHistograms {
 		writeOMLabeledHistogram(&b, lh)
 	}
-	showImages := r.showImages
 	r.mu.RUnlock()
-	if showImages {
-		writeOMImageMetrics(&b, r.prefix)
-	}
 	writeOMProcessMetrics(&b, r.startTime)
 	b.WriteString("# EOF\n")
 	_, _ = w.Write([]byte(b.String()))
@@ -67,7 +63,6 @@ func (r *Registry) serveOpenMetrics(w http.ResponseWriter) {
 
 // acceptsOpenMetrics checks if the Accept header prefers OpenMetrics over Prometheus text.
 func acceptsOpenMetrics(accept string) bool {
-	// Simple but correct: if the accept header contains "application/openmetrics-text", prefer it.
 	return strings.Contains(accept, "application/openmetrics-text")
 }
 
@@ -157,6 +152,9 @@ func writeOMLabeledGauge(b *strings.Builder, lg *LabeledGauge) {
 		lg.mu.RLock()
 		ptr := lg.vals[key]
 		lg.mu.RUnlock()
+		if ptr == nil {
+			continue
+		}
 		v := math.Float64frombits(ptr.Load())
 		labelStr := buildLabelString(lg.labels, key)
 		fmt.Fprintf(b, "%s{%s} %s\n", lg.name, labelStr, omFormatFloat(v))
@@ -205,75 +203,26 @@ func writeOMLabeledHistogram(b *strings.Builder, lh *LabeledHistogram) {
 	}
 }
 
-func writeOMImageMetrics(b *strings.Builder, prefix string) {
-	imageMetricsMu.RLock()
-	imgs := imageMetrics
-	imageMetricsMu.RUnlock()
-	if len(imgs) == 0 {
-		return
-	}
-	pullsName := prefix + "_image_pulls_total"
-	fmt.Fprintf(b, "# TYPE %s gauge\n", pullsName)
-	fmt.Fprintf(b, "# HELP %s %s\n", pullsName, helpEscaper.Replace("Total pull count per image"))
-	for _, m := range imgs {
-		var lb strings.Builder
-		lb.WriteString("registry=\"")
-		_, _ = labelEscaper.WriteString(&lb, m.Registry)
-		lb.WriteString("\",owner=\"")
-		_, _ = labelEscaper.WriteString(&lb, m.Owner)
-		lb.WriteString("\",repo=\"")
-		_, _ = labelEscaper.WriteString(&lb, m.Repo)
-		lb.WriteByte('"')
-		fmt.Fprintf(b, "%s{%s} %d.0\n", pullsName, lb.String(), m.Pulls)
-	}
-	hasTags := false
-	for _, m := range imgs {
-		if m.Tags > 0 {
-			hasTags = true
-			break
-		}
-	}
-	if hasTags {
-		tagsName := prefix + "_image_tags"
-		fmt.Fprintf(b, "# TYPE %s gauge\n", tagsName)
-		fmt.Fprintf(b, "# HELP %s %s\n", tagsName, helpEscaper.Replace("Number of tags per image"))
-		for _, m := range imgs {
-			if m.Tags <= 0 {
-				continue
-			}
-			var lb strings.Builder
-			lb.WriteString("registry=\"")
-			_, _ = labelEscaper.WriteString(&lb, m.Registry)
-			lb.WriteString("\",owner=\"")
-			_, _ = labelEscaper.WriteString(&lb, m.Owner)
-			lb.WriteString("\",repo=\"")
-			_, _ = labelEscaper.WriteString(&lb, m.Repo)
-			lb.WriteByte('"')
-			fmt.Fprintf(b, "%s{%s} %d.0\n", tagsName, lb.String(), m.Tags)
-		}
-	}
-}
-
 func writeOMProcessMetrics(b *strings.Builder, startTime time.Time) {
-	var m2 = new(processMetricsData)
-	collectProcessMetrics(m2, startTime)
+	var d processMetricsData
+	collectProcessMetrics(&d, startTime)
 
-	fmt.Fprintf(b, "# TYPE process_goroutines gauge\n# HELP process_goroutines Number of goroutines\nprocess_goroutines %d.0\n", m2.goroutines)
-	fmt.Fprintf(b, "# TYPE process_heap_bytes gauge\n# HELP process_heap_bytes Heap memory in use\nprocess_heap_bytes %d.0\n", m2.heapAlloc)
-	fmt.Fprintf(b, "# TYPE process_gc_pause_seconds counter\n# HELP process_gc_pause_seconds Total GC pause time\nprocess_gc_pause_seconds_total %s\n", omFormatFloat(m2.gcPause))
-	fmt.Fprintf(b, "# TYPE process_uptime_seconds gauge\n# HELP process_uptime_seconds Process uptime\nprocess_uptime_seconds %s\n", omFormatFloat(m2.uptime))
+	fmt.Fprintf(b, "# TYPE process_goroutines gauge\n# HELP process_goroutines Number of goroutines\nprocess_goroutines %d.0\n", d.goroutines)
+	fmt.Fprintf(b, "# TYPE process_heap_bytes gauge\n# HELP process_heap_bytes Heap memory in use\nprocess_heap_bytes %d.0\n", d.heapAlloc)
+	fmt.Fprintf(b, "# TYPE process_gc_pause_seconds counter\n# HELP process_gc_pause_seconds Total GC pause time\nprocess_gc_pause_seconds_total %s\n", omFormatFloat(d.gcPause))
+	fmt.Fprintf(b, "# TYPE process_uptime_seconds gauge\n# HELP process_uptime_seconds Process uptime\nprocess_uptime_seconds %s\n", omFormatFloat(d.uptime))
 	fmt.Fprintf(b, "# TYPE process_start_time_seconds gauge\n# HELP process_start_time_seconds Start time of the process since unix epoch in seconds\nprocess_start_time_seconds %s\n", omFormatFloat(processStartTime))
 
-	if m2.cpuSeconds >= 0 {
-		fmt.Fprintf(b, "# TYPE process_cpu_seconds counter\n# HELP process_cpu_seconds Total user and system CPU time spent in seconds\nprocess_cpu_seconds_total %s\n", omFormatFloat(m2.cpuSeconds))
+	if d.cpuSeconds >= 0 {
+		fmt.Fprintf(b, "# TYPE process_cpu_seconds counter\n# HELP process_cpu_seconds Total user and system CPU time spent in seconds\nprocess_cpu_seconds_total %s\n", omFormatFloat(d.cpuSeconds))
 	}
-	if m2.rss > 0 {
-		fmt.Fprintf(b, "# TYPE process_resident_memory_bytes gauge\n# HELP process_resident_memory_bytes Resident memory size in bytes\nprocess_resident_memory_bytes %d.0\n", m2.rss)
+	if d.rss > 0 {
+		fmt.Fprintf(b, "# TYPE process_resident_memory_bytes gauge\n# HELP process_resident_memory_bytes Resident memory size in bytes\nprocess_resident_memory_bytes %d.0\n", d.rss)
 	}
-	if m2.openFDs >= 0 {
-		fmt.Fprintf(b, "# TYPE process_open_fds gauge\n# HELP process_open_fds Number of open file descriptors\nprocess_open_fds %d.0\n", m2.openFDs)
-		if m2.maxFDs > 0 {
-			fmt.Fprintf(b, "# TYPE process_max_fds gauge\n# HELP process_max_fds Maximum number of open file descriptors\nprocess_max_fds %d.0\n", m2.maxFDs)
+	if d.openFDs >= 0 {
+		fmt.Fprintf(b, "# TYPE process_open_fds gauge\n# HELP process_open_fds Number of open file descriptors\nprocess_open_fds %d.0\n", d.openFDs)
+		if d.maxFDs > 0 {
+			fmt.Fprintf(b, "# TYPE process_max_fds gauge\n# HELP process_max_fds Maximum number of open file descriptors\nprocess_max_fds %d.0\n", d.maxFDs)
 		}
 	}
 }

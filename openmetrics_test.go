@@ -278,27 +278,6 @@ func TestOpenMetricsHandler_LabeledHistogram(t *testing.T) {
 	}
 }
 
-func TestOpenMetricsHandler_ImageMetrics(t *testing.T) {
-	SetImageMetrics([]ImageMetric{
-		{Registry: "dockerhub", Owner: "lib", Repo: "nginx", Pulls: 100, Tags: 5},
-	})
-	defer SetImageMetrics(nil)
-
-	r := NewRegistry("app")
-	r.EnableImageMetrics()
-	handler := r.OpenMetricsHandler()
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-
-	body := rec.Body.String()
-	if !strings.Contains(body, "# TYPE app_image_pulls_total gauge") {
-		t.Errorf("missing image pulls TYPE: %s", body)
-	}
-	if !strings.Contains(body, `app_image_pulls_total{registry="dockerhub",owner="lib",repo="nginx"} 100.0`) {
-		t.Errorf("missing image pulls value: %s", body)
-	}
-}
-
 func TestOMFormatFloat(t *testing.T) {
 	tests := []struct {
 		in   float64

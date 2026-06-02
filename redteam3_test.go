@@ -519,25 +519,6 @@ func TestReservedSuffix_LabeledCounterNamedTotal_OpenMetrics(t *testing.T) {
 
 // --- Attack surface 7: Image metrics with special chars in labels ---
 
-func TestImageMetrics_SpecialCharsInLabels(t *testing.T) {
-	SetImageMetrics([]ImageMetric{
-		{Registry: "docker\"hub", Owner: "user\\name", Repo: "app\nnewline", Pulls: 1, Tags: 1},
-	})
-	defer SetImageMetrics(nil)
-
-	var b strings.Builder
-	WriteImageMetrics(&b, "test")
-	out := b.String()
-
-	// Must escape quotes, backslashes, newlines in label values
-	if strings.Contains(out, "docker\"hub") && !strings.Contains(out, `docker\"hub`) {
-		t.Errorf("unescaped quote in image label: %s", out)
-	}
-	if !strings.Contains(out, `user\\name`) {
-		t.Errorf("unescaped backslash in image label: %s", out)
-	}
-}
-
 // --- Attack surface 8: Validate metric name edge cases ---
 
 func TestValidateMetricName_Panics(t *testing.T) {

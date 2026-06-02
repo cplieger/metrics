@@ -18,7 +18,6 @@
 package metrics
 
 import (
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -28,27 +27,6 @@ import (
 
 // helpEscaper escapes backslashes and newlines in HELP text per Prometheus exposition format.
 var helpEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`)
-
-// ImageMetric holds per-image gauge data set after each collect cycle.
-type ImageMetric struct {
-	Registry string
-	Owner    string
-	Repo     string
-	Pulls    int64
-	Tags     int
-}
-
-var (
-	imageMetricsMu sync.RWMutex
-	imageMetrics   []ImageMetric
-)
-
-// SetImageMetrics replaces the current image gauge data atomically.
-func SetImageMetrics(images []ImageMetric) {
-	imageMetricsMu.Lock()
-	imageMetrics = images
-	imageMetricsMu.Unlock()
-}
 
 // Registry holds a collection of metrics to be served.
 type Registry struct {
@@ -61,7 +39,6 @@ type Registry struct {
 	histograms        []*Histogram
 	labeledHistograms []*LabeledHistogram
 	mu                sync.RWMutex
-	showImages        bool
 }
 
 // NewRegistry creates a new metrics registry.
@@ -111,9 +88,6 @@ func (r *Registry) RegisterLabeledHistogram(lh *LabeledHistogram) {
 	r.mu.Unlock()
 }
 
-// EnableImageMetrics enables image metric output.
-func (r *Registry) EnableImageMetrics() { r.mu.Lock(); r.showImages = true; r.mu.Unlock() }
-
 // Handler returns an HTTP handler serving Prometheus text format.
 func (r *Registry) Handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
@@ -138,61 +112,9 @@ func (r *Registry) Handler() http.HandlerFunc {
 		for _, lh := range r.labeledHistograms {
 			WriteLabeledHistogram(&b, lh)
 		}
-		showImages := r.showImages
 		r.mu.RUnlock()
-		if showImages {
-			WriteImageMetrics(&b, r.prefix)
-		}
 		WriteProcessMetrics(&b, r.startTime)
 		_, _ = w.Write([]byte(b.String()))
-	}
-}
-
-// WriteImageMetrics writes image gauge metrics in Prometheus text format.
-func WriteImageMetrics(b *strings.Builder, prefix string) {
-	imageMetricsMu.RLock()
-	imgs := imageMetrics
-	imageMetricsMu.RUnlock()
-	if len(imgs) == 0 {
-		return
-	}
-	pullsName := prefix + "_image_pulls_total"
-	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n", pullsName, helpEscaper.Replace("Total pull count per image"), pullsName)
-	for _, m := range imgs {
-		var lb strings.Builder
-		lb.WriteString("registry=\"")
-		_, _ = labelEscaper.WriteString(&lb, m.Registry)
-		lb.WriteString("\",owner=\"")
-		_, _ = labelEscaper.WriteString(&lb, m.Owner)
-		lb.WriteString("\",repo=\"")
-		_, _ = labelEscaper.WriteString(&lb, m.Repo)
-		lb.WriteByte('"')
-		fmt.Fprintf(b, "%s{%s} %d\n", pullsName, lb.String(), m.Pulls)
-	}
-	hasTags := false
-	for _, m := range imgs {
-		if m.Tags > 0 {
-			hasTags = true
-			break
-		}
-	}
-	if hasTags {
-		tagsName := prefix + "_image_tags"
-		fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n", tagsName, helpEscaper.Replace("Number of tags per image"), tagsName)
-		for _, m := range imgs {
-			if m.Tags <= 0 {
-				continue
-			}
-			var lb strings.Builder
-			lb.WriteString("registry=\"")
-			_, _ = labelEscaper.WriteString(&lb, m.Registry)
-			lb.WriteString("\",owner=\"")
-			_, _ = labelEscaper.WriteString(&lb, m.Owner)
-			lb.WriteString("\",repo=\"")
-			_, _ = labelEscaper.WriteString(&lb, m.Repo)
-			lb.WriteByte('"')
-			fmt.Fprintf(b, "%s{%s} %d\n", tagsName, lb.String(), m.Tags)
-		}
 	}
 }
 

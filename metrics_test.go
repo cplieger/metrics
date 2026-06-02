@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -275,32 +276,6 @@ func TestHistogramCustomBuckets(t *testing.T) {
 	}
 }
 
-func TestImageMetrics(t *testing.T) {
-	SetImageMetrics(nil)
-	var b strings.Builder
-	WriteImageMetrics(&b, "test")
-	if b.Len() != 0 {
-		t.Error("expected empty output for nil images")
-	}
-	SetImageMetrics([]ImageMetric{
-		{Registry: "dockerhub", Owner: "lib", Repo: "nginx", Pulls: 1000, Tags: 5},
-		{Registry: "ghcr", Owner: "user", Repo: "app", Pulls: 50, Tags: 0},
-	})
-	b.Reset()
-	WriteImageMetrics(&b, "test")
-	out := b.String()
-	if !strings.Contains(out, "test_image_pulls_total") {
-		t.Error("missing image_pulls_total")
-	}
-	if !strings.Contains(out, "test_image_tags") {
-		t.Error("missing image_tags")
-	}
-	if !strings.Contains(out, `registry="dockerhub"`) {
-		t.Error("missing dockerhub label")
-	}
-	SetImageMetrics(nil)
-}
-
 func TestWriteProcessMetrics(t *testing.T) {
 	var b strings.Builder
 	WriteProcessMetrics(&b, time.Now().Add(-5*time.Second))
@@ -450,33 +425,6 @@ func TestWriteGaugeFormat(t *testing.T) {
 	}
 }
 
-func TestWriteImageMetricsFormat(t *testing.T) {
-	SetImageMetrics([]ImageMetric{
-		{Registry: "dockerhub", Owner: "library", Repo: "nginx", Pulls: 5000, Tags: 10},
-		{Registry: "ghcr", Owner: "user", Repo: "app", Pulls: 200, Tags: 3},
-	})
-	defer SetImageMetrics(nil)
-
-	var b strings.Builder
-	WriteImageMetrics(&b, "myapp")
-	out := b.String()
-
-	for _, want := range []string{
-		"# HELP myapp_image_pulls_total Total pull count per image",
-		"# TYPE myapp_image_pulls_total gauge",
-		`myapp_image_pulls_total{registry="dockerhub",owner="library",repo="nginx"} 5000`,
-		`myapp_image_pulls_total{registry="ghcr",owner="user",repo="app"} 200`,
-		"# HELP myapp_image_tags Number of tags per image",
-		"# TYPE myapp_image_tags gauge",
-		`myapp_image_tags{registry="dockerhub",owner="library",repo="nginx"} 10`,
-		`myapp_image_tags{registry="ghcr",owner="user",repo="app"} 3`,
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("output missing %q\ngot: %s", want, out)
-		}
-	}
-}
-
 func TestWriteCounter_escapes_help(t *testing.T) {
 	c := NewCounter("esc_counter", "line1\\line2\nline3")
 	c.Inc()
@@ -498,7 +446,6 @@ func TestLabelValueEscaping(t *testing.T) {
 	WriteLabeledCounter(&b, lc)
 	out := b.String()
 
-	// Must use \\ for backslash, not Go's %q which would produce other escapes
 	if !strings.Contains(out, `path="C:\\DIR\\FILE.TXT"`) {
 		t.Errorf("label value not escaped correctly: %s", out)
 	}
@@ -629,6 +576,78 @@ func TestLabeledGauge(t *testing.T) {
 	}
 }
 
+func TestLabeledGauge_Reset(t *testing.T) {
+	lg := NewLabeledGauge("lg_reset", "test", []string{"host"})
+	lg.Set(1, "a")
+	lg.Set(2, "b")
+	lg.Reset()
+
+	var b strings.Builder
+	WriteLabeledGauge(&b, lg)
+	if b.Len() != 0 {
+		t.Errorf("expected empty output after Reset, got: %s", b.String())
+	}
+}
+
+func TestLabeledGauge_Delete(t *testing.T) {
+	lg := NewLabeledGauge("lg_delete", "test", []string{"host"})
+	lg.Set(1, "a")
+	lg.Set(2, "b")
+	lg.Delete("a")
+
+	var b strings.Builder
+	WriteLabeledGauge(&b, lg)
+	out := b.String()
+	if strings.Contains(out, `host="a"`) {
+		t.Errorf("deleted key still present: %s", out)
+	}
+	if !strings.Contains(out, `host="b"`) {
+		t.Errorf("remaining key missing: %s", out)
+	}
+}
+
+func TestLabeledGauge_DeleteArityPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for arity mismatch")
+		}
+	}()
+	lg := NewLabeledGauge("lg_del_panic", "test", []string{"a", "b"})
+	lg.Delete("only_one")
+}
+
+func TestLabeledGauge_ResetConcurrent(t *testing.T) {
+	lg := NewLabeledGauge("lg_conc_reset", "test", []string{"id"})
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Go(func() {
+			for j := range 20 {
+				lg.Set(float64(j), strconv.Itoa(i))
+			}
+		})
+	}
+	// Concurrent resets
+	for range 10 {
+		wg.Go(func() {
+			lg.Reset()
+		})
+	}
+	wg.Wait()
+}
+
+func TestLabeledGauge_DeleteConcurrent(t *testing.T) {
+	lg := NewLabeledGauge("lg_conc_del", "test", []string{"id"})
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Go(func() {
+			key := strconv.Itoa(i)
+			lg.Set(float64(i), key)
+			lg.Delete(key)
+		})
+	}
+	wg.Wait()
+}
+
 func FuzzHistogramObserve(f *testing.F) {
 	f.Add(0.001)
 	f.Add(0.5)
@@ -664,6 +683,66 @@ func FuzzHistogramObserve(f *testing.F) {
 				t.Errorf("bucket[%d] count %d < prev %d", i, cur, prev)
 			}
 			prev = cur
+		}
+	})
+}
+
+func FuzzLabelValueExposition(f *testing.F) {
+	f.Add("simple")
+	f.Add("with\"quote")
+	f.Add("with\\backslash")
+	f.Add("with\nnewline")
+	f.Add("null\x00byte")
+	f.Add("emoji🎉")
+	f.Add("")
+	f.Add(strings.Repeat("x", 500))
+
+	f.Fuzz(func(t *testing.T, val string) {
+		r := NewRegistry("fuzz")
+		lc := NewLabeledCounter("fuzz_counter", "fuzz help", []string{"v"})
+		lg := NewLabeledGauge("fuzz_gauge", "fuzz help", []string{"v"})
+		r.RegisterLabeledCounter(lc)
+		r.RegisterLabeledGauge(lg)
+		lc.Inc(val)
+		lg.Set(1.0, val)
+
+		// Prometheus format
+		var b strings.Builder
+		WriteLabeledCounter(&b, lc)
+		out := b.String()
+		// Must not contain raw unescaped newlines inside a label value line
+		for line := range strings.SplitSeq(out, "\n") {
+			if strings.HasPrefix(line, "#") || line == "" {
+				continue
+			}
+			// Each non-comment sample line must be parseable: metric{labels} value
+			if !strings.Contains(line, "{") {
+				continue
+			}
+			// Verify we can find closing brace after opening brace
+			braceOpen := strings.Index(line, "{")
+			braceClose := strings.LastIndex(line, "}")
+			if braceOpen >= 0 && braceClose < braceOpen {
+				t.Errorf("malformed label section: %s", line)
+			}
+		}
+
+		// OpenMetrics format
+		b.Reset()
+		writeOMLabeledGauge(&b, lg)
+		omOut := b.String()
+		for line := range strings.SplitSeq(omOut, "\n") {
+			if strings.HasPrefix(line, "#") || line == "" {
+				continue
+			}
+			if !strings.Contains(line, "{") {
+				continue
+			}
+			braceOpen := strings.Index(line, "{")
+			braceClose := strings.LastIndex(line, "}")
+			if braceOpen >= 0 && braceClose < braceOpen {
+				t.Errorf("malformed OM label section: %s", line)
+			}
 		}
 	})
 }

@@ -109,6 +109,26 @@ func (lg *LabeledGauge) Set(v float64, labelVals ...string) {
 	lg.mu.Unlock()
 }
 
+// Reset removes all label combinations from the gauge.
+func (lg *LabeledGauge) Reset() {
+	lg.mu.Lock()
+	lg.vals = make(map[labelKey]*atomic.Uint64)
+	lg.mu.Unlock()
+}
+
+// Delete removes a single label combination from the gauge.
+// It panics if the number of label values does not match the label count.
+func (lg *LabeledGauge) Delete(labelVals ...string) {
+	if len(labelVals) != len(lg.labels) {
+		panic("metrics: label arity mismatch")
+	}
+	var key labelKey
+	copy(key[:], labelVals)
+	lg.mu.Lock()
+	delete(lg.vals, key)
+	lg.mu.Unlock()
+}
+
 // WriteLabeledGauge writes a labeled gauge in Prometheus text format.
 func WriteLabeledGauge(b *strings.Builder, lg *LabeledGauge) {
 	lg.mu.RLock()
@@ -133,6 +153,9 @@ func WriteLabeledGauge(b *strings.Builder, lg *LabeledGauge) {
 		lg.mu.RLock()
 		ptr := lg.vals[key]
 		lg.mu.RUnlock()
+		if ptr == nil {
+			continue
+		}
 		v := math.Float64frombits(ptr.Load())
 		labelStr := buildLabelString(lg.labels, key)
 		if v == float64(int64(v)) && !math.IsInf(v, 0) && !math.IsNaN(v) {
