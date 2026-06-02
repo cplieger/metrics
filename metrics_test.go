@@ -4,8 +4,11 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func BenchmarkHistogramObserve(b *testing.B) {
@@ -63,20 +66,20 @@ func TestRegistryHandler(t *testing.T) {
 	r := NewRegistry("test")
 
 	httpReqs := NewLabeledCounter("test_http_requests_total", "Total HTTP requests", []string{"method", "path", "status"})
-	sseClients := NewGauge("test_sse_clients", "Current SSE client count")
-	spawns := NewCounter("test_bridge_spawns_total", "Total bridge spawns")
-	pushSends := NewCounter("test_push_sends_total", "Total push notification sends")
+	activeConns := NewGauge("test_active_connections", "Active connection count")
+	tasks := NewCounter("test_tasks_total", "Total tasks")
+	events := NewCounter("test_events_total", "Total events")
 	httpDur := NewHistogram("test_http_request_duration_seconds", "HTTP request latency")
 
 	r.RegisterLabeledCounter(httpReqs)
-	r.RegisterGauge(sseClients)
-	r.RegisterCounter(spawns)
-	r.RegisterCounter(pushSends)
+	r.RegisterGauge(activeConns)
+	r.RegisterCounter(tasks)
+	r.RegisterCounter(events)
 	r.RegisterHistogram(httpDur)
 
 	httpReqs.Inc("GET", "/api", "200")
 	httpDur.Observe(0.05)
-	spawns.Inc()
+	tasks.Inc()
 
 	h := r.Handler()
 	rec := httptest.NewRecorder()
@@ -92,9 +95,9 @@ func TestRegistryHandler(t *testing.T) {
 	}
 	for _, want := range []string{
 		"test_http_request_duration_seconds",
-		"test_bridge_spawns_total",
-		"test_push_sends_total",
-		"test_sse_clients",
+		"test_tasks_total",
+		"test_events_total",
+		"test_active_connections",
 		"process_goroutines",
 		"process_heap_bytes",
 		"process_uptime_seconds",
@@ -115,14 +118,14 @@ func BenchmarkRegistryHandler(b *testing.B) {
 	r := NewRegistry("bench")
 	httpReqs := NewLabeledCounter("bench_http_requests_total", "Total HTTP requests", []string{"method", "path", "status"})
 	httpDur := NewHistogram("bench_http_request_duration_seconds", "HTTP request latency")
-	spawns := NewCounter("bench_bridge_spawns_total", "Total bridge spawns")
+	tasks := NewCounter("bench_tasks_total", "Total tasks")
 	r.RegisterLabeledCounter(httpReqs)
 	r.RegisterHistogram(httpDur)
-	r.RegisterCounter(spawns)
+	r.RegisterCounter(tasks)
 
 	httpReqs.Inc("GET", "/api", "200")
 	httpDur.Observe(0.05)
-	spawns.Inc()
+	tasks.Inc()
 
 	h := r.Handler()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
@@ -143,13 +146,56 @@ func TestCounterInc(t *testing.T) {
 	}
 }
 
+func TestCounterAdd(t *testing.T) {
+	c := NewCounter("test_counter_add", "test")
+	c.Add(5)
+	c.Add(3)
+	if got := c.val.Load(); got != 8 {
+		t.Errorf("Counter.Add() = %d, want 8", got)
+	}
+}
+
+func TestCounterAddNegativePanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for negative Add")
+		}
+	}()
+	c := NewCounter("test_counter_neg", "test")
+	c.Add(-1)
+}
+
+func TestGaugeFloat64(t *testing.T) {
+	g := NewGauge("test_gauge_f64", "test")
+	g.Set(3.14)
+	if got := g.Get(); math.Abs(got-3.14) > 0.001 {
+		t.Errorf("Gauge.Set(3.14) = %f", got)
+	}
+	g.Inc()
+	if got := g.Get(); math.Abs(got-4.14) > 0.001 {
+		t.Errorf("Gauge after Inc = %f", got)
+	}
+	g.Dec()
+	if got := g.Get(); math.Abs(got-3.14) > 0.001 {
+		t.Errorf("Gauge after Dec = %f", got)
+	}
+	g.Add(1.5)
+	if got := g.Get(); math.Abs(got-4.64) > 0.001 {
+		t.Errorf("Gauge after Add = %f", got)
+	}
+	g.Sub(0.64)
+	if got := g.Get(); math.Abs(got-4.0) > 0.001 {
+		t.Errorf("Gauge after Sub = %f", got)
+	}
+}
+
 func TestGaugeIncDec(t *testing.T) {
 	g := NewGauge("test_gauge", "test")
 	g.Inc()
 	g.Inc()
 	g.Dec()
-	if got := g.val.Load(); got != 1 {
-		t.Errorf("Gauge = %d, want 1", got)
+	if got := g.Get(); got != 1 {
+		t.Errorf("Gauge = %f, want 1", got)
 	}
 }
 
@@ -169,6 +215,25 @@ func TestLabeledCounterInc(t *testing.T) {
 	}
 }
 
+func TestLabeledCounterArityPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for arity mismatch")
+		}
+	}()
+	lc := NewLabeledCounter("test_lc_arity", "test", []string{"method", "status"})
+	lc.Inc("GET") // wrong arity
+}
+
+func TestLabeledCounterTooManyLabelsPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for >4 labels")
+		}
+	}()
+	NewLabeledCounter("test_lc_many", "test", []string{"a", "b", "c", "d", "e"})
+}
+
 func TestHistogramObserve(t *testing.T) {
 	h := NewHistogram("test_hist", "test")
 	h.Observe(0.003) // <= 0.005
@@ -182,57 +247,45 @@ func TestHistogramObserve(t *testing.T) {
 	if math.Abs(sum-2.053) > 0.0001 {
 		t.Errorf("Histogram.sum = %f, want ~2.053", sum)
 	}
-	// bucket[0] (<=0.005) should have 1
 	if got := h.buckets[0].Load(); got != 1 {
 		t.Errorf("bucket[0] = %d, want 1", got)
 	}
-	// +Inf bucket should have 3
-	if got := h.buckets[len(DefaultBuckets)].Load(); got != 3 {
+	if got := h.buckets[len(h.bounds)].Load(); got != 3 {
 		t.Errorf("bucket[+Inf] = %d, want 3", got)
 	}
 }
 
-func TestImageMetrics(t *testing.T) {
-	// Reset global state
-	SetImageMetrics(nil)
+func TestHistogramCustomBuckets(t *testing.T) {
+	h := NewHistogram("test_custom_hist", "test", WithBuckets([]float64{1, 5, 10}))
+	h.Observe(0.5)
+	h.Observe(3)
+	h.Observe(7)
+	h.Observe(20)
 
-	var b strings.Builder
-	WriteImageMetrics(&b, "test")
-	if b.Len() != 0 {
-		t.Error("expected empty output for nil images")
+	if got := h.buckets[0].Load(); got != 1 {
+		t.Errorf("bucket[<=1] = %d, want 1", got)
 	}
-
-	SetImageMetrics([]ImageMetric{
-		{Registry: "dockerhub", Owner: "lib", Repo: "nginx", Pulls: 1000, Tags: 5},
-		{Registry: "ghcr", Owner: "user", Repo: "app", Pulls: 50, Tags: 0},
-	})
-
-	b.Reset()
-	WriteImageMetrics(&b, "test")
-	out := b.String()
-	if !strings.Contains(out, "test_image_pulls_total") {
-		t.Error("missing image_pulls_total")
+	if got := h.buckets[1].Load(); got != 2 {
+		t.Errorf("bucket[<=5] = %d, want 2", got)
 	}
-	if !strings.Contains(out, "test_image_tags") {
-		t.Error("missing image_tags")
+	if got := h.buckets[2].Load(); got != 3 {
+		t.Errorf("bucket[<=10] = %d, want 3", got)
 	}
-	if !strings.Contains(out, `registry="dockerhub"`) {
-		t.Error("missing dockerhub label")
+	if got := h.buckets[3].Load(); got != 4 {
+		t.Errorf("bucket[+Inf] = %d, want 4", got)
 	}
-
-	// Clean up
-	SetImageMetrics(nil)
 }
 
 func TestWriteProcessMetrics(t *testing.T) {
 	var b strings.Builder
-	WriteProcessMetrics(&b)
+	WriteProcessMetrics(&b, time.Now().Add(-5*time.Second))
 	out := b.String()
 	for _, want := range []string{
 		"process_goroutines",
 		"process_heap_bytes",
 		"process_gc_pause_seconds_total",
 		"process_uptime_seconds",
+		"process_start_time_seconds",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("WriteProcessMetrics missing %q", want)
@@ -300,8 +353,6 @@ func TestWriteLabeledCounterSorted(t *testing.T) {
 	var b strings.Builder
 	WriteLabeledCounter(&b, lc)
 	out := b.String()
-
-	// Labels within each line should be sorted alphabetically
 	if !strings.Contains(out, `method="GET",path="/a",status="200"`) {
 		t.Errorf("labels not sorted: %s", out)
 	}
@@ -330,6 +381,271 @@ func TestWriteHistogramFormat(t *testing.T) {
 	if !strings.Contains(out, "fmt_hist_count 1") {
 		t.Error("missing _count line")
 	}
+}
+
+func TestWriteCounterFormat(t *testing.T) {
+	c := NewCounter("http_requests_total", "Total HTTP requests")
+	c.Inc()
+	c.Inc()
+	c.Inc()
+
+	var b strings.Builder
+	WriteCounter(&b, c)
+	out := b.String()
+
+	if !strings.Contains(out, "# HELP http_requests_total Total HTTP requests") {
+		t.Error("missing HELP line")
+	}
+	if !strings.Contains(out, "# TYPE http_requests_total counter") {
+		t.Error("missing TYPE line")
+	}
+	if !strings.Contains(out, "http_requests_total 3") {
+		t.Errorf("missing counter value: %s", out)
+	}
+}
+
+func TestWriteGaugeFormat(t *testing.T) {
+	g := NewGauge("active_connections", "Active connection count")
+	g.Inc()
+	g.Inc()
+	g.Dec()
+
+	var b strings.Builder
+	WriteGauge(&b, g)
+	out := b.String()
+
+	if !strings.Contains(out, "# HELP active_connections Active connection count") {
+		t.Error("missing HELP line")
+	}
+	if !strings.Contains(out, "# TYPE active_connections gauge") {
+		t.Error("missing TYPE line")
+	}
+	if !strings.Contains(out, "active_connections 1") {
+		t.Errorf("missing gauge value: %s", out)
+	}
+}
+
+func TestWriteCounter_escapes_help(t *testing.T) {
+	c := NewCounter("esc_counter", "line1\\line2\nline3")
+	c.Inc()
+
+	var b strings.Builder
+	WriteCounter(&b, c)
+	out := b.String()
+
+	if !strings.Contains(out, `# HELP esc_counter line1\\line2\nline3`) {
+		t.Errorf("HELP not escaped correctly: %s", out)
+	}
+}
+
+func TestLabelValueEscaping(t *testing.T) {
+	lc := NewLabeledCounter("esc_lc", "test", []string{"path"})
+	lc.Inc("C:\\DIR\\FILE.TXT")
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	out := b.String()
+
+	if !strings.Contains(out, `path="C:\\DIR\\FILE.TXT"`) {
+		t.Errorf("label value not escaped correctly: %s", out)
+	}
+}
+
+func TestLabelValueEscapingNewlineAndQuote(t *testing.T) {
+	lc := NewLabeledCounter("esc_lc2", "test", []string{"msg"})
+	lc.Inc("hello\n\"world\"")
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	out := b.String()
+
+	if !strings.Contains(out, `msg="hello\n\"world\""`) {
+		t.Errorf("label escaping wrong: %s", out)
+	}
+}
+
+func TestLabelValueTabNotOverEscaped(t *testing.T) {
+	lc := NewLabeledCounter("esc_lc3", "test", []string{"msg"})
+	lc.Inc("a\tb") // tab should NOT be escaped
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	out := b.String()
+
+	if !strings.Contains(out, "msg=\"a\tb\"") {
+		t.Errorf("tab should pass through unescaped: %s", out)
+	}
+}
+
+func TestWriteProcessMetrics_uses_startTime(t *testing.T) {
+	var b strings.Builder
+	start := time.Now().Add(-10 * time.Second)
+	WriteProcessMetrics(&b, start)
+	out := b.String()
+
+	if !strings.Contains(out, "process_uptime_seconds") {
+		t.Fatal("missing process_uptime_seconds")
+	}
+	for line := range strings.SplitSeq(out, "\n") {
+		if valStr, ok := strings.CutPrefix(line, "process_uptime_seconds "); ok {
+			val, err := strconv.ParseFloat(valStr, 64)
+			if err != nil {
+				t.Fatalf("failed to parse uptime: %v", err)
+			}
+			if val < 10.0 {
+				t.Errorf("uptime = %.3f, want >= 10.0", val)
+			}
+			return
+		}
+	}
+	t.Error("process_uptime_seconds line not found")
+}
+
+func TestMetricNameValidation(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for invalid metric name")
+		}
+	}()
+	NewCounter("invalid-name", "test")
+}
+
+func TestLabelNameValidation(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for invalid label name")
+		}
+	}()
+	NewLabeledCounter("valid_name", "test", []string{"invalid-label"})
+}
+
+func TestTimer(t *testing.T) {
+	h := NewHistogram("timer_test", "test")
+	timer := NewTimer(h)
+	time.Sleep(10 * time.Millisecond)
+	d := timer.ObserveDuration()
+	if d < 10*time.Millisecond {
+		t.Errorf("timer duration too short: %v", d)
+	}
+	if h.count.Load() != 1 {
+		t.Error("timer did not observe")
+	}
+}
+
+func TestLabeledHistogram(t *testing.T) {
+	lh := NewLabeledHistogram("lh_test", "test", []string{"method"}, WithBuckets([]float64{0.1, 0.5, 1}))
+	lh.Observe(0.05, "GET")
+	lh.Observe(0.3, "GET")
+	lh.Observe(2.0, "POST")
+
+	var b strings.Builder
+	WriteLabeledHistogram(&b, lh)
+	out := b.String()
+
+	if !strings.Contains(out, "# TYPE lh_test histogram") {
+		t.Error("missing TYPE")
+	}
+	if !strings.Contains(out, `lh_test_bucket{method="GET",le="0.1"} 1`) {
+		t.Errorf("missing GET le=0.1 bucket: %s", out)
+	}
+	if !strings.Contains(out, `lh_test_bucket{method="GET",le="+Inf"} 2`) {
+		t.Errorf("missing GET +Inf bucket: %s", out)
+	}
+	if !strings.Contains(out, `lh_test_bucket{method="POST",le="+Inf"} 1`) {
+		t.Errorf("missing POST +Inf bucket: %s", out)
+	}
+}
+
+func TestLabeledGauge(t *testing.T) {
+	lg := NewLabeledGauge("lg_test", "test", []string{"host"})
+	lg.Set(42.5, "server1")
+	lg.Set(10, "server2")
+
+	var b strings.Builder
+	WriteLabeledGauge(&b, lg)
+	out := b.String()
+
+	if !strings.Contains(out, "# TYPE lg_test gauge") {
+		t.Error("missing TYPE")
+	}
+	if !strings.Contains(out, `lg_test{host="server1"} 42.5`) {
+		t.Errorf("missing server1: %s", out)
+	}
+	if !strings.Contains(out, `lg_test{host="server2"} 10`) {
+		t.Errorf("missing server2: %s", out)
+	}
+}
+
+func TestLabeledGauge_Reset(t *testing.T) {
+	lg := NewLabeledGauge("lg_reset", "test", []string{"host"})
+	lg.Set(1, "a")
+	lg.Set(2, "b")
+	lg.Reset()
+
+	var b strings.Builder
+	WriteLabeledGauge(&b, lg)
+	if b.Len() != 0 {
+		t.Errorf("expected empty output after Reset, got: %s", b.String())
+	}
+}
+
+func TestLabeledGauge_Delete(t *testing.T) {
+	lg := NewLabeledGauge("lg_delete", "test", []string{"host"})
+	lg.Set(1, "a")
+	lg.Set(2, "b")
+	lg.Delete("a")
+
+	var b strings.Builder
+	WriteLabeledGauge(&b, lg)
+	out := b.String()
+	if strings.Contains(out, `host="a"`) {
+		t.Errorf("deleted key still present: %s", out)
+	}
+	if !strings.Contains(out, `host="b"`) {
+		t.Errorf("remaining key missing: %s", out)
+	}
+}
+
+func TestLabeledGauge_DeleteArityPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for arity mismatch")
+		}
+	}()
+	lg := NewLabeledGauge("lg_del_panic", "test", []string{"a", "b"})
+	lg.Delete("only_one")
+}
+
+func TestLabeledGauge_ResetConcurrent(t *testing.T) {
+	lg := NewLabeledGauge("lg_conc_reset", "test", []string{"id"})
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Go(func() {
+			for j := range 20 {
+				lg.Set(float64(j), strconv.Itoa(i))
+			}
+		})
+	}
+	// Concurrent resets
+	for range 10 {
+		wg.Go(func() {
+			lg.Reset()
+		})
+	}
+	wg.Wait()
+}
+
+func TestLabeledGauge_DeleteConcurrent(t *testing.T) {
+	lg := NewLabeledGauge("lg_conc_del", "test", []string{"id"})
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Go(func() {
+			key := strconv.Itoa(i)
+			lg.Set(float64(i), key)
+			lg.Delete(key)
+		})
+	}
+	wg.Wait()
 }
 
 func FuzzHistogramObserve(f *testing.F) {
@@ -367,6 +683,66 @@ func FuzzHistogramObserve(f *testing.F) {
 				t.Errorf("bucket[%d] count %d < prev %d", i, cur, prev)
 			}
 			prev = cur
+		}
+	})
+}
+
+func FuzzLabelValueExposition(f *testing.F) {
+	f.Add("simple")
+	f.Add("with\"quote")
+	f.Add("with\\backslash")
+	f.Add("with\nnewline")
+	f.Add("null\x00byte")
+	f.Add("emoji🎉")
+	f.Add("")
+	f.Add(strings.Repeat("x", 500))
+
+	f.Fuzz(func(t *testing.T, val string) {
+		r := NewRegistry("fuzz")
+		lc := NewLabeledCounter("fuzz_counter", "fuzz help", []string{"v"})
+		lg := NewLabeledGauge("fuzz_gauge", "fuzz help", []string{"v"})
+		r.RegisterLabeledCounter(lc)
+		r.RegisterLabeledGauge(lg)
+		lc.Inc(val)
+		lg.Set(1.0, val)
+
+		// Prometheus format
+		var b strings.Builder
+		WriteLabeledCounter(&b, lc)
+		out := b.String()
+		// Must not contain raw unescaped newlines inside a label value line
+		for line := range strings.SplitSeq(out, "\n") {
+			if strings.HasPrefix(line, "#") || line == "" {
+				continue
+			}
+			// Each non-comment sample line must be parseable: metric{labels} value
+			if !strings.Contains(line, "{") {
+				continue
+			}
+			// Verify we can find closing brace after opening brace
+			braceOpen := strings.Index(line, "{")
+			braceClose := strings.LastIndex(line, "}")
+			if braceOpen >= 0 && braceClose < braceOpen {
+				t.Errorf("malformed label section: %s", line)
+			}
+		}
+
+		// OpenMetrics format
+		b.Reset()
+		writeOMLabeledGauge(&b, lg)
+		omOut := b.String()
+		for line := range strings.SplitSeq(omOut, "\n") {
+			if strings.HasPrefix(line, "#") || line == "" {
+				continue
+			}
+			if !strings.Contains(line, "{") {
+				continue
+			}
+			braceOpen := strings.Index(line, "{")
+			braceClose := strings.LastIndex(line, "}")
+			if braceOpen >= 0 && braceClose < braceOpen {
+				t.Errorf("malformed OM label section: %s", line)
+			}
 		}
 	})
 }
