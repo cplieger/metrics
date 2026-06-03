@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"strings"
@@ -54,8 +55,7 @@ func FuzzHelpTextExposition(f *testing.F) {
 		var b strings.Builder
 		WriteCounter(&b, c)
 		out := b.String()
-		lines := strings.Split(out, "\n")
-		for _, line := range lines {
+		for line := range strings.SplitSeq(out, "\n") {
 			if !strings.HasPrefix(line, "# HELP ") {
 				continue
 			}
@@ -93,10 +93,10 @@ func FuzzOpenMetricsLabelExposition(f *testing.F) {
 		reg.RegisterLabeledCounter(lc)
 		lc.Inc(val)
 		rec := httptest.NewRecorder()
-		reg.OpenMetricsHandler()(rec, httptest.NewRequest("GET", "/", nil))
+		reg.OpenMetricsHandler()(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 		out := rec.Body.String()
 		// Check all label values are properly quoted
-		for _, line := range strings.Split(out, "\n") {
+		for line := range strings.SplitSeq(out, "\n") {
 			if !strings.Contains(line, "{") {
 				continue
 			}
@@ -148,10 +148,9 @@ func FuzzRegistryFullExposition(f *testing.F) {
 		reg.RegisterLabeledCounter(lc)
 
 		rec := httptest.NewRecorder()
-		reg.Handler()(rec, httptest.NewRequest("GET", "/", nil))
+		reg.Handler()(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 		out := rec.Body.String()
-		lines := strings.Split(out, "\n")
-		for _, line := range lines {
+		for line := range strings.SplitSeq(out, "\n") {
 			if line == "" {
 				continue
 			}
