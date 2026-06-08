@@ -13,6 +13,7 @@ A lightweight, zero-dependency metrics library that exposes counters, gauges, la
 Go: `go get github.com/cplieger/metrics@latest`
 
 ## Usage
+
 ```go
 package main
 
@@ -42,18 +43,22 @@ func main() {
 ## API
 
 ### Constants & Variables
+
 - `DefaultBuckets []float64` — default histogram bucket boundaries (`0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0`)
 - `OpenMetricsContentType string` — OpenMetrics content type (`application/openmetrics-text; version=1.0.0; charset=utf-8`)
 
 ### Counters
+
 - `NewCounter(name, help) *Counter` — monotonic counter with `Inc()`, `Add(n int64)`
 - `NewLabeledCounter(name, help, labels) *LabeledCounter` — per-label-combination counter with `Inc(vals...)`
 
 ### Gauges
+
 - `NewGauge(name, help) *Gauge` — float64 gauge with `Set(float64)`, `Add(float64)`, `Sub(float64)`, `Inc()`, `Dec()`, `Get()`
 - `NewLabeledGauge(name, help, labels) *LabeledGauge` — per-label gauge with `Set(float64, vals...)`
 
 ### Histograms
+
 - `NewHistogram(name, help, opts ...Option) *Histogram` — histogram with `Observe(seconds)`; uses DefaultBuckets unless `WithBuckets` is provided
 - `NewLabeledHistogram(name, help, labels, opts ...Option) *LabeledHistogram` — labeled histogram with `Observe(seconds, vals...)`
 - `WithBuckets([]float64) Option` — sets custom bucket boundaries
@@ -61,9 +66,11 @@ func main() {
 - `type Option func(*histogramCfg)` — functional option for histogram configuration
 
 ### Timer
+
 - `NewTimer(h *Histogram) *Timer` — starts a timer; call `ObserveDuration()` to record elapsed time
 
 ### Registry
+
 - `NewRegistry(prefix) *Registry` — collects metrics; `Handler()` returns `http.HandlerFunc`
 - `RegisterCounter`, `RegisterGauge`, `RegisterLabeledCounter`, `RegisterLabeledGauge`, `RegisterHistogram`, `RegisterLabeledHistogram`
 - `EnableImageMetrics()` — enables image metric output in handlers
@@ -71,19 +78,23 @@ func main() {
 - `NegotiateHandler()` — returns handler with content negotiation (OpenMetrics if Accept header requests it, otherwise Prometheus text)
 
 ### Image Metrics
+
 - `SetImageMetrics([]ImageMetric)` — set per-image gauge data
 
 ### Process Metrics (emitted automatically)
+
 - `process_goroutines`, `process_heap_bytes`, `process_gc_pause_seconds_total`, `process_uptime_seconds`
 - `process_start_time_seconds`, `process_cpu_seconds_total` (Linux), `process_resident_memory_bytes` (Linux)
 - `process_open_fds`, `process_max_fds` (Linux)
 
 ### Low-level Writers
+
 - `WriteCounter`, `WriteGauge`, `WriteLabeledCounter`, `WriteLabeledGauge`, `WriteHistogram`, `WriteLabeledHistogram`, `WriteImageMetrics`, `WriteProcessMetrics`
 
 ## Spec Conformance
 
 This library emits valid Prometheus text exposition format (version 0.0.4):
+
 - Label values are escaped per spec: only `\`, `"`, and `\n` are escaped (as `\\`, `\"`, `\n`)
 - HELP text escapes `\` and `\n` only
 - Metric and label names are validated at creation time (`[a-zA-Z_:][a-zA-Z0-9_:]*` for metrics, `[a-zA-Z_][a-zA-Z0-9_]*` for labels)
@@ -93,6 +104,7 @@ This library emits valid Prometheus text exposition format (version 0.0.4):
 ### OpenMetrics Text Format
 
 Full support for OpenMetrics text exposition format 1.0.0 (the CNCF-standard successor to Prometheus format):
+
 - Content-Type: `application/openmetrics-text; version=1.0.0; charset=utf-8`
 - Exposition ends with mandatory `# EOF` line
 - TYPE metadata appears before HELP (per spec ordering)
@@ -118,4 +130,5 @@ The following features are intentionally not implemented:
 | **Gauge.SetToCurrentTime()** | Trivial one-liner users can write themselves |
 
 ## License
+
 GPL-3.0 — see [LICENSE](LICENSE).
