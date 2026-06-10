@@ -13,7 +13,7 @@ import (
 // Counters/gauges/histograms named with _total, _bucket, _sum, _count, _info, _created suffixes.
 
 func TestReservedSuffix_CounterNamedTotal_Prometheus(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	c := NewCounter("my_requests_total", "Requests")
 	r.RegisterCounter(c)
 	c.Add(42)
@@ -35,7 +35,7 @@ func TestReservedSuffix_CounterNamedTotal_Prometheus(t *testing.T) {
 }
 
 func TestReservedSuffix_CounterNamedTotal_OpenMetrics(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	c := NewCounter("my_requests_total", "Requests")
 	r.RegisterCounter(c)
 	c.Add(42)
@@ -108,7 +108,7 @@ func TestReservedSuffix_HistogramNamedCount(t *testing.T) {
 // --- Attack surface 2: Both formats parity ---
 
 func TestFormatParity_AllMetricTypes(t *testing.T) {
-	r := NewRegistry("parity")
+	r := NewRegistry("")
 	c := NewCounter("parity_counter", "A counter")
 	g := NewGauge("parity_gauge", "A gauge")
 	h := NewHistogram("parity_hist", "A histogram", WithBuckets([]float64{0.1, 1}))
@@ -227,7 +227,7 @@ func TestUTF8_HelpText(t *testing.T) {
 // --- Attack surface 4: Contention races ---
 
 func TestRace_RegistryHandlerDuringMutation(t *testing.T) {
-	r := NewRegistry("race")
+	r := NewRegistry("")
 	c := NewCounter("race_counter", "test")
 	g := NewGauge("race_gauge", "test")
 	h := NewHistogram("race_hist", "test")
@@ -493,7 +493,7 @@ func TestHistogram_SingleBucket(t *testing.T) {
 // --- Attack surface 6: OpenMetrics counter _total for labeled counters with _total name ---
 
 func TestReservedSuffix_LabeledCounterNamedTotal_OpenMetrics(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	lc := NewLabeledCounter("api_errors_total", "API errors", []string{"code"})
 	r.RegisterLabeledCounter(lc)
 	lc.Inc("500")
@@ -584,7 +584,7 @@ func TestValidateLabelName_Panics(t *testing.T) {
 // --- Attack surface 9: OpenMetrics format for process counters ---
 
 func TestOpenMetrics_ProcessCounters_BaseNameInType(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	rec := httptest.NewRecorder()
 	r.OpenMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()
@@ -605,7 +605,7 @@ func TestOpenMetrics_ProcessCounters_BaseNameInType(t *testing.T) {
 // --- Attack surface 10: Concurrent registry registration + handler ---
 
 func TestRace_RegisterDuringServe(t *testing.T) {
-	r := NewRegistry("race_reg")
+	r := NewRegistry("")
 	c := NewCounter("race_reg_c", "test")
 	r.RegisterCounter(c)
 	c.Inc()

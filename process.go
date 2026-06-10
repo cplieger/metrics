@@ -11,19 +11,19 @@ import (
 
 // Timer measures elapsed time and reports to a Histogram.
 type Timer struct {
-	start time.Time
-	hist  *Histogram
+	start   time.Time
+	observe func(float64)
 }
 
 // NewTimer starts a timer that will observe into the given histogram.
 func NewTimer(h *Histogram) *Timer {
-	return &Timer{start: time.Now(), hist: h}
+	return &Timer{start: time.Now(), observe: h.Observe}
 }
 
 // ObserveDuration records the elapsed time since the timer was created.
 func (t *Timer) ObserveDuration() time.Duration {
 	d := time.Since(t.start)
-	t.hist.Observe(d.Seconds())
+	t.observe(d.Seconds())
 	return d
 }
 

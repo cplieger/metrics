@@ -317,7 +317,7 @@ func TestRT6_LabelNameValidation_ColonForbidden(t *testing.T) {
 // --- (2b) OpenMetrics vs Prometheus differences ---
 
 func TestRT6_OpenMetrics_CounterNoTotal_GetsTotal(t *testing.T) {
-	r := NewRegistry("rt6")
+	r := NewRegistry("")
 	c := NewCounter("rt6_events", "events")
 	r.RegisterCounter(c)
 	c.Add(7)
@@ -335,7 +335,7 @@ func TestRT6_OpenMetrics_CounterNoTotal_GetsTotal(t *testing.T) {
 }
 
 func TestRT6_OpenMetrics_GaugeFloat(t *testing.T) {
-	r := NewRegistry("rt6")
+	r := NewRegistry("")
 	g := NewGauge("rt6_temp", "temperature")
 	r.RegisterGauge(g)
 	g.Set(42)
@@ -351,7 +351,7 @@ func TestRT6_OpenMetrics_GaugeFloat(t *testing.T) {
 }
 
 func TestRT6_NegotiateHandler_AcceptOM(t *testing.T) {
-	r := NewRegistry("rt6")
+	r := NewRegistry("")
 	c := NewCounter("rt6_neg", "test")
 	r.RegisterCounter(c)
 	c.Inc()
@@ -372,7 +372,7 @@ func TestRT6_NegotiateHandler_AcceptOM(t *testing.T) {
 }
 
 func TestRT6_NegotiateHandler_DefaultProm(t *testing.T) {
-	r := NewRegistry("rt6")
+	r := NewRegistry("")
 	c := NewCounter("rt6_neg2", "test")
 	r.RegisterCounter(c)
 	c.Inc()
@@ -390,7 +390,7 @@ func TestRT6_NegotiateHandler_DefaultProm(t *testing.T) {
 // --- (3) Confirm ImageMetric global state gone ---
 
 func TestRT6_NoImageMetricExports(t *testing.T) {
-	r := NewRegistry("rt6_no_image")
+	r := NewRegistry("")
 	rec := httptest.NewRecorder()
 	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()
@@ -525,7 +525,7 @@ func TestRT6_LabeledHistogram_ScrapeRace(t *testing.T) {
 // --- Full handler race with Reset/Delete in flight ---
 
 func TestRT6_FullHandler_ResetDeleteRace(t *testing.T) {
-	r := NewRegistry("rt6_full")
+	r := NewRegistry("")
 	lg := NewLabeledGauge("rt6_full_gauge", "test", []string{"host"})
 	c := NewCounter("rt6_full_counter", "test")
 	h := NewHistogram("rt6_full_hist", "test")
