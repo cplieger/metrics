@@ -63,7 +63,7 @@ func BenchmarkLabeledCounterInc_Parallel(b *testing.B) {
 }
 
 func TestRegistryHandler(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 
 	httpReqs := NewLabeledCounter("test_http_requests_total", "Total HTTP requests", []string{"method", "path", "status"})
 	activeConns := NewGauge("test_active_connections", "Active connection count")
@@ -115,7 +115,7 @@ func TestRegistryHandler(t *testing.T) {
 }
 
 func BenchmarkRegistryHandler(b *testing.B) {
-	r := NewRegistry("bench")
+	r := NewRegistry("")
 	httpReqs := NewLabeledCounter("bench_http_requests_total", "Total HTTP requests", []string{"method", "path", "status"})
 	httpDur := NewHistogram("bench_http_request_duration_seconds", "HTTP request latency")
 	tasks := NewCounter("bench_tasks_total", "Total tasks")
@@ -698,7 +698,7 @@ func FuzzLabelValueExposition(f *testing.F) {
 	f.Add(strings.Repeat("x", 500))
 
 	f.Fuzz(func(t *testing.T, val string) {
-		r := NewRegistry("fuzz")
+		r := NewRegistry("")
 		lc := NewLabeledCounter("fuzz_counter", "fuzz help", []string{"v"})
 		lg := NewLabeledGauge("fuzz_gauge", "fuzz help", []string{"v"})
 		r.RegisterLabeledCounter(lc)

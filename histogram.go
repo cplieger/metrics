@@ -7,10 +7,15 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // DefaultBuckets are the default histogram bucket boundaries (HTTP latency).
 var DefaultBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0}
+
+// APIBuckets are coarse latency buckets (seconds) for outbound API calls and
+// slow collect/scan cycles, where DefaultBuckets (max 1.0s) saturates at +Inf.
+var APIBuckets = []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
 
 // histogramCfg holds optional configuration for histogram construction.
 type histogramCfg struct {
@@ -194,4 +199,12 @@ func WriteLabeledHistogram(b *strings.Builder, lh *LabeledHistogram) {
 		fmt.Fprintf(b, "%s_sum{%s} %.6f\n", lh.name, labelStr, sum)
 		fmt.Fprintf(b, "%s_count{%s} %d\n", lh.name, labelStr, count)
 	}
+}
+
+// NewTimer returns a Timer that, on ObserveDuration, records the elapsed time
+// into this labeled histogram with the given label values. This lets the
+// common per-label latency case use Timer's defer-ObserveDuration ergonomics
+// (plain NewTimer only composes with an unlabeled Histogram).
+func (lh *LabeledHistogram) NewTimer(labelVals ...string) *Timer {
+	return &Timer{start: time.Now(), observe: func(s float64) { lh.Observe(s, labelVals...) }}
 }

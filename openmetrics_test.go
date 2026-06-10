@@ -8,7 +8,7 @@ import (
 )
 
 func TestOpenMetricsHandler_ContentType(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	c := NewCounter("test_requests_total", "Total requests")
 	r.RegisterCounter(c)
 	c.Inc()
@@ -24,7 +24,7 @@ func TestOpenMetricsHandler_ContentType(t *testing.T) {
 }
 
 func TestOpenMetricsHandler_EOF(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	h := r.OpenMetricsHandler()
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -36,7 +36,7 @@ func TestOpenMetricsHandler_EOF(t *testing.T) {
 }
 
 func TestOpenMetricsHandler_CounterTotal(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	c := NewCounter("test_requests", "Total requests")
 	r.RegisterCounter(c)
 	c.Add(5)
@@ -55,7 +55,7 @@ func TestOpenMetricsHandler_CounterTotal(t *testing.T) {
 }
 
 func TestOpenMetricsHandler_LabeledCounter(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	lc := NewLabeledCounter("http_requests", "HTTP requests", []string{"method"})
 	r.RegisterLabeledCounter(lc)
 	lc.Inc("GET")
@@ -79,7 +79,7 @@ func TestOpenMetricsHandler_LabeledCounter(t *testing.T) {
 }
 
 func TestOpenMetricsHandler_Gauge(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	g := NewGauge("temperature", "Current temp")
 	r.RegisterGauge(g)
 	g.Set(23.5)
@@ -98,7 +98,7 @@ func TestOpenMetricsHandler_Gauge(t *testing.T) {
 }
 
 func TestOpenMetricsHandler_GaugeInteger(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	g := NewGauge("connections", "Active connections")
 	r.RegisterGauge(g)
 	g.Set(42)
@@ -115,7 +115,7 @@ func TestOpenMetricsHandler_GaugeInteger(t *testing.T) {
 }
 
 func TestOpenMetricsHandler_Histogram(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	h := NewHistogram("request_duration_seconds", "Request latency", WithBuckets([]float64{0.1, 0.5, 1}))
 	r.RegisterHistogram(h)
 	h.Observe(0.05)
@@ -145,7 +145,7 @@ func TestOpenMetricsHandler_Histogram(t *testing.T) {
 }
 
 func TestOpenMetricsHandler_TypeBeforeHelp(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	c := NewCounter("my_counter", "A counter")
 	r.RegisterCounter(c)
 	c.Inc()
@@ -166,7 +166,7 @@ func TestOpenMetricsHandler_TypeBeforeHelp(t *testing.T) {
 }
 
 func TestNegotiateHandler_OpenMetrics(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	c := NewCounter("neg_counter", "test")
 	r.RegisterCounter(c)
 	c.Inc()
@@ -193,7 +193,7 @@ func TestNegotiateHandler_OpenMetrics(t *testing.T) {
 }
 
 func TestNegotiateHandler_Prometheus(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	c := NewCounter("neg_counter", "test")
 	r.RegisterCounter(c)
 	c.Inc()
@@ -216,7 +216,7 @@ func TestNegotiateHandler_Prometheus(t *testing.T) {
 }
 
 func TestNegotiateHandler_PrometheusStyleAccept(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	c := NewCounter("neg_counter2", "test")
 	r.RegisterCounter(c)
 	c.Inc()
@@ -236,7 +236,7 @@ func TestNegotiateHandler_PrometheusStyleAccept(t *testing.T) {
 }
 
 func TestOpenMetricsHandler_ProcessMetrics(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	handler := r.OpenMetricsHandler()
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -256,7 +256,7 @@ func TestOpenMetricsHandler_ProcessMetrics(t *testing.T) {
 }
 
 func TestOpenMetricsHandler_LabeledHistogram(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	lh := NewLabeledHistogram("api_duration_seconds", "API latency", []string{"method"}, WithBuckets([]float64{0.1, 1}))
 	r.RegisterLabeledHistogram(lh)
 	lh.Observe(0.05, "GET")
@@ -299,7 +299,7 @@ func TestOMFormatFloat(t *testing.T) {
 }
 
 func TestOpenMetricsHandler_LabeledGauge(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	lg := NewLabeledGauge("cpu_usage", "CPU usage", []string{"core"})
 	r.RegisterLabeledGauge(lg)
 	lg.Set(0.75, "0")
@@ -322,7 +322,7 @@ func TestOpenMetricsHandler_LabeledGauge(t *testing.T) {
 }
 
 func TestOpenMetricsHandler_Full(t *testing.T) {
-	r := NewRegistry("myapp")
+	r := NewRegistry("")
 	c := NewCounter("myapp_requests", "Total requests")
 	g := NewGauge("myapp_temperature", "Temperature")
 	h := NewHistogram("myapp_latency_seconds", "Latency")
@@ -364,7 +364,7 @@ func TestOpenMetricsHandler_Full(t *testing.T) {
 func TestOpenMetricsHandler_CounterTypeNoTotal(t *testing.T) {
 	// OpenMetrics spec: TYPE/HELP lines for counters must NOT include _total suffix.
 	// Only the sample line gets _total.
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	handler := r.OpenMetricsHandler()
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -394,7 +394,7 @@ func TestOpenMetricsHandler_CounterTypeNoTotal(t *testing.T) {
 }
 
 func BenchmarkOpenMetricsHandler(b *testing.B) {
-	r := NewRegistry("bench")
+	r := NewRegistry("")
 	httpReqs := NewLabeledCounter("bench_http_requests", "Total HTTP requests", []string{"method", "path", "status"})
 	httpDur := NewHistogram("bench_http_request_duration_seconds", "HTTP request latency")
 	tasks := NewCounter("bench_tasks", "Total tasks")

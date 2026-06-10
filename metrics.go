@@ -43,12 +43,25 @@ type Registry struct {
 
 // NewRegistry creates a new metrics registry.
 func NewRegistry(prefix string) *Registry {
+	if prefix != "" {
+		validateMetricName(prefix)
+	}
 	return &Registry{prefix: prefix, startTime: time.Now()}
+}
+
+// prefixed joins the registry prefix to a metric name (prefix_name). An empty
+// prefix returns the name unchanged.
+func (r *Registry) prefixed(name string) string {
+	if r.prefix == "" {
+		return name
+	}
+	return r.prefix + "_" + name
 }
 
 // RegisterCounter adds a counter to the registry.
 func (r *Registry) RegisterCounter(c *Counter) {
 	r.mu.Lock()
+	c.name = r.prefixed(c.name)
 	r.counters = append(r.counters, c)
 	r.mu.Unlock()
 }
@@ -56,6 +69,7 @@ func (r *Registry) RegisterCounter(c *Counter) {
 // RegisterGauge adds a gauge to the registry.
 func (r *Registry) RegisterGauge(g *Gauge) {
 	r.mu.Lock()
+	g.name = r.prefixed(g.name)
 	r.gauges = append(r.gauges, g)
 	r.mu.Unlock()
 }
@@ -63,6 +77,7 @@ func (r *Registry) RegisterGauge(g *Gauge) {
 // RegisterLabeledCounter adds a labeled counter to the registry.
 func (r *Registry) RegisterLabeledCounter(lc *LabeledCounter) {
 	r.mu.Lock()
+	lc.name = r.prefixed(lc.name)
 	r.labeledCounters = append(r.labeledCounters, lc)
 	r.mu.Unlock()
 }
@@ -70,6 +85,7 @@ func (r *Registry) RegisterLabeledCounter(lc *LabeledCounter) {
 // RegisterLabeledGauge adds a labeled gauge to the registry.
 func (r *Registry) RegisterLabeledGauge(lg *LabeledGauge) {
 	r.mu.Lock()
+	lg.name = r.prefixed(lg.name)
 	r.labeledGauges = append(r.labeledGauges, lg)
 	r.mu.Unlock()
 }
@@ -77,6 +93,7 @@ func (r *Registry) RegisterLabeledGauge(lg *LabeledGauge) {
 // RegisterHistogram adds a histogram to the registry.
 func (r *Registry) RegisterHistogram(h *Histogram) {
 	r.mu.Lock()
+	h.name = r.prefixed(h.name)
 	r.histograms = append(r.histograms, h)
 	r.mu.Unlock()
 }
@@ -84,6 +101,7 @@ func (r *Registry) RegisterHistogram(h *Histogram) {
 // RegisterLabeledHistogram adds a labeled histogram to the registry.
 func (r *Registry) RegisterLabeledHistogram(lh *LabeledHistogram) {
 	r.mu.Lock()
+	lh.name = r.prefixed(lh.name)
 	r.labeledHistograms = append(r.labeledHistograms, lh)
 	r.mu.Unlock()
 }

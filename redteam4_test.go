@@ -181,7 +181,7 @@ func TestReattack_PrometheusEscaping_AllSpecialChars(t *testing.T) {
 }
 
 func TestReattack_OpenMetricsEscaping(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	lc := NewLabeledCounter("om_esc", "help\nline", []string{"v"})
 	r.RegisterLabeledCounter(lc)
 	lc.Inc("quote\"here")
@@ -203,7 +203,7 @@ func TestReattack_OpenMetricsEscaping(t *testing.T) {
 // ====================================================================
 
 func TestReattack_TotalSuffixNotDoubled_Simple(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	c := NewCounter("events_total", "events")
 	r.RegisterCounter(c)
 	c.Inc()
@@ -224,7 +224,7 @@ func TestReattack_TotalSuffixNotDoubled_Simple(t *testing.T) {
 }
 
 func TestReattack_TotalSuffixNotDoubled_Labeled(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	lc := NewLabeledCounter("req_total", "requests", []string{"m"})
 	r.RegisterLabeledCounter(lc)
 	lc.Inc("GET")
@@ -335,7 +335,7 @@ func TestReattack_NameValidation_Valid(t *testing.T) {
 // ====================================================================
 
 func TestReattack_NegotiateHandler(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	c := NewCounter("neg_test", "test")
 	r.RegisterCounter(c)
 	c.Inc()
@@ -367,7 +367,7 @@ func TestReattack_NegotiateHandler(t *testing.T) {
 // ====================================================================
 
 func TestReattack_HistogramExposition_BothFormats(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	h := NewHistogram("dur_seconds", "Duration", WithBuckets([]float64{0.1, 0.5, 1.0}))
 	r.RegisterHistogram(h)
 	h.Observe(0.05) // <= 0.1

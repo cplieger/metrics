@@ -8,7 +8,7 @@ import (
 )
 
 func TestOpenMetrics_CounterTotalSuffixNotDoubled(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	// Counter named with _total suffix (common Prometheus convention)
 	c := NewCounter("http_requests_total", "Total requests")
 	r.RegisterCounter(c)
@@ -38,7 +38,7 @@ func TestOpenMetrics_CounterTotalSuffixNotDoubled(t *testing.T) {
 }
 
 func TestOpenMetrics_LabeledCounterTotalSuffixNotDoubled(t *testing.T) {
-	r := NewRegistry("test")
+	r := NewRegistry("")
 	lc := NewLabeledCounter("api_calls_total", "API calls", []string{"method"})
 	r.RegisterLabeledCounter(lc)
 	lc.Inc("GET")
