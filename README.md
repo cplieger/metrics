@@ -1,121 +1,144 @@
 # metrics
 
 [![CI](https://github.com/cplieger/metrics/actions/workflows/ci.yaml/badge.svg)](https://github.com/cplieger/metrics/actions/workflows/ci.yaml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/metrics.svg)](https://pkg.go.dev/github.com/cplieger/metrics)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/metrics/v2.svg)](https://pkg.go.dev/github.com/cplieger/metrics/v2)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 
 > Hand-rolled Prometheus text-format exposition library for Go
 
-A lightweight, zero-dependency metrics library that exposes counters, gauges, labeled counters, histograms, and more in Prometheus text format. Standard library only.
+A lightweight, zero-dependency metrics library that exposes counters, gauges, labeled counters, histograms, and process metrics in Prometheus text format (with optional OpenMetrics negotiation). Standard library only.
 
 ## Install
 
-Go: `go get github.com/cplieger/metrics@latest`
+```sh
+go get github.com/cplieger/metrics/v2
+```
 
 ## Usage
+
 ```go
 package main
 
 import (
 	"net/http"
-	"github.com/cplieger/metrics"
+	"strconv"
+	"time"
+
+	"github.com/cplieger/metrics/v2"
 )
 
 func main() {
+	// Registry prefix is applied to every registered metric name (myapp_*).
 	r := metrics.NewRegistry("myapp")
-	reqs := metrics.NewLabeledCounter("myapp_http_requests_total", "Total HTTP requests", []string{"method", "status"})
-	dur := metrics.NewHistogram("myapp_http_duration_seconds", "Request latency", metrics.WithBuckets([]float64{0.01, 0.05, 0.1, 0.5, 1, 5}))
-	r.RegisterLabeledCounter(reqs)
-	r.RegisterHistogram(dur)
 
-	reqs.Inc("GET", "200")
+	reqs := metrics.NewLabeledCounter(
+		"http_requests_total", "Total HTTP requests",
+		[]string{"method", "status"},
+	)
+	dur := metrics.NewHistogram(
+		"http_request_duration_seconds", "Request latency",
+	)
+	r.RegisterLabeledCounter(reqs) // exposed as myapp_http_requests_total
+	r.RegisterHistogram(dur)       // exposed as myapp_http_request_duration_seconds
 
-	timer := metrics.NewTimer(dur)
-	// ... do work ...
-	timer.ObserveDuration()
+	// One-shot HTTP instrumentation: caller owns the label set.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/widget", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	instrumented := metrics.InstrumentHandler(mux, reqs, dur,
+		func(rq *http.Request, status int) []string {
+			return []string{rq.Method, strconv.Itoa(status)}
+		})
+
+	// Or measure a code path with the labeled-histogram timer.
+	work := metrics.NewLabeledHistogram("op_seconds", "op", []string{"kind"})
+	r.RegisterLabeledHistogram(work)
+	t := work.NewTimer("scan")
+	time.Sleep(50 * time.Millisecond)
+	t.ObserveDuration()
 
 	http.Handle("/metrics", r.Handler())
-	http.ListenAndServe(":9090", nil)
+	http.Handle("/", instrumented)
+	_ = http.ListenAndServe(":9090", nil)
 }
 ```
 
 ## API
 
 ### Constants & Variables
-- `DefaultBuckets []float64` — default histogram bucket boundaries (`0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0`)
-- `OpenMetricsContentType string` — OpenMetrics content type (`application/openmetrics-text; version=1.0.0; charset=utf-8`)
+
+- `DefaultBuckets []float64` — HTTP-latency buckets (`0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0`).
+- `APIBuckets []float64` — coarse buckets for outbound API calls and slow collect/scan cycles (`0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30`); use when DefaultBuckets would saturate everything in `+Inf`.
+- `OpenMetricsContentType string` — `application/openmetrics-text; version=1.0.0; charset=utf-8`.
 
 ### Counters
-- `NewCounter(name, help) *Counter` — monotonic counter with `Inc()`, `Add(n int64)`
-- `NewLabeledCounter(name, help, labels) *LabeledCounter` — per-label-combination counter with `Inc(vals...)`
+
+- `NewCounter(name, help) *Counter` — monotonic counter; `Inc()`, `Add(n int64)`.
+- `NewLabeledCounter(name, help, labels) *LabeledCounter` — `Inc(vals...)`; panics on label-arity mismatch.
 
 ### Gauges
-- `NewGauge(name, help) *Gauge` — float64 gauge with `Set(float64)`, `Add(float64)`, `Sub(float64)`, `Inc()`, `Dec()`, `Get()`
-- `NewLabeledGauge(name, help, labels) *LabeledGauge` — per-label gauge with `Set(float64, vals...)`
+
+- `NewGauge(name, help) *Gauge` — float64 gauge; `Set`, `Add`, `Sub`, `Inc`, `Dec`, `Get`.
+- `NewLabeledGauge(name, help, labels) *LabeledGauge` — `Set(float64, vals...)`, `Delete(vals...)`, `Reset()`.
 
 ### Histograms
-- `NewHistogram(name, help, opts ...Option) *Histogram` — histogram with `Observe(seconds)`; uses DefaultBuckets unless `WithBuckets` is provided
-- `NewLabeledHistogram(name, help, labels, opts ...Option) *LabeledHistogram` — labeled histogram with `Observe(seconds, vals...)`
-- `WithBuckets([]float64) Option` — sets custom bucket boundaries
-- `FormatBound(float64) string` — formats a bucket boundary for Prometheus output
-- `type Option func(*histogramCfg)` — functional option for histogram configuration
+
+- `NewHistogram(name, help, opts ...Option) *Histogram` — `Observe(seconds)`; uses `DefaultBuckets` unless `WithBuckets` is provided.
+- `NewLabeledHistogram(name, help, labels, opts ...Option) *LabeledHistogram` — `Observe(seconds, vals...)`.
+- `WithBuckets([]float64) Option` — sets custom bucket boundaries.
+- `FormatBound(float64) string` — formats a bucket boundary for Prometheus output.
 
 ### Timer
-- `NewTimer(h *Histogram) *Timer` — starts a timer; call `ObserveDuration()` to record elapsed time
+
+- `NewTimer(*Histogram) *Timer` — starts a timer for an unlabeled histogram.
+- `(*LabeledHistogram).NewTimer(vals...) *Timer` — starts a timer for the given label set, so per-label latency can use `defer t.ObserveDuration()` ergonomics.
+- `(*Timer).ObserveDuration() time.Duration` — records elapsed time and returns it.
+
+### HTTP instrumentation (zero-dep `net/http`)
+
+- `StatusRecorder` / `NewStatusRecorder(w)` — wraps `http.ResponseWriter` to capture the response status; implements `Unwrap` so `http.ResponseController` reaches Flusher / Hijacker.
+- `RecordHTTP(c *LabeledCounter, h *Histogram, d time.Duration, labelVals ...string)` — record one request into the caller-supplied counter/histogram (either may be `nil`).
+- `InstrumentHandler(next, c, h, labelValues func(r, status) []string) http.Handler` — middleware wrapper. The caller owns the label set, ordering, and any path templating.
 
 ### Registry
-- `NewRegistry(prefix) *Registry` — collects metrics; `Handler()` returns `http.HandlerFunc`
-- `RegisterCounter`, `RegisterGauge`, `RegisterLabeledCounter`, `RegisterLabeledGauge`, `RegisterHistogram`, `RegisterLabeledHistogram`
-- `EnableImageMetrics()` — enables image metric output in handlers
-- `OpenMetricsHandler()` — returns handler serving OpenMetrics text format (1.0.0)
-- `NegotiateHandler()` — returns handler with content negotiation (OpenMetrics if Accept header requests it, otherwise Prometheus text)
 
-### Image Metrics
-- `SetImageMetrics([]ImageMetric)` — set per-image gauge data
+- `NewRegistry(prefix) *Registry` — every registered metric name is prefixed with `<prefix>_` (process metrics excepted). Pass `""` for no prefix.
+- `Register{Counter,Gauge,LabeledCounter,LabeledGauge,Histogram,LabeledHistogram}`.
+- `Handler()` — Prometheus text format 0.0.4.
+- `OpenMetricsHandler()` — OpenMetrics 1.0.0.
+- `NegotiateHandler()` — responds with OpenMetrics when the `Accept` header requests it, otherwise Prometheus text.
 
-### Process Metrics (emitted automatically)
-- `process_goroutines`, `process_heap_bytes`, `process_gc_pause_seconds_total`, `process_uptime_seconds`
-- `process_start_time_seconds`, `process_cpu_seconds_total` (Linux), `process_resident_memory_bytes` (Linux)
-- `process_open_fds`, `process_max_fds` (Linux)
+### Process metrics (emitted automatically)
 
-### Low-level Writers
-- `WriteCounter`, `WriteGauge`, `WriteLabeledCounter`, `WriteLabeledGauge`, `WriteHistogram`, `WriteLabeledHistogram`, `WriteImageMetrics`, `WriteProcessMetrics`
+- `process_goroutines`, `process_heap_bytes`, `process_gc_pause_seconds_total`, `process_uptime_seconds`, `process_start_time_seconds`.
+- Linux only: `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds`, `process_max_fds`.
 
-## Spec Conformance
+### Low-level writers
 
-This library emits valid Prometheus text exposition format (version 0.0.4):
-- Label values are escaped per spec: only `\`, `"`, and `\n` are escaped (as `\\`, `\"`, `\n`)
-- HELP text escapes `\` and `\n` only
-- Metric and label names are validated at creation time (`[a-zA-Z_:][a-zA-Z0-9_:]*` for metrics, `[a-zA-Z_][a-zA-Z0-9_]*` for labels)
-- Label arity is enforced (panics on mismatch)
-- Histograms always include `+Inf` bucket equal to `_count`
+`WriteCounter`, `WriteGauge`, `WriteLabeledCounter`, `WriteLabeledGauge`, `WriteHistogram`, `WriteLabeledHistogram`, `WriteProcessMetrics` — for callers building custom handlers.
 
-### OpenMetrics Text Format
+## Spec conformance
 
-Full support for OpenMetrics text exposition format 1.0.0 (the CNCF-standard successor to Prometheus format):
-- Content-Type: `application/openmetrics-text; version=1.0.0; charset=utf-8`
-- Exposition ends with mandatory `# EOF` line
-- TYPE metadata appears before HELP (per spec ordering)
-- Counter samples use `_total` suffix
-- Gauge values rendered as floats (e.g., `42.0`)
-- Content negotiation via `NegotiateHandler()` (responds to Accept header)
-- Direct access via `OpenMetricsHandler()`
+Valid Prometheus text exposition format 0.0.4: label values escape only `\`, `"`, and `\n` (as `\\`, `\"`, `\n`); HELP text escapes `\` and `\n`; metric/label names are validated at creation (panic on invalid); label arity is enforced (panic on mismatch); histograms always include a `+Inf` bucket equal to `_count`.
 
-## Unsupported by Design (SKIP List)
+OpenMetrics 1.0.0 support: content-type `application/openmetrics-text; version=1.0.0; charset=utf-8`, mandatory trailing `# EOF`, TYPE before HELP, counter samples use the `_total` suffix, gauge values render as floats. Use `NegotiateHandler()` for content negotiation, `OpenMetricsHandler()` for direct OpenMetrics output.
 
-The following features are intentionally not implemented:
+## Unsupported by design (SKIP list)
 
 | Feature | Reason |
 |---------|--------|
 | **Summary metric type** | Prometheus best practices recommend histograms; complex windowed-quantile implementation for no consumer benefit |
-| **Exemplars (OpenMetrics)** | Niche; requires tracing integration and adds complexity for a feature most scrapers ignore |
+| **Exemplars (OpenMetrics)** | Niche; requires tracing integration |
 | **Push / remote-write** | All consumers are pull-based |
 | **Protobuf exposition format** | Text format is default in Prometheus 3.0; protobuf requires code generation |
 | **Native histograms (exponential buckets)** | Requires protobuf format; large specialized implementation |
 | **Unregister / dynamic metric lifecycle** | All consumers have static metric sets |
+| **Image metrics** | Prior `EnableImageMetrics` / `SetImageMetrics` / `ImageMetric` API removed in v2; consumers that need per-image gauges layer them on `LabeledGauge` — see registry-stats |
 | **Float64 counter** | Integer counters are sufficient for all consumers |
 | **Gzip response compression** | Use standard HTTP middleware |
-| **Gauge.SetToCurrentTime()** | Trivial one-liner users can write themselves |
+| **`Gauge.SetToCurrentTime()`** | Trivial one-liner users can write themselves |
 
 ## License
+
 GPL-3.0 — see [LICENSE](LICENSE).
