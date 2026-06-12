@@ -51,7 +51,7 @@ not, and they are easy to break:
 
 ## Local development
 
-Requires the Go toolchain matching `go.mod` (currently `go 1.26.4`). Everything
+Requires the Go toolchain matching `go.mod`. Everything
 runs from the repo root:
 
 ```sh
