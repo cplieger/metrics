@@ -111,16 +111,9 @@ func TestR2_WithBuckets_Negative(t *testing.T) {
 }
 
 func TestR2_WithBuckets_NegInf(t *testing.T) {
-	h := NewHistogram("r2_neginf", "test", WithBuckets([]float64{math.Inf(-1), 0, 1}))
-	h.Observe(-100)
-	// -100 <= -Inf is false (nothing is <= -Inf except -Inf itself)
-	// Actually: -100 > -Inf, so -100 is NOT <= -Inf. Wait:
-	// math.Inf(-1) = -Inf. Is -100 <= -Inf? No, -100 > -Inf.
-	// Only -Inf <= -Inf. So -100 should land in le=0 bucket.
-	h.Observe(math.Inf(-1)) // exactly -Inf, should be <= -Inf
-	if h.count.Load() != 2 {
-		t.Errorf("count = %d, want 2", h.count.Load())
-	}
+	mustPanicContaining(t, "finite", func() {
+		NewHistogram("r2_neginf", "test", WithBuckets([]float64{math.Inf(-1), 0, 1}))
+	})
 }
 
 func TestR2_WithBuckets_VerySmall(t *testing.T) {
@@ -234,23 +227,15 @@ func TestR2_HistogramExposition_EmptyBuckets(t *testing.T) {
 }
 
 func TestR2_HistogramExposition_NaNBound(t *testing.T) {
-	h := NewHistogram("r2_nan_expo", "test", WithBuckets([]float64{math.NaN(), 1.0}))
-	h.Observe(0.5)
-
-	var b strings.Builder
-	WriteHistogram(&b, h)
-	out := b.String()
-
-	// Should not panic, should produce valid output
-	if !strings.Contains(out, "r2_nan_expo_count 1") {
-		t.Errorf("NaN bound exposition failed: %s", out)
-	}
+	mustPanicContaining(t, "finite", func() {
+		NewHistogram("r2_nan_expo", "test", WithBuckets([]float64{math.NaN(), 1.0}))
+	})
 }
 
 func TestR2_WithBuckets_NilSlice(t *testing.T) {
 	// WithBuckets(nil) — nil slice passed to the option
 	h := NewHistogram("r2_nil_slice", "test", WithBuckets(nil))
-	// nil slice: len(nil) == 0, so sorted is empty
+	// nil slice: len(nil) == 0, so bounds is empty
 	if len(h.bounds) != 0 {
 		t.Errorf("nil slice bounds = %d, want 0", len(h.bounds))
 	}
@@ -263,11 +248,11 @@ func TestR2_WithBuckets_NilSlice(t *testing.T) {
 // --- Option independence (WithBuckets does not mutate across calls) ---
 
 func TestR2_OptionIndependence(t *testing.T) {
-	opt := WithBuckets([]float64{5, 3, 1})
+	opt := WithBuckets([]float64{1, 3, 5})
 	h1 := NewHistogram("r2_indep1", "test", opt)
 	h2 := NewHistogram("r2_indep2", "test", opt)
 
-	// Both should have sorted [1, 3, 5]
+	// Both should have [1, 3, 5]
 	if len(h1.bounds) != 3 || len(h2.bounds) != 3 {
 		t.Fatal("bounds length mismatch")
 	}
@@ -280,7 +265,7 @@ func TestR2_OptionIndependence(t *testing.T) {
 }
 
 func TestR2_SharedOption_ConcurrentUse(t *testing.T) {
-	opt := WithBuckets([]float64{5, 3, 1, 4, 2})
+	opt := WithBuckets([]float64{1, 2, 3, 4, 5})
 	var wg sync.WaitGroup
 	for i := range 20 {
 		wg.Go(func() {

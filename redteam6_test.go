@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // ====================================================================
@@ -76,6 +77,7 @@ func TestRT6_LabeledGauge_SetResetDeleteRacingScrape(t *testing.T) {
 			}
 		})
 	}
+	time.Sleep(50 * time.Millisecond) // let producers/scrapers actually overlap
 	close(stop)
 	wg.Wait()
 }
@@ -159,6 +161,7 @@ func TestRT6_LabeledGauge_WriteDuringDelete(t *testing.T) {
 		}
 	})
 
+	time.Sleep(50 * time.Millisecond) // let producers/scrapers actually overlap
 	close(stop)
 	wg.Wait()
 }
@@ -178,8 +181,8 @@ func TestRT6_GaugeSpecialValues(t *testing.T) {
 		{"pos_inf", math.Inf(1), posInf, posInf},
 		{"neg_inf", math.Inf(-1), negInf, negInf},
 		{"nan", math.NaN(), nanStr, nanStr},
-		{"zero", 0, "0", "0.0"},
-		{"neg_zero", math.Copysign(0, -1), "0", "0.0"},
+		{"zero", 0, "0", "0"},
+		{"neg_zero", math.Copysign(0, -1), "0", "0"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -271,11 +274,11 @@ func TestRT6_HelpEscaping_AllFormats(t *testing.T) {
 		t.Errorf("Prometheus HELP escaping wrong:\n%s", out)
 	}
 
-	// OpenMetrics
+	// OpenMetrics: per OpenMetrics 1.0.0 escaped-string, double quotes are escaped as \"
 	b.Reset()
 	writeOMSimpleCounter(&b, c)
 	omOut := b.String()
-	if !strings.Contains(omOut, `# HELP rt6_help_esc line1\\line2\nline3"quoted"`) {
+	if !strings.Contains(omOut, `# HELP rt6_help_esc line1\\line2\nline3\"quoted\"`) {
 		t.Errorf("OpenMetrics HELP escaping wrong:\n%s", omOut)
 	}
 }
@@ -344,9 +347,17 @@ func TestRT6_OpenMetrics_GaugeFloat(t *testing.T) {
 	r.OpenMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()
 
-	// OpenMetrics gauges should render integers as "42.0"
-	if !strings.Contains(body, "rt6_temp 42.0") {
-		t.Errorf("OM gauge should have .0 suffix for integer:\n%s", body)
+	// A whole-valued gauge renders as a bare integer in OpenMetrics too (the
+	// ABNF realnumber accepts a bare integer); both formats agree on "42".
+	if !strings.Contains(body, "rt6_temp 42\n") {
+		t.Errorf("OM gauge should render whole value as bare integer:\n%s", body)
+	}
+	// A fractional gauge keeps its decimal form.
+	g.Set(36.6)
+	rec = httptest.NewRecorder()
+	r.OpenMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if body := rec.Body.String(); !strings.Contains(body, "rt6_temp 36.6\n") {
+		t.Errorf("OM gauge fractional value wrong:\n%s", body)
 	}
 }
 
@@ -416,9 +427,11 @@ func FuzzRT6_LabelValuePanicCheck(f *testing.F) {
 
 		var b strings.Builder
 		WriteLabeledGauge(&b, lg)
+		assertExpositionLabelsBalanced(t, b.String())
 
 		b.Reset()
 		writeOMLabeledGauge(&b, lg)
+		assertExpositionLabelsBalanced(t, b.String())
 	})
 }
 
@@ -426,13 +439,18 @@ func FuzzRT6_BucketBounds(f *testing.F) {
 	f.Add(0.001, 0.01, 0.1)
 	f.Add(-1.0, 0.0, 1.0)
 	f.Add(math.SmallestNonzeroFloat64, 1.0, math.MaxFloat64)
-	f.Add(0.0, 0.0, 0.0)
+	f.Add(-100.0, 0.0, 100.0)
 
 	f.Fuzz(func(t *testing.T, b1, b2, b3 float64) {
 		if math.IsNaN(b1) || math.IsNaN(b2) || math.IsNaN(b3) {
 			return
 		}
 		if math.IsInf(b1, 0) || math.IsInf(b2, 0) || math.IsInf(b3, 0) {
+			return
+		}
+		// The bucket contract requires strictly increasing finite bounds;
+		// anything else panics at construction by design, so skip it here.
+		if !(b1 < b2 && b2 < b3) {
 			return
 		}
 
@@ -445,9 +463,14 @@ func FuzzRT6_BucketBounds(f *testing.F) {
 
 		var sb strings.Builder
 		WriteHistogram(&sb, h)
+		out := sb.String()
 
 		if got := h.count.Load(); got != 5 {
 			t.Errorf("count = %d, want 5", got)
+		}
+		// Every Observe lands in +Inf bucket regardless of bound layout
+		if !strings.Contains(out, "fuzz_rt6_hist_count 5") {
+			t.Errorf("rendered _count must equal 5:\n%s", out)
 		}
 	})
 }
@@ -483,6 +506,7 @@ func TestRT6_LabeledCounter_ScrapeRace(t *testing.T) {
 		}
 	})
 
+	time.Sleep(50 * time.Millisecond) // let producers/scrapers actually overlap
 	close(stop)
 	wg.Wait()
 }
@@ -518,6 +542,7 @@ func TestRT6_LabeledHistogram_ScrapeRace(t *testing.T) {
 		}
 	})
 
+	time.Sleep(50 * time.Millisecond) // let producers/scrapers actually overlap
 	close(stop)
 	wg.Wait()
 }
@@ -594,6 +619,7 @@ func TestRT6_FullHandler_ResetDeleteRace(t *testing.T) {
 		}
 	})
 
+	time.Sleep(50 * time.Millisecond) // let producers/scrapers actually overlap
 	close(stop)
 	wg.Wait()
 }

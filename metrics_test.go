@@ -4,6 +4,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -276,9 +277,72 @@ func TestHistogramCustomBuckets(t *testing.T) {
 	}
 }
 
+func TestHistogram_Observe_valueEqualToBound_countsInThatBucket(t *testing.T) {
+	// le is "less than or equal": an observation exactly equal to a bound
+	// must be counted in that bound's cumulative bucket.
+	h := NewHistogram("boundary_hist", "test", WithBuckets([]float64{0.1, 0.5, 1}))
+
+	h.Observe(0.1) // exactly the first bound
+	h.Observe(0.5) // exactly the second bound
+	h.Observe(1)   // exactly the third bound
+
+	_, count, bucketVals := h.snapshot()
+
+	if count != 3 {
+		t.Errorf("Observe boundary values: count = %d, want 3", count)
+	}
+	// Cumulative: le=0.1 -> {0.1}=1; le=0.5 -> {0.1,0.5}=2; le=1 -> all=3; +Inf=3.
+	want := []int64{1, 2, 3, 3}
+	for i, w := range want {
+		if got := bucketVals[i]; got != w {
+			t.Errorf("bucket[%d] = %d, want %d (boundary inclusive)", i, got, w)
+		}
+	}
+}
+
+func FuzzHistogram_BucketPlacementInvariant(f *testing.F) {
+	f.Add(0.1, 0.5, 1.0, 0.3)
+	f.Add(1.0, 5.0, 10.0, 7.0)
+	f.Add(-1.0, 0.0, 1.0, 0.0)
+
+	f.Fuzz(func(t *testing.T, b1, b2, b3, obs float64) {
+		for _, v := range []float64{b1, b2, b3, obs} {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				return
+			}
+		}
+		// Contract: bounds must be strictly increasing finite values.
+		if !(b1 < b2 && b2 < b3) {
+			return
+		}
+		bounds := []float64{b1, b2, b3}
+		h := NewHistogram("fuzz_placement", "fuzz", WithBuckets(bounds))
+		h.Observe(obs)
+
+		_, count, bucketVals := h.snapshot()
+		if count != 1 {
+			t.Fatalf("count = %d, want 1", count)
+		}
+		// bucket[i] == 1 iff obs <= bounds[i], else 0 (cumulative).
+		for i, bound := range bounds {
+			want := int64(0)
+			if obs <= bound {
+				want = 1
+			}
+			if got := bucketVals[i]; got != want {
+				t.Errorf("obs=%v bound[%d]=%v: bucket=%d, want %d", obs, i, bound, got, want)
+			}
+		}
+		// +Inf bucket always counts every observation.
+		if got := bucketVals[len(bounds)]; got != 1 {
+			t.Errorf("+Inf bucket = %d, want 1", got)
+		}
+	})
+}
+
 func TestWriteProcessMetrics(t *testing.T) {
 	var b strings.Builder
-	WriteProcessMetrics(&b, time.Now().Add(-5*time.Second))
+	WriteProcessMetrics(&b)
 	out := b.String()
 	for _, want := range []string{
 		"process_goroutines",
@@ -293,19 +357,34 @@ func TestWriteProcessMetrics(t *testing.T) {
 	}
 }
 
-func TestFormatBound(t *testing.T) {
+func TestFormatValue(t *testing.T) {
 	tests := []struct {
 		in   float64
 		want string
 	}{
+		// Whole finite values render as bare integers (valid in both formats).
 		{1.0, "1"},
+		{0, "0"},
+		{-1, "-1"},
+		{42, "42"},
+		{1e15, "1000000000000000"},
+		// Beyond the int64-exact range, fall back to shortest 'g'.
+		{1e16, "1e+16"},
+		{-1e16, "-1e+16"},
+		// Fractional values keep full precision (shortest round-trip).
 		{0.005, "0.005"},
 		{0.5, "0.5"},
 		{0.025, "0.025"},
+		{3.14, "3.14"},
+		{1e-7, "1e-07"},
+		// Non-finite spec tokens (accepted case-insensitively by both formats).
+		{math.Inf(1), "+Inf"},
+		{math.Inf(-1), "-Inf"},
+		{math.NaN(), "NaN"},
 	}
 	for _, tt := range tests {
-		if got := FormatBound(tt.in); got != tt.want {
-			t.Errorf("FormatBound(%v) = %q, want %q", tt.in, got, tt.want)
+		if got := formatValue(tt.in); got != tt.want {
+			t.Errorf("formatValue(%v) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 }
@@ -477,28 +556,37 @@ func TestLabelValueTabNotOverEscaped(t *testing.T) {
 	}
 }
 
-func TestWriteProcessMetrics_uses_startTime(t *testing.T) {
+func TestWriteProcessMetrics_uptimeAndStartTimeReconcile(t *testing.T) {
+	// process_uptime_seconds and process_start_time_seconds now derive from a
+	// single anchor (package-init processStartTime), so start + uptime must
+	// reconcile with now -- the inconsistency l-f3 fixed.
 	var b strings.Builder
-	start := time.Now().Add(-10 * time.Second)
-	WriteProcessMetrics(&b, start)
+	WriteProcessMetrics(&b)
 	out := b.String()
 
-	if !strings.Contains(out, "process_uptime_seconds") {
-		t.Fatal("missing process_uptime_seconds")
-	}
+	var uptime, start float64
+	var gotUptime, gotStart bool
 	for line := range strings.SplitSeq(out, "\n") {
-		if valStr, ok := strings.CutPrefix(line, "process_uptime_seconds "); ok {
-			val, err := strconv.ParseFloat(valStr, 64)
-			if err != nil {
-				t.Fatalf("failed to parse uptime: %v", err)
-			}
-			if val < 10.0 {
-				t.Errorf("uptime = %.3f, want >= 10.0", val)
-			}
-			return
+		if v, ok := strings.CutPrefix(line, "process_uptime_seconds "); ok {
+			uptime, _ = strconv.ParseFloat(v, 64)
+			gotUptime = true
+		}
+		if v, ok := strings.CutPrefix(line, "process_start_time_seconds "); ok {
+			start, _ = strconv.ParseFloat(v, 64)
+			gotStart = true
 		}
 	}
-	t.Error("process_uptime_seconds line not found")
+	if !gotUptime || !gotStart {
+		t.Fatal("missing process_uptime_seconds or process_start_time_seconds")
+	}
+	if uptime < 0 {
+		t.Errorf("uptime = %.3f, want >= 0", uptime)
+	}
+	now := float64(time.Now().Unix())
+	if diff := now - (start + uptime); diff < -2 || diff > 2 {
+		t.Errorf("start(%.0f) + uptime(%.3f) = %.3f, want ~= now(%.0f); diff=%.3f",
+			start, uptime, start+uptime, now, diff)
+	}
 }
 
 func TestMetricNameValidation(t *testing.T) {
@@ -614,6 +702,86 @@ func TestLabeledGauge_DeleteArityPanic(t *testing.T) {
 	}()
 	lg := NewLabeledGauge("lg_del_panic", "test", []string{"a", "b"})
 	lg.Delete("only_one")
+}
+
+func TestLabeledCounter_Reset(t *testing.T) {
+	lc := NewLabeledCounter("lc_reset_total", "test", []string{"host"})
+	lc.Inc("a")
+	lc.Inc("b")
+	lc.Reset()
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	if b.Len() != 0 {
+		t.Errorf("expected empty output after Reset, got: %s", b.String())
+	}
+}
+
+func TestLabeledCounter_Delete(t *testing.T) {
+	lc := NewLabeledCounter("lc_delete_total", "test", []string{"host"})
+	lc.Inc("a")
+	lc.Inc("b")
+	lc.Delete("a")
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	out := b.String()
+	if strings.Contains(out, `host="a"`) {
+		t.Errorf("deleted key still present: %s", out)
+	}
+	if !strings.Contains(out, `host="b"`) {
+		t.Errorf("remaining key missing: %s", out)
+	}
+}
+
+func TestLabeledCounter_DeleteArityPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for arity mismatch")
+		}
+	}()
+	lc := NewLabeledCounter("lc_del_panic_total", "test", []string{"a", "b"})
+	lc.Delete("only_one")
+}
+
+func TestLabeledHistogram_Reset(t *testing.T) {
+	lh := NewLabeledHistogram("lh_reset", "test", []string{"host"}, WithBuckets([]float64{0.1, 1}))
+	lh.Observe(0.05, "a")
+	lh.Observe(0.05, "b")
+	lh.Reset()
+
+	var b strings.Builder
+	WriteLabeledHistogram(&b, lh)
+	if b.Len() != 0 {
+		t.Errorf("expected empty output after Reset, got: %s", b.String())
+	}
+}
+
+func TestLabeledHistogram_Delete(t *testing.T) {
+	lh := NewLabeledHistogram("lh_delete", "test", []string{"host"}, WithBuckets([]float64{0.1, 1}))
+	lh.Observe(0.05, "a")
+	lh.Observe(0.05, "b")
+	lh.Delete("a")
+
+	var b strings.Builder
+	WriteLabeledHistogram(&b, lh)
+	out := b.String()
+	if strings.Contains(out, `host="a"`) {
+		t.Errorf("deleted key still present: %s", out)
+	}
+	if !strings.Contains(out, `host="b"`) {
+		t.Errorf("remaining key missing: %s", out)
+	}
+}
+
+func TestLabeledHistogram_DeleteArityPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for arity mismatch")
+		}
+	}()
+	lh := NewLabeledHistogram("lh_del_panic", "test", []string{"a", "b"})
+	lh.Delete("only_one")
 }
 
 func TestLabeledGauge_ResetConcurrent(t *testing.T) {
@@ -743,6 +911,177 @@ func FuzzLabelValueExposition(f *testing.F) {
 			if braceOpen >= 0 && braceClose < braceOpen {
 				t.Errorf("malformed OM label section: %s", line)
 			}
+		}
+	})
+}
+
+func TestNewLabeledGauge_TooManyLabelsPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for >4 labels")
+		}
+	}()
+	NewLabeledGauge("lg_many", "test", []string{"a", "b", "c", "d", "e"})
+}
+
+func TestNewLabeledHistogram_TooManyLabelsPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for >4 labels")
+		}
+	}()
+	NewLabeledHistogram("lh_many", "test", []string{"a", "b", "c", "d", "e"})
+}
+
+func TestWriteCounter_escapes_carriage_return(t *testing.T) {
+	c := NewCounter("cr_counter", "line1\rline2")
+	c.Inc()
+
+	var b strings.Builder
+	WriteCounter(&b, c)
+	out := b.String()
+
+	if !strings.Contains(out, `# HELP cr_counter line1\rline2`) {
+		t.Errorf("CR in HELP not escaped to \\r: %q", out)
+	}
+	if strings.Contains(out, "line1\rline2") {
+		t.Errorf("raw carriage return leaked into exposition output: %q", out)
+	}
+}
+
+func TestLabelValueEscapingCarriageReturn(t *testing.T) {
+	lc := NewLabeledCounter("esc_cr_lc", "test", []string{"msg"})
+	lc.Inc("a\rb")
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	out := b.String()
+
+	if !strings.Contains(out, `msg="a\rb"`) {
+		t.Errorf("CR in label value not escaped to \\r: %q", out)
+	}
+	if strings.Contains(out, "a\rb") {
+		t.Errorf("raw carriage return leaked into label value: %q", out)
+	}
+}
+
+func TestHistogramSnapshot(t *testing.T) {
+	h := NewHistogram("snap_test", "snapshot",
+		WithBuckets([]float64{0.1, 0.5, 1}))
+	h.Observe(0.05) // lands in <=0.1, <=0.5, <=1, +Inf
+	h.Observe(0.3)  // lands in <=0.5, <=1, +Inf
+	h.Observe(2.0)  // lands in +Inf only
+	sum, count, buckets := h.snapshot()
+	// count=3, sum=2.35, cumulative buckets=[1,2,2,3]
+	if count != 3 {
+		t.Errorf("count = %d, want 3", count)
+	}
+	wantSum := 0.05 + 0.3 + 2.0
+	if math.Abs(sum-wantSum) > 1e-9 {
+		t.Errorf("sum = %v, want %v", sum, wantSum)
+	}
+	want := []int64{1, 2, 2, 3}
+	for i := range want {
+		if buckets[i] != want[i] {
+			t.Errorf("buckets[%d] = %d, want %d", i, buckets[i], want[i])
+		}
+	}
+}
+
+func TestSortedLabelKeys_returnsLexicographicOrder(t *testing.T) {
+	var mu sync.RWMutex
+	vals := map[labelKey]int{
+		{"b", "2", "", ""}: 1,
+		{"a", "9", "", ""}: 1,
+		{"a", "1", "", ""}: 1,
+		{"c", "0", "", ""}: 1,
+	}
+	got := sortedLabelKeys(&mu, vals)
+	want := []labelKey{
+		{"a", "1", "", ""},
+		{"a", "9", "", ""},
+		{"b", "2", "", ""},
+		{"c", "0", "", ""},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("sortedLabelKeys() = %v, want %v", got, want)
+	}
+}
+
+func TestSortedLabelKeys_empty(t *testing.T) {
+	var mu sync.RWMutex
+	if got := sortedLabelKeys(&mu, map[labelKey]int{}); len(got) != 0 {
+		t.Errorf("sortedLabelKeys(empty) = %v, want empty", got)
+	}
+}
+
+func TestLabeledCounterAdd(t *testing.T) {
+	lc := NewLabeledCounter("test_lc_add", "test", []string{"method", "status"})
+	lc.Add(5, "GET", "200") // new key: Store(5)
+	lc.Add(3, "GET", "200") // existing key: Add(3) -> 8
+	lc.Add(10, "POST", "201")
+
+	key := labelKey{"GET", "200", "", ""}
+	if got := lc.vals[key].Load(); got != 8 {
+		t.Errorf("LabeledCounter.Add[GET,200] = %d, want 8", got)
+	}
+	key2 := labelKey{"POST", "201", "", ""}
+	if got := lc.vals[key2].Load(); got != 10 {
+		t.Errorf("LabeledCounter.Add[POST,201] = %d, want 10", got)
+	}
+}
+
+func TestLabeledCounterAdd_zeroOnNewKey(t *testing.T) {
+	lc := NewLabeledCounter("test_lc_add_zero", "test", []string{"k"})
+	lc.Add(0, "a")
+	key := labelKey{"a", "", "", ""}
+	v, ok := lc.vals[key]
+	if !ok {
+		t.Fatal("Add(0) should create the label entry")
+	}
+	if got := v.Load(); got != 0 {
+		t.Errorf("LabeledCounter.Add(0)[a] = %d, want 0", got)
+	}
+}
+
+func TestLabeledCounterAdd_negativePanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for negative Add")
+		}
+	}()
+	lc := NewLabeledCounter("test_lc_add_neg", "test", []string{"k"})
+	lc.Add(-1, "a") // correct arity: hits the negative guard, not the arity guard
+}
+
+func TestLabeledCounterAdd_arityMismatchPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for arity mismatch")
+		}
+	}()
+	lc := NewLabeledCounter("test_lc_add_arity", "test", []string{"method", "status"})
+	lc.Add(1, "GET") // n>=0 passes negative guard, then arity guard fires
+}
+
+func TestWriteHistogram_SumRendering(t *testing.T) {
+	t.Run("tiny sum keeps precision", func(t *testing.T) {
+		h := NewHistogram("hist_sum_tiny", "test")
+		h.Observe(1e-7) // pre-l-f3 %.6f floored this sum to "0.000000"
+		var b strings.Builder
+		WriteHistogram(&b, h)
+		if got := b.String(); !strings.Contains(got, "hist_sum_tiny_sum 1e-07\n") {
+			t.Errorf("WriteHistogram sum = %q, want line %q", got, "hist_sum_tiny_sum 1e-07")
+		}
+	})
+	t.Run("whole sum renders as bare integer", func(t *testing.T) {
+		h := NewHistogram("hist_sum_whole", "test")
+		h.Observe(2)
+		h.Observe(2) // sum = 4; pre-l-f3 %.6f rendered "4.000000"
+		var b strings.Builder
+		WriteHistogram(&b, h)
+		if got := b.String(); !strings.Contains(got, "hist_sum_whole_sum 4\n") {
+			t.Errorf("WriteHistogram sum = %q, want line %q", got, "hist_sum_whole_sum 4")
 		}
 	})
 }

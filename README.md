@@ -75,7 +75,7 @@ func main() {
 ### Counters
 
 - `NewCounter(name, help) *Counter` — monotonic counter; `Inc()`, `Add(n int64)`.
-- `NewLabeledCounter(name, help, labels) *LabeledCounter` — `Inc(vals...)`; panics on label-arity mismatch.
+- `NewLabeledCounter(name, help, labels) *LabeledCounter` — `Inc(vals...)`, `Add(int64, vals...)`, `Delete(vals...)`, `Reset()`; panics on label-arity mismatch.
 
 ### Gauges
 
@@ -85,9 +85,8 @@ func main() {
 ### Histograms
 
 - `NewHistogram(name, help, opts ...Option) *Histogram` — `Observe(seconds)`; uses `DefaultBuckets` unless `WithBuckets` is provided.
-- `NewLabeledHistogram(name, help, labels, opts ...Option) *LabeledHistogram` — `Observe(seconds, vals...)`.
-- `WithBuckets([]float64) Option` — sets custom bucket boundaries.
-- `FormatBound(float64) string` — formats a bucket boundary for Prometheus output.
+- `NewLabeledHistogram(name, help, labels, opts ...Option) *LabeledHistogram` — `Observe(seconds, vals...)`, `Delete(vals...)`, `Reset()`.
+- `WithBuckets([]float64) Option` — sets custom bucket boundaries. Bounds must be a strictly increasing sequence of finite values; the implicit `le="+Inf"` bucket is appended for you, so do not include `+Inf`. Non-finite, duplicate, or out-of-order bounds panic at construction. An empty slice yields a histogram with only the `+Inf` bucket.
 
 ### Timer
 
@@ -120,9 +119,9 @@ func main() {
 
 ## Spec conformance
 
-Valid Prometheus text exposition format 0.0.4: label values escape only `\`, `"`, and `\n` (as `\\`, `\"`, `\n`); HELP text escapes `\` and `\n`; metric/label names are validated at creation (panic on invalid); label arity is enforced (panic on mismatch); histograms always include a `+Inf` bucket equal to `_count`.
+Valid Prometheus text exposition format 0.0.4: label values escape only `\`, `"`, and `\n` (as `\\`, `\"`, `\n`); HELP text escapes `\` and `\n`; metric/label names are validated at creation (panic on invalid); label arity is enforced (panic on mismatch); duplicate metric family names panic at registration (fail-fast, including the reserved `process_*` names); histogram bucket bounds are validated at creation (panic unless strictly increasing and finite); histograms always include a `+Inf` bucket equal to `_count`.
 
-OpenMetrics 1.0.0 support: content-type `application/openmetrics-text; version=1.0.0; charset=utf-8`, mandatory trailing `# EOF`, TYPE before HELP, counter samples use the `_total` suffix, gauge values render as floats. Use `NegotiateHandler()` for content negotiation, `OpenMetricsHandler()` for direct OpenMetrics output.
+OpenMetrics 1.0.0 support: content-type `application/openmetrics-text; version=1.0.0; charset=utf-8`, mandatory trailing `# EOF`, TYPE before HELP, counter samples use the `_total` suffix. Numeric values render through a single canonical formatter shared by both formats, so a given value is exposed identically: whole values as bare integers (e.g. `42`), other values in shortest round-trippable form, and `+Inf`/`-Inf`/`NaN` for non-finite. Use `NegotiateHandler()` for content negotiation, `OpenMetricsHandler()` for direct OpenMetrics output.
 
 ## Unsupported by design (SKIP list)
 

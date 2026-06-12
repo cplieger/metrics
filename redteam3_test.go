@@ -395,20 +395,9 @@ func TestHistogram_EmptyBuckets(t *testing.T) {
 }
 
 func TestHistogram_DuplicateBuckets(t *testing.T) {
-	h := NewHistogram("dup_buckets", "test", WithBuckets([]float64{1, 1, 5, 5, 10}))
-	h.Observe(3)
-
-	var b strings.Builder
-	WriteHistogram(&b, h)
-	out := b.String()
-
-	// Should not panic; duplicates are sorted and output as-is
-	if !strings.Contains(out, "# TYPE dup_buckets histogram") {
-		t.Errorf("missing TYPE: %s", out)
-	}
-	if h.count.Load() != 1 {
-		t.Errorf("count wrong: %d", h.count.Load())
-	}
+	mustPanicContaining(t, "strictly increasing", func() {
+		NewHistogram("dup_buckets", "test", WithBuckets([]float64{1, 1, 5, 5, 10}))
+	})
 }
 
 func TestHistogram_NegativeBuckets(t *testing.T) {
@@ -433,20 +422,9 @@ func TestHistogram_NegativeBuckets(t *testing.T) {
 }
 
 func TestHistogram_InfBucket(t *testing.T) {
-	h := NewHistogram("inf_buckets", "test", WithBuckets([]float64{1, math.Inf(1)}))
-	h.Observe(0.5)
-	h.Observe(100)
-
-	var b strings.Builder
-	WriteHistogram(&b, h)
-	out := b.String()
-
-	if !strings.Contains(out, "# TYPE inf_buckets histogram") {
-		t.Errorf("missing TYPE: %s", out)
-	}
-	if h.count.Load() != 2 {
-		t.Errorf("count wrong: %d", h.count.Load())
-	}
+	mustPanicContaining(t, "finite", func() {
+		NewHistogram("inf_buckets", "test", WithBuckets([]float64{1, math.Inf(1)}))
+	})
 }
 
 func TestHistogram_NaNObserve(t *testing.T) {

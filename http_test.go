@@ -65,3 +65,23 @@ func TestInstrumentHandler(t *testing.T) {
 		t.Errorf("InstrumentHandler did not record labeled request:\n%s", out)
 	}
 }
+
+func TestStatusRecorder_Unwrap(t *testing.T) {
+	inner := httptest.NewRecorder()
+	rec := NewStatusRecorder(inner)
+	if got := rec.Unwrap(); got != inner {
+		t.Errorf("Unwrap() = %v, want underlying recorder", got)
+	}
+}
+
+func TestStatusRecorder_UnwrapExposesFlusher(t *testing.T) {
+	inner := httptest.NewRecorder()
+	rec := NewStatusRecorder(inner)
+	rc := http.NewResponseController(rec)
+	if err := rc.Flush(); err != nil {
+		t.Errorf("Flush through StatusRecorder = %v, want nil", err)
+	}
+	if !inner.Flushed {
+		t.Error("underlying recorder was not flushed; Unwrap did not expose Flusher")
+	}
+}

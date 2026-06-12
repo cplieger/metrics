@@ -3,7 +3,6 @@ package metrics
 import (
 	"fmt"
 	"math"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,9 +10,10 @@ import (
 
 // Gauge is a value that can go up and down (float64).
 type Gauge struct {
-	name string
-	help string
-	bits atomic.Uint64
+	name       string
+	help       string
+	bits       atomic.Uint64
+	registered atomic.Bool
 }
 
 // NewGauge creates a named gauge.
@@ -50,22 +50,18 @@ func (g *Gauge) Get() float64 { return math.Float64frombits(g.bits.Load()) }
 
 // WriteGauge writes a gauge in Prometheus text format.
 func WriteGauge(b *strings.Builder, g *Gauge) {
-	v := g.Get()
 	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n", g.name, helpEscaper.Replace(g.help), g.name)
-	if v == float64(int64(v)) && !math.IsInf(v, 0) && !math.IsNaN(v) {
-		fmt.Fprintf(b, "%s %d\n", g.name, int64(v))
-	} else {
-		fmt.Fprintf(b, "%s %g\n", g.name, v)
-	}
+	fmt.Fprintf(b, "%s %s\n", g.name, formatValue(g.Get()))
 }
 
 // LabeledGauge tracks gauges per label combination.
 type LabeledGauge struct {
-	vals   map[labelKey]*atomic.Uint64
-	name   string
-	help   string
-	labels []string
-	mu     sync.RWMutex
+	vals       map[labelKey]*atomic.Uint64
+	name       string
+	help       string
+	labels     []string
+	registered atomic.Bool
+	mu         sync.RWMutex
 }
 
 // NewLabeledGauge creates a labeled gauge.
@@ -85,45 +81,24 @@ func NewLabeledGauge(name, help string, labels []string) *LabeledGauge {
 
 // Set sets the gauge for the given label values.
 func (lg *LabeledGauge) Set(v float64, labelVals ...string) {
-	if len(labelVals) != len(lg.labels) {
-		panic("metrics: label arity mismatch")
-	}
-	var key labelKey
-	copy(key[:], labelVals)
-	lg.mu.RLock()
-	ptr, ok := lg.vals[key]
-	lg.mu.RUnlock()
-	if ok {
+	key := labelKeyFor(lg.labels, labelVals)
+	if ptr, loaded := loadOrStore(&lg.mu, lg.vals, key,
+		func() *atomic.Uint64 { u := &atomic.Uint64{}; u.Store(math.Float64bits(v)); return u }); loaded {
 		ptr.Store(math.Float64bits(v))
-		return
 	}
-	lg.mu.Lock()
-	if ptr, ok = lg.vals[key]; ok {
-		lg.mu.Unlock()
-		ptr.Store(math.Float64bits(v))
-		return
-	}
-	ptr = &atomic.Uint64{}
-	ptr.Store(math.Float64bits(v))
-	lg.vals[key] = ptr
-	lg.mu.Unlock()
 }
 
 // Reset removes all label combinations from the gauge.
 func (lg *LabeledGauge) Reset() {
 	lg.mu.Lock()
-	lg.vals = make(map[labelKey]*atomic.Uint64)
+	clear(lg.vals)
 	lg.mu.Unlock()
 }
 
 // Delete removes a single label combination from the gauge.
 // It panics if the number of label values does not match the label count.
 func (lg *LabeledGauge) Delete(labelVals ...string) {
-	if len(labelVals) != len(lg.labels) {
-		panic("metrics: label arity mismatch")
-	}
-	var key labelKey
-	copy(key[:], labelVals)
+	key := labelKeyFor(lg.labels, labelVals)
 	lg.mu.Lock()
 	delete(lg.vals, key)
 	lg.mu.Unlock()
@@ -131,23 +106,10 @@ func (lg *LabeledGauge) Delete(labelVals ...string) {
 
 // WriteLabeledGauge writes a labeled gauge in Prometheus text format.
 func WriteLabeledGauge(b *strings.Builder, lg *LabeledGauge) {
-	lg.mu.RLock()
-	keys := make([]labelKey, 0, len(lg.vals))
-	for k := range lg.vals {
-		keys = append(keys, k)
-	}
-	lg.mu.RUnlock()
+	keys := sortedLabelKeys(&lg.mu, lg.vals)
 	if len(keys) == 0 {
 		return
 	}
-	sort.Slice(keys, func(a, c int) bool {
-		for i := range keys[a] {
-			if keys[a][i] != keys[c][i] {
-				return keys[a][i] < keys[c][i]
-			}
-		}
-		return false
-	})
 	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n", lg.name, helpEscaper.Replace(lg.help), lg.name)
 	for _, key := range keys {
 		lg.mu.RLock()
@@ -158,10 +120,6 @@ func WriteLabeledGauge(b *strings.Builder, lg *LabeledGauge) {
 		}
 		v := math.Float64frombits(ptr.Load())
 		labelStr := buildLabelString(lg.labels, key)
-		if v == float64(int64(v)) && !math.IsInf(v, 0) && !math.IsNaN(v) {
-			fmt.Fprintf(b, "%s{%s} %d\n", lg.name, labelStr, int64(v))
-		} else {
-			fmt.Fprintf(b, "%s{%s} %g\n", lg.name, labelStr, v)
-		}
+		fmt.Fprintf(b, "%s{%s} %s\n", lg.name, labelStr, formatValue(v))
 	}
 }
