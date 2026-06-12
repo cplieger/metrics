@@ -95,21 +95,27 @@ func FuzzOpenMetricsLabelExposition(f *testing.F) {
 		rec := httptest.NewRecorder()
 		reg.OpenMetricsHandler()(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 		out := rec.Body.String()
-		// Check all label values are properly quoted
-		for line := range strings.SplitSeq(out, "\n") {
-			if !strings.Contains(line, "{") {
-				continue
-			}
-			braceStart := strings.IndexByte(line, '{')
-			braceEnd := strings.LastIndexByte(line, '}')
-			if braceEnd <= braceStart {
-				t.Fatalf("unbalanced braces: %q", line)
-			}
-			inner := line[braceStart+1 : braceEnd]
-			// Verify no unescaped quotes inside label values
-			checkLabelQuoting(t, inner)
-		}
+		assertExpositionLabelsBalanced(t, out)
 	})
+}
+
+// assertExpositionLabelsBalanced verifies every labeled exposition line in out
+// has balanced braces and properly escaped (quote-balanced) label values. It is
+// shared by the counter- and gauge-path label-fuzz targets so both assert the
+// same structural invariant rather than merely catching panics.
+func assertExpositionLabelsBalanced(t *testing.T, out string) {
+	t.Helper()
+	for line := range strings.SplitSeq(out, "\n") {
+		if !strings.Contains(line, "{") {
+			continue
+		}
+		braceStart := strings.IndexByte(line, '{')
+		braceEnd := strings.LastIndexByte(line, '}')
+		if braceEnd <= braceStart {
+			t.Fatalf("unbalanced braces: %q", line)
+		}
+		checkLabelQuoting(t, line[braceStart+1:braceEnd])
+	}
 }
 
 func checkLabelQuoting(t *testing.T, inner string) {
@@ -170,6 +176,65 @@ func FuzzRegistryFullExposition(f *testing.F) {
 				default:
 					t.Fatalf("unknown type %q in line: %q", typ, line)
 				}
+			}
+		}
+	})
+}
+
+func FuzzOpenMetricsHelpExposition(f *testing.F) {
+	f.Add("simple help")
+	f.Add("line\nbreak")
+	f.Add(`back\slash`)
+	f.Add(`quote"here`)
+	f.Add("cr\rreturn")
+	f.Add("\x00\xff\n\\\"\r")
+	f.Fuzz(func(t *testing.T, help string) {
+		c := &Counter{name: "om_help_counter", help: help}
+		var b strings.Builder
+		writeOMSimpleCounter(&b, c)
+		for line := range strings.SplitSeq(b.String(), "\n") {
+			content, ok := strings.CutPrefix(line, "# HELP om_help_counter ")
+			if !ok {
+				continue
+			}
+			if strings.ContainsRune(content, '\r') {
+				t.Fatalf("raw CR in OM HELP line: %q", content)
+			}
+			for i := 0; i < len(content); i++ {
+				switch content[i] {
+				case '\\':
+					if i+1 >= len(content) {
+						t.Fatalf("trailing backslash in OM HELP: %q", content)
+					}
+					if n := content[i+1]; n != '\\' && n != 'n' && n != 'r' && n != '"' {
+						t.Fatalf("invalid escape \\%c in OM HELP: %q", n, content)
+					}
+					i++
+				case '"':
+					t.Fatalf("unescaped quote in OM HELP: %q", content)
+				}
+			}
+		}
+	})
+}
+
+func FuzzAcceptsOpenMetrics(f *testing.F) {
+	f.Add("application/openmetrics-text")
+	f.Add("text/plain;q=0.9,application/openmetrics-text;q=0.5")
+	f.Add("application/openmetrics-text;q=0,text/plain;q=1")
+	f.Add(",;q=;application/openmetrics-text;;q=banana,")
+	f.Add("APPLICATION/OPENMETRICS-TEXT;Q=0.5")
+	f.Add("text/plain;q=0.4,application/openmetrics-text;q=0.4")
+	f.Add("*/*")
+	f.Fuzz(func(t *testing.T, accept string) {
+		got := acceptsOpenMetrics(accept)
+		if got && !strings.Contains(strings.ToLower(accept), "openmetrics-text") {
+			t.Fatalf("acceptsOpenMetrics(%q) = true but token absent from header", accept)
+		}
+		if got {
+			q, present := mediaQuality(accept, "application/openmetrics-text")
+			if !present || q <= 0 {
+				t.Fatalf("acceptsOpenMetrics(%q) = true but mediaQuality reports present=%v q=%v", accept, present, q)
 			}
 		}
 	})

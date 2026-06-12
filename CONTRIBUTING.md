@@ -22,24 +22,34 @@ not, and they are easy to break:
   `writeOM*` functions (`openmetrics.go`). Any change to one format almost
   always needs the mirror change in the other. They differ deliberately:
   OpenMetrics emits `# TYPE` before `# HELP`, forces the `_total` counter
-  suffix (`omCounterSampleName`), renders gauge/float values via
-  `omFormatFloat` (e.g. `42.0`, `+Inf`), and terminates with a mandatory
-  `# EOF` line. Prometheus output does none of those.
+  suffix (`omCounterSampleName`), and terminates with a mandatory `# EOF` line;
+  Prometheus output does none of those. Numeric _values_, by contrast, are
+  rendered identically in both formats by a single shared `formatValue`
+  (`metrics.go`) — whole finite values as bare integers (e.g. `42`, no `.0`),
+  others in shortest round-trippable form, and `+Inf`/`-Inf`/`NaN` for
+  non-finite. A per-format float formatter is a bug, not a feature: keep value
+  rendering single-sourced.
 - **Label storage is a fixed-size key.** `labelKey` is `[4]string`, so a metric
   supports **at most 4 labels** — constructors panic past that. Label values
   are copied into the array and the rendered label string is always sorted by
   label name (`buildLabelString`) for deterministic output.
 - **Validation and arity are fail-fast panics, by design.** Metric/label names
   are validated at construction (`validate.go`); `Inc`/`Observe`/`Set` panic on
-  label-arity mismatch; `Counter.Add` panics on a negative delta. Tests assert
-  these panics — don't soften them to error returns.
+  label-arity mismatch; `Counter.Add` panics on a negative delta; registering
+  two metrics whose exposition family names collide panics (`reserveName`,
+  including the pre-seeded `process_*` family names). Tests assert these
+  panics — don't soften them to error returns.
 - **Spec-exact escaping is non-negotiable.** `labelEscaper` escapes only `\`,
   `"`, and `\n`; `helpEscaper` escapes only `\` and `\n`. The fuzz and red-team
   tests pin this exactly — widening or narrowing the set will fail them.
 - **Histogram internals.** Buckets are cumulative, the `+Inf` bucket always
   equals `_count`, and the running sum is stored as float bits updated via an
-  atomic compare-and-swap loop (`Histogram.Observe`). Bounds are sorted at
-  construction.
+  atomic compare-and-swap loop (`Histogram.Observe`). Bounds are validated at
+  construction — they must be a strictly increasing sequence of finite values,
+  and non-finite, duplicate, or out-of-order bounds panic (no silent sorting).
+  Labeled counters and histograms expose `Delete(vals...)`/`Reset()` for series
+  removal, matching labeled gauges; the exposition writers nil-guard a key that
+  a concurrent `Delete`/`Reset` removes mid-scrape.
 - **Process metrics are partly Linux-only.** `process.go` parses
   `/proc/self/{stat,status,fd,limits}`; CPU, RSS, and FD metrics are emitted
   only when those reads succeed (gated on `>= 0` / `> 0`), so output differs

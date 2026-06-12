@@ -108,9 +108,11 @@ func TestOpenMetricsHandler_GaugeInteger(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 
 	body := rec.Body.String()
-	// OpenMetrics: integer gauge values should render as float (42.0)
-	if !strings.Contains(body, "connections 42.0") {
-		t.Errorf("integer gauge should render as float: %s", body)
+	// A whole-valued gauge renders as a bare integer ("42") in both formats;
+	// the OpenMetrics ABNF realnumber accepts a bare integer, so no ".0" is
+	// emitted (matches the Prometheus rendering for parity).
+	if !strings.Contains(body, "connections 42\n") {
+		t.Errorf("integer gauge should render as bare integer: %s", body)
 	}
 }
 
@@ -278,26 +280,6 @@ func TestOpenMetricsHandler_LabeledHistogram(t *testing.T) {
 	}
 }
 
-func TestOMFormatFloat(t *testing.T) {
-	tests := []struct {
-		in   float64
-		want string
-	}{
-		{0, "0.0"},
-		{1, "1.0"},
-		{42, "42.0"},
-		{-1, "-1.0"},
-		{3.14, "3.14"},
-		{0.001, "0.001"},
-	}
-	for _, tt := range tests {
-		got := omFormatFloat(tt.in)
-		if got != tt.want {
-			t.Errorf("omFormatFloat(%v) = %q, want %q", tt.in, got, tt.want)
-		}
-	}
-}
-
 func TestOpenMetricsHandler_LabeledGauge(t *testing.T) {
 	r := NewRegistry("")
 	lg := NewLabeledGauge("cpu_usage", "CPU usage", []string{"core"})
@@ -413,5 +395,113 @@ func BenchmarkOpenMetricsHandler(b *testing.B) {
 	for range b.N {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
+	}
+}
+
+func TestOpenMetricsHistogram_IntegerBucketBound_CanonicalLE(t *testing.T) {
+	t.Run("unlabeled", func(t *testing.T) {
+		r := NewRegistry("")
+		h := NewHistogram("om_le_seconds", "latency", WithBuckets([]float64{0.5, 1, 2}))
+		r.RegisterHistogram(h)
+		h.Observe(0.1)
+
+		rec := httptest.NewRecorder()
+		r.OpenMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		body := rec.Body.String()
+
+		if !strings.Contains(body, `om_le_seconds_bucket{le="1"} 1`) {
+			t.Errorf("integer bound must render as le=\"1\" in OpenMetrics:\n%s", body)
+		}
+		if !strings.Contains(body, `om_le_seconds_bucket{le="2"} 1`) {
+			t.Errorf("integer bound must render as le=\"2\" in OpenMetrics:\n%s", body)
+		}
+		if !strings.Contains(body, `om_le_seconds_bucket{le="0.5"} 1`) {
+			t.Errorf("fractional bound must render as le=\"0.5\":\n%s", body)
+		}
+	})
+
+	t.Run("labeled", func(t *testing.T) {
+		r := NewRegistry("")
+		lh := NewLabeledHistogram("om_le_lbl_seconds", "latency", []string{"op"}, WithBuckets([]float64{0.5, 1}))
+		r.RegisterLabeledHistogram(lh)
+		lh.Observe(0.1, "read")
+
+		rec := httptest.NewRecorder()
+		r.OpenMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		body := rec.Body.String()
+
+		if !strings.Contains(body, `om_le_lbl_seconds_bucket{op="read",le="1"} 1`) {
+			t.Errorf("labeled integer bound must render as le=\"1\":\n%s", body)
+		}
+	})
+}
+
+func TestOMCounterBaseName_TotalOnlyNameStaysNonEmpty(t *testing.T) {
+	// A counter named exactly "_total" must not strip to an empty base, which
+	// would emit a malformed "# TYPE  counter" line with no metric name.
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"_total", "_total"},
+		{"foo_total", "foo"},
+		{"foo", "foo"},
+		{"requests_total", "requests"},
+	}
+	for _, tt := range tests {
+		if got := omCounterBaseName(tt.in); got != tt.want {
+			t.Errorf("omCounterBaseName(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestAcceptsOpenMetrics_QValueNegotiation(t *testing.T) {
+	tests := []struct {
+		name   string
+		accept string
+		want   bool
+	}{
+		{"explicit om only", "application/openmetrics-text", true},
+		{"om with version param", "application/openmetrics-text;version=1.0.0", true},
+		{"prometheus real (om ranked higher)", "application/openmetrics-text;version=1.0.0;q=0.5,text/plain;version=0.0.4;q=0.4,*/*;q=0.1", true},
+		{"om equal to text/plain", "text/plain;q=0.4,application/openmetrics-text;q=0.4", true},
+		{"om explicitly refused q=0", "application/openmetrics-text;q=0,text/plain;q=1", false},
+		{"text/plain ranked higher", "text/plain;q=0.9,application/openmetrics-text;q=0.5", false},
+		{"text/plain only", "text/plain", false},
+		{"wildcard only (om not explicit)", "*/*", false},
+		{"empty accept", "", false},
+		{"malformed q defaults to 1.0", "application/openmetrics-text;q=banana", true},
+		{"uppercase media type still matched (EqualFold)", "APPLICATION/OPENMETRICS-TEXT", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := acceptsOpenMetrics(tt.accept); got != tt.want {
+				t.Errorf("acceptsOpenMetrics(%q) = %v, want %v", tt.accept, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMediaQuality_returnsRFC7231QValues(t *testing.T) {
+	tests := []struct {
+		name, accept, mediaType string
+		wantQ                   float64
+		wantPres                bool
+	}{
+		{"absent type", "text/plain", "application/openmetrics-text", 0, false},
+		{"present defaults q to 1.0", "application/openmetrics-text", "application/openmetrics-text", 1.0, true},
+		{"explicit q", "application/openmetrics-text;q=0.7", "application/openmetrics-text", 0.7, true},
+		{"malformed q falls back to 1.0", "application/openmetrics-text;q=xyz", "application/openmetrics-text", 1.0, true},
+		{"case-insensitive type match", "APPLICATION/OpenMetrics-Text", "application/openmetrics-text", 1.0, true},
+		{"negative q parsed verbatim", "application/openmetrics-text;q=-1", "application/openmetrics-text", -1, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			q, pres := mediaQuality(tt.accept, tt.mediaType)
+			if pres != tt.wantPres || q != tt.wantQ {
+				t.Errorf("mediaQuality(%q, %q) = (%v, %v), want (%v, %v)",
+					tt.accept, tt.mediaType, q, pres, tt.wantQ, tt.wantPres)
+			}
+		})
 	}
 }

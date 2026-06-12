@@ -3,7 +3,7 @@ package metrics
 import (
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,14 +32,41 @@ func WithBuckets(buckets []float64) Option {
 	}
 }
 
+// validateBuckets enforces the histogram bucket contract: bounds must be a
+// strictly increasing sequence of finite values. The writers append the
+// implicit le="+Inf" bucket, so callers must not include +Inf (nor any other
+// non-finite value), and duplicate or out-of-order bounds would emit duplicate
+// or non-monotonic le series that Prometheus and OpenMetrics parsers reject,
+// dropping the whole scrape. Bucket bounds are fixed at construction by the
+// programmer, so a violation is a programmer error and panics, consistent with
+// validateMetricName. The empty bound set is valid: it yields a histogram with
+// only the implicit +Inf bucket.
+func validateBuckets(bounds []float64) {
+	for i, b := range bounds {
+		if math.IsNaN(b) || math.IsInf(b, 0) {
+			panic(fmt.Sprintf("metrics: histogram bucket bound must be finite, got %v", b))
+		}
+		if i > 0 && b <= bounds[i-1] {
+			panic(fmt.Sprintf("metrics: histogram bucket bounds must be strictly increasing, got %v after %v", b, bounds[i-1]))
+		}
+	}
+}
+
 // Histogram tracks a distribution using cumulative buckets and atomic CAS for sum.
 type Histogram struct {
-	name    string
-	help    string
-	bounds  []float64
-	buckets []atomic.Int64
-	sumBits atomic.Uint64
-	count   atomic.Int64
+	name       string
+	help       string
+	bounds     []float64
+	buckets    []atomic.Int64
+	sumBits    atomic.Uint64
+	count      atomic.Int64
+	registered atomic.Bool
+	// mu is used with inverted RWMutex semantics: Observe holds RLock (writers
+	// mutate sum/count/buckets via atomics, so they run concurrently), while
+	// snapshot holds the exclusive Lock to read a consistent view with no
+	// Observe in flight. Do not swap these: a Lock in Observe serializes the
+	// hot path; an RLock in snapshot reintroduces torn count/bucket reads.
+	mu sync.RWMutex
 }
 
 // NewHistogram creates a histogram with the given name and help text.
@@ -52,20 +79,21 @@ func NewHistogram(name, help string, opts ...Option) *Histogram {
 		}
 	}
 	validateMetricName(name)
-	sorted := make([]float64, len(cfg.buckets))
-	copy(sorted, cfg.buckets)
-	sort.Float64s(sorted)
+	validateBuckets(cfg.buckets)
+	bounds := slices.Clone(cfg.buckets)
 	h := &Histogram{
 		name:    name,
 		help:    help,
-		bounds:  sorted,
-		buckets: make([]atomic.Int64, len(sorted)+1),
+		bounds:  bounds,
+		buckets: make([]atomic.Int64, len(bounds)+1),
 	}
 	return h
 }
 
 // Observe records a value in the histogram.
 func (h *Histogram) Observe(seconds float64) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	for {
 		old := h.sumBits.Load()
 		newF := math.Float64frombits(old) + seconds
@@ -85,27 +113,41 @@ func (h *Histogram) Observe(seconds float64) {
 	h.buckets[len(h.bounds)].Add(1) // +Inf
 }
 
+// snapshot atomically reads sum, count, and per-bucket counts under the
+// histogram lock. Shared by the four Prometheus/OpenMetrics histogram emitters.
+func (h *Histogram) snapshot() (sum float64, count int64, bucketVals []int64) {
+	h.mu.Lock()
+	sum = math.Float64frombits(h.sumBits.Load())
+	count = h.count.Load()
+	bucketVals = make([]int64, len(h.buckets))
+	for i := range h.buckets {
+		bucketVals[i] = h.buckets[i].Load()
+	}
+	h.mu.Unlock()
+	return sum, count, bucketVals
+}
+
 // WriteHistogram writes a histogram in Prometheus text format.
 func WriteHistogram(b *strings.Builder, h *Histogram) {
-	sum := math.Float64frombits(h.sumBits.Load())
-	count := h.count.Load()
+	sum, count, bucketVals := h.snapshot()
 	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s histogram\n", h.name, helpEscaper.Replace(h.help), h.name)
 	for i, bound := range h.bounds {
-		fmt.Fprintf(b, "%s_bucket{le=\"%s\"} %d\n", h.name, FormatBound(bound), h.buckets[i].Load())
+		fmt.Fprintf(b, "%s_bucket{le=\"%s\"} %d\n", h.name, formatValue(bound), bucketVals[i])
 	}
-	fmt.Fprintf(b, "%s_bucket{le=\"+Inf\"} %d\n", h.name, h.buckets[len(h.bounds)].Load())
-	fmt.Fprintf(b, "%s_sum %.6f\n", h.name, sum)
+	fmt.Fprintf(b, "%s_bucket{le=\"+Inf\"} %d\n", h.name, bucketVals[len(h.bounds)])
+	fmt.Fprintf(b, "%s_sum %s\n", h.name, formatValue(sum))
 	fmt.Fprintf(b, "%s_count %d\n", h.name, count)
 }
 
 // LabeledHistogram tracks histograms per label combination.
 type LabeledHistogram struct {
-	vals   map[labelKey]*Histogram
-	name   string
-	help   string
-	bounds []float64
-	labels []string
-	mu     sync.RWMutex
+	vals       map[labelKey]*Histogram
+	name       string
+	help       string
+	bounds     []float64
+	labels     []string
+	registered atomic.Bool
+	mu         sync.RWMutex
 }
 
 // NewLabeledHistogram creates a labeled histogram with the given name, help, and label names.
@@ -122,81 +164,68 @@ func NewLabeledHistogram(name, help string, labels []string, opts ...Option) *La
 	if len(labels) > 4 {
 		panic("metrics: LabeledHistogram supports at most 4 labels")
 	}
-	sorted := make([]float64, len(cfg.buckets))
-	copy(sorted, cfg.buckets)
-	sort.Float64s(sorted)
+	validateBuckets(cfg.buckets)
+	bounds := slices.Clone(cfg.buckets)
 	return &LabeledHistogram{
 		name:   name,
 		help:   help,
 		labels: labels,
-		bounds: sorted,
+		bounds: bounds,
 		vals:   make(map[labelKey]*Histogram),
 	}
 }
 
 // Observe records a value for the given label values.
 func (lh *LabeledHistogram) Observe(seconds float64, labelVals ...string) {
-	if len(labelVals) != len(lh.labels) {
-		panic("metrics: label arity mismatch")
-	}
-	var key labelKey
-	copy(key[:], labelVals)
-	lh.mu.RLock()
-	h, ok := lh.vals[key]
-	lh.mu.RUnlock()
-	if ok {
-		h.Observe(seconds)
-		return
-	}
-	lh.mu.Lock()
-	if h, ok = lh.vals[key]; ok {
-		lh.mu.Unlock()
-		h.Observe(seconds)
-		return
-	}
-	h = &Histogram{
-		name:    lh.name,
-		help:    lh.help,
-		bounds:  lh.bounds,
-		buckets: make([]atomic.Int64, len(lh.bounds)+1),
-	}
-	lh.vals[key] = h
-	lh.mu.Unlock()
+	key := labelKeyFor(lh.labels, labelVals)
+	h, _ := loadOrStore(&lh.mu, lh.vals, key, func() *Histogram {
+		return &Histogram{
+			name:    lh.name,
+			help:    lh.help,
+			bounds:  lh.bounds,
+			buckets: make([]atomic.Int64, len(lh.bounds)+1),
+		}
+	})
 	h.Observe(seconds)
+}
+
+// Reset removes all label combinations from the histogram.
+func (lh *LabeledHistogram) Reset() {
+	lh.mu.Lock()
+	clear(lh.vals)
+	lh.mu.Unlock()
+}
+
+// Delete removes a single label combination from the histogram.
+// It panics if the number of label values does not match the label count.
+func (lh *LabeledHistogram) Delete(labelVals ...string) {
+	key := labelKeyFor(lh.labels, labelVals)
+	lh.mu.Lock()
+	delete(lh.vals, key)
+	lh.mu.Unlock()
 }
 
 // WriteLabeledHistogram writes all child histograms in Prometheus text format.
 func WriteLabeledHistogram(b *strings.Builder, lh *LabeledHistogram) {
-	lh.mu.RLock()
-	keys := make([]labelKey, 0, len(lh.vals))
-	for k := range lh.vals {
-		keys = append(keys, k)
-	}
-	lh.mu.RUnlock()
+	keys := sortedLabelKeys(&lh.mu, lh.vals)
 	if len(keys) == 0 {
 		return
 	}
-	sort.Slice(keys, func(a, c int) bool {
-		for i := range keys[a] {
-			if keys[a][i] != keys[c][i] {
-				return keys[a][i] < keys[c][i]
-			}
-		}
-		return false
-	})
 	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s histogram\n", lh.name, helpEscaper.Replace(lh.help), lh.name)
 	for _, key := range keys {
 		lh.mu.RLock()
 		h := lh.vals[key]
 		lh.mu.RUnlock()
-		labelStr := buildLabelString(lh.labels, key)
-		sum := math.Float64frombits(h.sumBits.Load())
-		count := h.count.Load()
-		for i, bound := range h.bounds {
-			fmt.Fprintf(b, "%s_bucket{%s,le=\"%s\"} %d\n", lh.name, labelStr, FormatBound(bound), h.buckets[i].Load())
+		if h == nil {
+			continue
 		}
-		fmt.Fprintf(b, "%s_bucket{%s,le=\"+Inf\"} %d\n", lh.name, labelStr, h.buckets[len(h.bounds)].Load())
-		fmt.Fprintf(b, "%s_sum{%s} %.6f\n", lh.name, labelStr, sum)
+		labelStr := buildLabelString(lh.labels, key)
+		sum, count, bucketVals := h.snapshot()
+		for i, bound := range h.bounds {
+			fmt.Fprintf(b, "%s_bucket{%s,le=\"%s\"} %d\n", lh.name, labelStr, formatValue(bound), bucketVals[i])
+		}
+		fmt.Fprintf(b, "%s_bucket{%s,le=\"+Inf\"} %d\n", lh.name, labelStr, bucketVals[len(h.bounds)])
+		fmt.Fprintf(b, "%s_sum{%s} %s\n", lh.name, labelStr, formatValue(sum))
 		fmt.Fprintf(b, "%s_count{%s} %d\n", lh.name, labelStr, count)
 	}
 }

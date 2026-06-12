@@ -2,15 +2,20 @@ package metrics
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
 	"math"
 	"net/http"
-	"sort"
+	"strconv"
 	"strings"
-	"time"
 )
 
 // OpenMetricsContentType is the content type per the OpenMetrics specification.
 const OpenMetricsContentType = "application/openmetrics-text; version=1.0.0; charset=utf-8"
+
+// omHelpEscaper escapes backslash, newline, AND double-quote per the OpenMetrics
+// 1.0.0 escaped-string rule (Prometheus 0.0.4 helpEscaper does not escape quotes).
+var omHelpEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`, "\r", `\r`, `"`, `\"`)
 
 // NegotiateHandler returns an HTTP handler that performs content negotiation.
 // If the client sends an Accept header preferring OpenMetrics, it responds in
@@ -18,6 +23,7 @@ const OpenMetricsContentType = "application/openmetrics-text; version=1.0.0; cha
 func (r *Registry) NegotiateHandler() http.HandlerFunc {
 	promHandler := r.Handler()
 	return func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Vary", "Accept")
 		if acceptsOpenMetrics(req.Header.Get("Accept")) {
 			r.serveOpenMetrics(w)
 			return
@@ -35,6 +41,7 @@ func (r *Registry) OpenMetricsHandler() http.HandlerFunc {
 
 func (r *Registry) serveOpenMetrics(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", OpenMetricsContentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	var b strings.Builder
 	r.mu.RLock()
 	for _, lc := range r.labeledCounters {
@@ -56,36 +63,69 @@ func (r *Registry) serveOpenMetrics(w http.ResponseWriter) {
 		writeOMLabeledHistogram(&b, lh)
 	}
 	r.mu.RUnlock()
-	writeOMProcessMetrics(&b, r.startTime)
+	writeOMProcessMetrics(&b)
 	b.WriteString("# EOF\n")
-	_, _ = w.Write([]byte(b.String()))
+	if _, err := io.WriteString(w, b.String()); err != nil {
+		slog.Debug("metrics: writing openmetrics exposition failed", "error", err)
+	}
 }
 
-// acceptsOpenMetrics checks if the Accept header prefers OpenMetrics over Prometheus text.
+// acceptsOpenMetrics reports whether the Accept header prefers OpenMetrics over
+// Prometheus text. OpenMetrics is served only when the client explicitly lists
+// application/openmetrics-text with a non-zero q-value AND ranks it at least as
+// high as text/plain (RFC 7231 quality values: an omitted q defaults to 1.0,
+// q=0 means "not acceptable"). This honours an explicit refusal
+// (application/openmetrics-text;q=0) and a client that ranks Prometheus text
+// higher — both of which a bare substring match would mishandle.
 func acceptsOpenMetrics(accept string) bool {
-	return strings.Contains(accept, "application/openmetrics-text")
+	omQ, omPresent := mediaQuality(accept, "application/openmetrics-text")
+	if !omPresent || omQ <= 0 {
+		return false
+	}
+	if txtQ, txtPresent := mediaQuality(accept, "text/plain"); txtPresent && txtQ > omQ {
+		return false
+	}
+	return true
 }
 
-// omFormatFloat formats a float for OpenMetrics output.
-func omFormatFloat(v float64) string {
-	if math.IsInf(v, 1) {
-		return "+Inf"
+// mediaQuality returns the q-value the Accept header assigns to an exact media
+// type and whether that type appears at all. Per RFC 7231 the q parameter
+// defaults to 1.0 when omitted; a malformed q also falls back to 1.0. Only an
+// exact type match counts — wildcards (*/*) are not expanded, matching the
+// explicit-mention requirement for serving OpenMetrics.
+func mediaQuality(accept, mediaType string) (q float64, present bool) {
+	for part := range strings.SplitSeq(accept, ",") {
+		segs := strings.Split(part, ";")
+		if !strings.EqualFold(strings.TrimSpace(segs[0]), mediaType) {
+			continue
+		}
+		cur := 1.0
+		for _, p := range segs[1:] {
+			name, v, found := strings.Cut(strings.TrimSpace(p), "=")
+			if !found || !strings.EqualFold(name, "q") {
+				continue
+			}
+			if parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+				cur = parsed
+			}
+		}
+		if !present || cur > q {
+			q, present = cur, true
+		}
 	}
-	if math.IsInf(v, -1) {
-		return "-Inf"
-	}
-	if math.IsNaN(v) {
-		return "NaN"
-	}
-	if v == float64(int64(v)) && v >= -1e15 && v <= 1e15 {
-		return fmt.Sprintf("%d.0", int64(v))
-	}
-	return fmt.Sprintf("%g", v)
+	return q, present
 }
 
 // omCounterBaseName returns the base metric name for a counter, stripping _total if present.
 func omCounterBaseName(name string) string {
-	return strings.TrimSuffix(name, "_total")
+	base := strings.TrimSuffix(name, "_total")
+	if base == "" {
+		// A counter named exactly "_total" strips to an empty base, which would
+		// emit a malformed "# TYPE  counter" line with no metric name. Keep the
+		// full name so the family stays valid and non-empty.
+		return name
+	}
+	return base
 }
 
 // omCounterSampleName returns the sample name for a counter, ensuring _total suffix.
@@ -100,29 +140,26 @@ func writeOMSimpleCounter(b *strings.Builder, c *Counter) {
 	base := omCounterBaseName(c.name)
 	sample := omCounterSampleName(c.name)
 	fmt.Fprintf(b, "# TYPE %s counter\n", base)
-	fmt.Fprintf(b, "# HELP %s %s\n", base, helpEscaper.Replace(c.help))
+	fmt.Fprintf(b, "# HELP %s %s\n", base, omHelpEscaper.Replace(c.help))
 	fmt.Fprintf(b, "%s %d\n", sample, c.val.Load())
 }
 
 func writeOMCounter(b *strings.Builder, lc *LabeledCounter) {
-	lc.mu.RLock()
-	keys := make([]labelKey, 0, len(lc.vals))
-	for k := range lc.vals {
-		keys = append(keys, k)
-	}
-	lc.mu.RUnlock()
+	keys := sortedLabelKeys(&lc.mu, lc.vals)
 	if len(keys) == 0 {
 		return
 	}
-	sortLabelKeys(keys)
 	base := omCounterBaseName(lc.name)
 	sample := omCounterSampleName(lc.name)
 	fmt.Fprintf(b, "# TYPE %s counter\n", base)
-	fmt.Fprintf(b, "# HELP %s %s\n", base, helpEscaper.Replace(lc.help))
+	fmt.Fprintf(b, "# HELP %s %s\n", base, omHelpEscaper.Replace(lc.help))
 	for _, key := range keys {
 		lc.mu.RLock()
 		v := lc.vals[key]
 		lc.mu.RUnlock()
+		if v == nil {
+			continue
+		}
 		labelStr := buildLabelString(lc.labels, key)
 		fmt.Fprintf(b, "%s{%s} %d\n", sample, labelStr, v.Load())
 	}
@@ -131,23 +168,17 @@ func writeOMCounter(b *strings.Builder, lc *LabeledCounter) {
 func writeOMGauge(b *strings.Builder, g *Gauge) {
 	v := g.Get()
 	fmt.Fprintf(b, "# TYPE %s gauge\n", g.name)
-	fmt.Fprintf(b, "# HELP %s %s\n", g.name, helpEscaper.Replace(g.help))
-	fmt.Fprintf(b, "%s %s\n", g.name, omFormatFloat(v))
+	fmt.Fprintf(b, "# HELP %s %s\n", g.name, omHelpEscaper.Replace(g.help))
+	fmt.Fprintf(b, "%s %s\n", g.name, formatValue(v))
 }
 
 func writeOMLabeledGauge(b *strings.Builder, lg *LabeledGauge) {
-	lg.mu.RLock()
-	keys := make([]labelKey, 0, len(lg.vals))
-	for k := range lg.vals {
-		keys = append(keys, k)
-	}
-	lg.mu.RUnlock()
+	keys := sortedLabelKeys(&lg.mu, lg.vals)
 	if len(keys) == 0 {
 		return
 	}
-	sortLabelKeys(keys)
 	fmt.Fprintf(b, "# TYPE %s gauge\n", lg.name)
-	fmt.Fprintf(b, "# HELP %s %s\n", lg.name, helpEscaper.Replace(lg.help))
+	fmt.Fprintf(b, "# HELP %s %s\n", lg.name, omHelpEscaper.Replace(lg.help))
 	for _, key := range keys {
 		lg.mu.RLock()
 		ptr := lg.vals[key]
@@ -157,84 +188,73 @@ func writeOMLabeledGauge(b *strings.Builder, lg *LabeledGauge) {
 		}
 		v := math.Float64frombits(ptr.Load())
 		labelStr := buildLabelString(lg.labels, key)
-		fmt.Fprintf(b, "%s{%s} %s\n", lg.name, labelStr, omFormatFloat(v))
+		fmt.Fprintf(b, "%s{%s} %s\n", lg.name, labelStr, formatValue(v))
 	}
 }
 
 func writeOMHistogram(b *strings.Builder, h *Histogram) {
-	sum := math.Float64frombits(h.sumBits.Load())
-	count := h.count.Load()
+	sum, count, bucketVals := h.snapshot()
 	fmt.Fprintf(b, "# TYPE %s histogram\n", h.name)
-	fmt.Fprintf(b, "# HELP %s %s\n", h.name, helpEscaper.Replace(h.help))
+	fmt.Fprintf(b, "# HELP %s %s\n", h.name, omHelpEscaper.Replace(h.help))
 	for i, bound := range h.bounds {
-		fmt.Fprintf(b, "%s_bucket{le=\"%s\"} %d\n", h.name, FormatBound(bound), h.buckets[i].Load())
+		fmt.Fprintf(b, "%s_bucket{le=\"%s\"} %d\n", h.name, formatValue(bound), bucketVals[i])
 	}
-	fmt.Fprintf(b, "%s_bucket{le=\"+Inf\"} %d\n", h.name, h.buckets[len(h.bounds)].Load())
+	fmt.Fprintf(b, "%s_bucket{le=\"+Inf\"} %d\n", h.name, bucketVals[len(h.bounds)])
+	fmt.Fprintf(b, "%s_sum %s\n", h.name, formatValue(sum))
 	fmt.Fprintf(b, "%s_count %d\n", h.name, count)
-	fmt.Fprintf(b, "%s_sum %s\n", h.name, omFormatFloat(sum))
 }
 
 func writeOMLabeledHistogram(b *strings.Builder, lh *LabeledHistogram) {
-	lh.mu.RLock()
-	keys := make([]labelKey, 0, len(lh.vals))
-	for k := range lh.vals {
-		keys = append(keys, k)
-	}
-	lh.mu.RUnlock()
+	keys := sortedLabelKeys(&lh.mu, lh.vals)
 	if len(keys) == 0 {
 		return
 	}
-	sortLabelKeys(keys)
 	fmt.Fprintf(b, "# TYPE %s histogram\n", lh.name)
-	fmt.Fprintf(b, "# HELP %s %s\n", lh.name, helpEscaper.Replace(lh.help))
+	fmt.Fprintf(b, "# HELP %s %s\n", lh.name, omHelpEscaper.Replace(lh.help))
 	for _, key := range keys {
 		lh.mu.RLock()
 		h := lh.vals[key]
 		lh.mu.RUnlock()
+		if h == nil {
+			continue
+		}
 		labelStr := buildLabelString(lh.labels, key)
-		sum := math.Float64frombits(h.sumBits.Load())
-		count := h.count.Load()
+		sum, count, bucketVals := h.snapshot()
 		for i, bound := range h.bounds {
-			fmt.Fprintf(b, "%s_bucket{%s,le=\"%s\"} %d\n", lh.name, labelStr, FormatBound(bound), h.buckets[i].Load())
+			fmt.Fprintf(b, "%s_bucket{%s,le=\"%s\"} %d\n", lh.name, labelStr, formatValue(bound), bucketVals[i])
 		}
-		fmt.Fprintf(b, "%s_bucket{%s,le=\"+Inf\"} %d\n", lh.name, labelStr, h.buckets[len(h.bounds)].Load())
+		fmt.Fprintf(b, "%s_bucket{%s,le=\"+Inf\"} %d\n", lh.name, labelStr, bucketVals[len(h.bounds)])
+		fmt.Fprintf(b, "%s_sum{%s} %s\n", lh.name, labelStr, formatValue(sum))
 		fmt.Fprintf(b, "%s_count{%s} %d\n", lh.name, labelStr, count)
-		fmt.Fprintf(b, "%s_sum{%s} %s\n", lh.name, labelStr, omFormatFloat(sum))
 	}
 }
 
-func writeOMProcessMetrics(b *strings.Builder, startTime time.Time) {
+// writeOMProcessMetrics writes Go runtime and standard process metrics in
+// OpenMetrics format. process_goroutines/heap/gc/uptime/start_time are emitted
+// on every platform. process_cpu_seconds_total, process_resident_memory_bytes,
+// process_open_fds and process_max_fds are sourced from /proc and are
+// Linux-only; on other platforms they are silently omitted. CPU time assumes
+// USER_HZ=100 (Linux).
+func writeOMProcessMetrics(b *strings.Builder) {
 	var d processMetricsData
-	collectProcessMetrics(&d, startTime)
+	collectProcessMetrics(&d)
 
-	fmt.Fprintf(b, "# TYPE process_goroutines gauge\n# HELP process_goroutines Number of goroutines\nprocess_goroutines %d.0\n", d.goroutines)
-	fmt.Fprintf(b, "# TYPE process_heap_bytes gauge\n# HELP process_heap_bytes Heap memory in use\nprocess_heap_bytes %d.0\n", d.heapAlloc)
-	fmt.Fprintf(b, "# TYPE process_gc_pause_seconds counter\n# HELP process_gc_pause_seconds Total GC pause time\nprocess_gc_pause_seconds_total %s\n", omFormatFloat(d.gcPause))
-	fmt.Fprintf(b, "# TYPE process_uptime_seconds gauge\n# HELP process_uptime_seconds Process uptime\nprocess_uptime_seconds %s\n", omFormatFloat(d.uptime))
-	fmt.Fprintf(b, "# TYPE process_start_time_seconds gauge\n# HELP process_start_time_seconds Start time of the process since unix epoch in seconds\nprocess_start_time_seconds %s\n", omFormatFloat(processStartTime))
+	fmt.Fprintf(b, "# TYPE %s gauge\n# HELP %s %s\n%s %d\n", pmGoroutines, pmGoroutines, helpGoroutines, pmGoroutines, d.goroutines)
+	fmt.Fprintf(b, "# TYPE %s gauge\n# HELP %s %s\n%s %d\n", pmHeapBytes, pmHeapBytes, helpHeapBytes, pmHeapBytes, d.heapAlloc)
+	fmt.Fprintf(b, "# TYPE %s counter\n# HELP %s %s\n%s %s\n", pmGCPause, pmGCPause, helpGCPause, pmGCPauseTotal, formatValue(d.gcPause))
+	fmt.Fprintf(b, "# TYPE %s gauge\n# HELP %s %s\n%s %s\n", pmUptime, pmUptime, helpUptime, pmUptime, formatValue(d.uptime))
+	fmt.Fprintf(b, "# TYPE %s gauge\n# HELP %s %s\n%s %d\n", pmStartTime, pmStartTime, helpStartTime, pmStartTime, processStartTime.Unix())
 
-	if d.cpuSeconds >= 0 {
-		fmt.Fprintf(b, "# TYPE process_cpu_seconds counter\n# HELP process_cpu_seconds Total user and system CPU time spent in seconds\nprocess_cpu_seconds_total %s\n", omFormatFloat(d.cpuSeconds))
+	if d.hasCPU() {
+		fmt.Fprintf(b, "# TYPE %s counter\n# HELP %s %s\n%s %s\n", pmCPU, pmCPU, helpCPU, pmCPUTotal, formatValue(d.cpuSeconds))
 	}
-	if d.rss > 0 {
-		fmt.Fprintf(b, "# TYPE process_resident_memory_bytes gauge\n# HELP process_resident_memory_bytes Resident memory size in bytes\nprocess_resident_memory_bytes %d.0\n", d.rss)
+	if d.hasRSS() {
+		fmt.Fprintf(b, "# TYPE %s gauge\n# HELP %s %s\n%s %d\n", pmResidentBytes, pmResidentBytes, helpResident, pmResidentBytes, d.rss)
 	}
-	if d.openFDs >= 0 {
-		fmt.Fprintf(b, "# TYPE process_open_fds gauge\n# HELP process_open_fds Number of open file descriptors\nprocess_open_fds %d.0\n", d.openFDs)
-		if d.maxFDs > 0 {
-			fmt.Fprintf(b, "# TYPE process_max_fds gauge\n# HELP process_max_fds Maximum number of open file descriptors\nprocess_max_fds %d.0\n", d.maxFDs)
+	if d.hasOpenFDs() {
+		fmt.Fprintf(b, "# TYPE %s gauge\n# HELP %s %s\n%s %d\n", pmOpenFDs, pmOpenFDs, helpOpenFDs, pmOpenFDs, d.openFDs)
+		if d.hasMaxFDs() {
+			fmt.Fprintf(b, "# TYPE %s gauge\n# HELP %s %s\n%s %d\n", pmMaxFDs, pmMaxFDs, helpMaxFDs, pmMaxFDs, d.maxFDs)
 		}
 	}
-}
-
-// sortLabelKeys sorts label keys lexicographically.
-func sortLabelKeys(keys []labelKey) {
-	sort.Slice(keys, func(a, c int) bool {
-		for i := range keys[a] {
-			if keys[a][i] != keys[c][i] {
-				return keys[a][i] < keys[c][i]
-			}
-		}
-		return false
-	})
 }

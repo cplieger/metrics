@@ -48,14 +48,6 @@ func TestRefactor_WithBucketsOverridesDefault(t *testing.T) {
 	}
 }
 
-// TestRefactor_WithBucketsSorts verifies unsorted buckets get sorted.
-func TestRefactor_WithBucketsSorts(t *testing.T) {
-	h := NewHistogram("refactor_unsorted", "test", WithBuckets([]float64{5, 1, 3}))
-	if !reflect.DeepEqual(h.bounds, []float64{1, 3, 5}) {
-		t.Errorf("bounds = %v, want [1 3 5]", h.bounds)
-	}
-}
-
 // TestRefactor_WithBucketsEmpty verifies empty bucket slice works.
 func TestRefactor_WithBucketsEmpty(t *testing.T) {
 	h := NewHistogram("refactor_empty", "test", WithBuckets([]float64{}))
@@ -72,48 +64,36 @@ func TestRefactor_WithBucketsEmpty(t *testing.T) {
 	}
 }
 
-// TestRefactor_WithBucketsDuplicates verifies duplicates are handled safely.
+// TestRefactor_WithBucketsDuplicates verifies duplicate bounds are rejected at
+// construction (they would emit duplicate le series).
 func TestRefactor_WithBucketsDuplicates(t *testing.T) {
-	h := NewHistogram("refactor_dup", "test", WithBuckets([]float64{1, 1, 5, 5}))
-	// After sort: [1, 1, 5, 5]
-	h.Observe(3)
-	// 3 > 1, 3 > 1, 3 <= 5 (at index 2): inner loop increments buckets[2], buckets[3]
-	// +Inf always incremented
-	if h.count.Load() != 1 {
-		t.Errorf("count = %d", h.count.Load())
-	}
+	mustPanicContaining(t, "strictly increasing", func() {
+		NewHistogram("refactor_dup", "test", WithBuckets([]float64{1, 1, 5, 5}))
+	})
 }
 
-// TestRefactor_WithBucketsNaN verifies NaN bucket boundaries don't cause panic or hang.
+// TestRefactor_WithBucketsNaN verifies a NaN bucket bound is rejected at construction.
 func TestRefactor_WithBucketsNaN(t *testing.T) {
-	h := NewHistogram("refactor_nan", "test", WithBuckets([]float64{math.NaN(), 0.5, 1.0}))
-	h.Observe(0.3)
-	h.Observe(0.7)
-	h.Observe(2.0)
-	if h.count.Load() != 3 {
-		t.Errorf("count = %d, want 3", h.count.Load())
-	}
+	mustPanicContaining(t, "finite", func() {
+		NewHistogram("refactor_nan", "test", WithBuckets([]float64{math.NaN(), 0.5, 1.0}))
+	})
 }
 
-// TestRefactor_WithBucketsPosInf verifies +Inf in user bounds is safe.
+// TestRefactor_WithBucketsPosInf verifies a +Inf bucket bound is rejected at construction
+// (the writers append the implicit le="+Inf" bucket).
 func TestRefactor_WithBucketsPosInf(t *testing.T) {
-	h := NewHistogram("refactor_posinf", "test", WithBuckets([]float64{0.5, math.Inf(1)}))
-	h.Observe(0.3)
-	h.Observe(100)
-	if h.count.Load() != 2 {
-		t.Errorf("count = %d, want 2", h.count.Load())
-	}
+	mustPanicContaining(t, "finite", func() {
+		NewHistogram("refactor_posinf", "test", WithBuckets([]float64{0.5, math.Inf(1)}))
+	})
 }
 
-// TestRefactor_OptionOrderIndependent verifies option ordering doesn't matter.
-// (Only one option type exists currently, but test the pattern.)
-func TestRefactor_OptionOrderIndependent(t *testing.T) {
-	// Apply WithBuckets; the last one wins (or the only one).
-	h1 := NewHistogram("refactor_order1", "test", WithBuckets([]float64{1, 2}))
-	h2 := NewHistogram("refactor_order2", "test", WithBuckets([]float64{2, 1}))
-	if !reflect.DeepEqual(h1.bounds, h2.bounds) {
-		t.Errorf("option order produced different results: %v vs %v", h1.bounds, h2.bounds)
-	}
+// TestRefactor_WithBucketsUnsorted verifies out-of-order bounds are rejected at
+// construction; the contract requires strictly increasing bounds, with no
+// silent reordering.
+func TestRefactor_WithBucketsUnsorted(t *testing.T) {
+	mustPanicContaining(t, "strictly increasing", func() {
+		NewHistogram("refactor_unsorted", "test", WithBuckets([]float64{2, 1}))
+	})
 }
 
 // TestRefactor_NilOptionSafe verifies passing a nil option doesn't panic.
@@ -130,7 +110,7 @@ func TestRefactor_NilOptionSafe(t *testing.T) {
 
 // TestRefactor_WithBucketsDoesNotMutateInput verifies the input slice isn't modified.
 func TestRefactor_WithBucketsDoesNotMutateInput(t *testing.T) {
-	input := []float64{5, 3, 1}
+	input := []float64{1, 3, 5}
 	original := make([]float64, len(input))
 	copy(original, input)
 	NewHistogram("refactor_nomutate", "test", WithBuckets(input))

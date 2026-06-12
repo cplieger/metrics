@@ -4,7 +4,7 @@ import "strings"
 
 // labelEscaper escapes only the three characters mandated by the Prometheus text format
 // for label values: backslash, double-quote, and newline.
-var labelEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+var labelEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`)
 
 // isValidMetricName checks if a metric name matches [a-zA-Z_:][a-zA-Z0-9_:]*.
 func isValidMetricName(name string) bool {

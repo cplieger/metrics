@@ -18,19 +18,67 @@
 package metrics
 
 import (
+	"fmt"
+	"io"
+	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 // helpEscaper escapes backslashes and newlines in HELP text per Prometheus exposition format.
-var helpEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`)
+var helpEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`, "\r", `\r`)
+
+// Process metric family names, defined once so the reservation list
+// (processFamilyNames) and both writers (WriteProcessMetrics,
+// writeOMProcessMetrics) reference a single source and cannot drift.
+const (
+	pmGoroutines    = "process_goroutines"
+	pmHeapBytes     = "process_heap_bytes"
+	pmGCPause       = "process_gc_pause_seconds"
+	pmGCPauseTotal  = "process_gc_pause_seconds_total"
+	pmUptime        = "process_uptime_seconds"
+	pmStartTime     = "process_start_time_seconds"
+	pmCPU           = "process_cpu_seconds"
+	pmCPUTotal      = "process_cpu_seconds_total"
+	pmResidentBytes = "process_resident_memory_bytes"
+	pmOpenFDs       = "process_open_fds"
+	pmMaxFDs        = "process_max_fds"
+)
+
+// processFamilyNames are the family names WriteProcessMetrics / writeOMProcessMetrics emit
+// unconditionally. Reserved at creation so a user metric colliding with one fails fast like any
+// other duplicate instead of silently producing a duplicate "# TYPE" line that breaks the scrape.
+// Both the OM counter base and the Prometheus _total TYPE form are listed for the two process
+// counters, because a user counter normalizes to the base while a user gauge/histogram reserves
+// its name verbatim.
+var processFamilyNames = []string{
+	pmGoroutines, pmHeapBytes,
+	pmGCPause, pmGCPauseTotal,
+	pmUptime, pmStartTime,
+	pmCPU, pmCPUTotal,
+	pmResidentBytes, pmOpenFDs, pmMaxFDs,
+}
+
+// Process metric HELP text, single-sourced so the Prometheus and OpenMetrics
+// writers cannot expose divergent descriptions for the same family.
+const (
+	helpGoroutines = "Number of goroutines"
+	helpHeapBytes  = "Heap memory in use"
+	helpGCPause    = "Total GC pause time"
+	helpUptime     = "Process uptime"
+	helpStartTime  = "Start time of the process since unix epoch in seconds"
+	helpCPU        = "Total user and system CPU time spent in seconds"
+	helpResident   = "Resident memory size in bytes"
+	helpOpenFDs    = "Number of open file descriptors"
+	helpMaxFDs     = "Maximum number of open file descriptors"
+)
 
 // Registry holds a collection of metrics to be served.
 type Registry struct {
-	startTime         time.Time
+	names             map[string]string
 	prefix            string
 	counters          []*Counter
 	gauges            []*Gauge
@@ -46,7 +94,14 @@ func NewRegistry(prefix string) *Registry {
 	if prefix != "" {
 		validateMetricName(prefix)
 	}
-	return &Registry{prefix: prefix, startTime: time.Now()}
+	r := &Registry{
+		prefix: prefix,
+		names:  make(map[string]string),
+	}
+	for _, n := range processFamilyNames {
+		r.names[n] = "process metric"
+	}
+	return r
 }
 
 // prefixed joins the registry prefix to a metric name (prefix_name). An empty
@@ -58,58 +113,118 @@ func (r *Registry) prefixed(name string) string {
 	return r.prefix + "_" + name
 }
 
+// reserveName records the exposition family name a metric occupies and panics
+// if another metric already claims it. The family name is the identifier that
+// appears in the "# TYPE" line: counters normalize on their _total-stripped
+// base (so foo and foo_total are one family), every other type uses its name
+// verbatim. Family names must be unique across the whole registry and across
+// types, because a duplicate "# TYPE" line makes both Prometheus and
+// OpenMetrics parsers reject the entire scrape. Registration is fail-fast: a
+// collision is a programming error, like the panics in validateMetricName and
+// the label-arity guards. Callers must hold r.mu.
+func (r *Registry) reserveName(family, kind string) {
+	if existing, ok := r.names[family]; ok {
+		panic(fmt.Sprintf("metrics: %s %q collides with already-registered %s; "+
+			"metric family names must be unique across the registry", kind, family, existing))
+	}
+	r.names[family] = kind
+}
+
+// reserveHistogramFamily reserves the histogram base name plus the derived
+// _bucket/_sum/_count series names a histogram emits in both writers.
+// Callers must hold r.mu.
+func (r *Registry) reserveHistogramFamily(name, kind string) {
+	r.reserveName(name, kind)
+	r.reserveName(name+"_bucket", kind)
+	r.reserveName(name+"_sum", kind)
+	r.reserveName(name+"_count", kind)
+}
+
 // RegisterCounter adds a counter to the registry.
 func (r *Registry) RegisterCounter(c *Counter) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !c.registered.CompareAndSwap(false, true) {
+		panic("metrics: counter already registered")
+	}
 	c.name = r.prefixed(c.name)
+	base := omCounterBaseName(c.name)
+	r.reserveName(base, "counter")
+	if sample := omCounterSampleName(c.name); sample != base {
+		r.reserveName(sample, "counter")
+	}
 	r.counters = append(r.counters, c)
-	r.mu.Unlock()
 }
 
 // RegisterGauge adds a gauge to the registry.
 func (r *Registry) RegisterGauge(g *Gauge) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !g.registered.CompareAndSwap(false, true) {
+		panic("metrics: gauge already registered")
+	}
 	g.name = r.prefixed(g.name)
+	r.reserveName(g.name, "gauge")
 	r.gauges = append(r.gauges, g)
-	r.mu.Unlock()
 }
 
 // RegisterLabeledCounter adds a labeled counter to the registry.
 func (r *Registry) RegisterLabeledCounter(lc *LabeledCounter) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !lc.registered.CompareAndSwap(false, true) {
+		panic("metrics: labeled counter already registered")
+	}
 	lc.name = r.prefixed(lc.name)
+	base := omCounterBaseName(lc.name)
+	r.reserveName(base, "labeled counter")
+	if sample := omCounterSampleName(lc.name); sample != base {
+		r.reserveName(sample, "labeled counter")
+	}
 	r.labeledCounters = append(r.labeledCounters, lc)
-	r.mu.Unlock()
 }
 
 // RegisterLabeledGauge adds a labeled gauge to the registry.
 func (r *Registry) RegisterLabeledGauge(lg *LabeledGauge) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !lg.registered.CompareAndSwap(false, true) {
+		panic("metrics: labeled gauge already registered")
+	}
 	lg.name = r.prefixed(lg.name)
+	r.reserveName(lg.name, "labeled gauge")
 	r.labeledGauges = append(r.labeledGauges, lg)
-	r.mu.Unlock()
 }
 
 // RegisterHistogram adds a histogram to the registry.
 func (r *Registry) RegisterHistogram(h *Histogram) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !h.registered.CompareAndSwap(false, true) {
+		panic("metrics: histogram already registered")
+	}
 	h.name = r.prefixed(h.name)
+	r.reserveHistogramFamily(h.name, "histogram")
 	r.histograms = append(r.histograms, h)
-	r.mu.Unlock()
 }
 
 // RegisterLabeledHistogram adds a labeled histogram to the registry.
 func (r *Registry) RegisterLabeledHistogram(lh *LabeledHistogram) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !lh.registered.CompareAndSwap(false, true) {
+		panic("metrics: labeled histogram already registered")
+	}
 	lh.name = r.prefixed(lh.name)
+	r.reserveHistogramFamily(lh.name, "labeled histogram")
 	r.labeledHistograms = append(r.labeledHistograms, lh)
-	r.mu.Unlock()
 }
 
 // Handler returns an HTTP handler serving Prometheus text format.
 func (r *Registry) Handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		var b strings.Builder
 		r.mu.RLock()
 		for _, lc := range r.labeledCounters {
@@ -131,14 +246,33 @@ func (r *Registry) Handler() http.HandlerFunc {
 			WriteLabeledHistogram(&b, lh)
 		}
 		r.mu.RUnlock()
-		WriteProcessMetrics(&b, r.startTime)
-		_, _ = w.Write([]byte(b.String()))
+		WriteProcessMetrics(&b)
+		if _, err := io.WriteString(w, b.String()); err != nil {
+			slog.Debug("metrics: writing prometheus exposition failed", "error", err)
+		}
 	}
 }
 
-// FormatBound formats a bucket boundary for Prometheus output.
-func FormatBound(v float64) string {
-	if v == float64(int64(v)) {
+// formatValue renders a float64 metric value in the canonical form shared by
+// the Prometheus 0.0.4 and OpenMetrics 1.0.0 writers, so a given value is
+// exposed identically regardless of format. Non-finite values use the spec
+// tokens "+Inf"/"-Inf"/"NaN" (accepted case-insensitively by both formats per
+// the OpenMetrics ABNF). A finite value that is exactly integral and within the
+// int64-exact range renders as a bare integer (e.g. "42", "1718193600"); the
+// OpenMetrics ABNF's realnumber accepts a bare integer, so no ".0" is needed.
+// Everything else uses the shortest round-trippable form (strconv 'g'), which
+// preserves full precision and never floors a small magnitude to zero the way
+// the fixed-precision %.6f the Prometheus writers previously used did.
+func formatValue(v float64) string {
+	switch {
+	case math.IsInf(v, 1):
+		return "+Inf"
+	case math.IsInf(v, -1):
+		return "-Inf"
+	case math.IsNaN(v):
+		return "NaN"
+	}
+	if v == float64(int64(v)) && v >= -1e15 && v <= 1e15 {
 		return strconv.FormatInt(int64(v), 10)
 	}
 	return strconv.FormatFloat(v, 'g', -1, 64)
