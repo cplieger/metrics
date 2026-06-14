@@ -4,6 +4,8 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/metrics/v2.svg)](https://pkg.go.dev/github.com/cplieger/metrics/v2)
 [![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/metrics)](https://goreportcard.com/report/github.com/cplieger/metrics)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/metrics/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/metrics)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/metrics/badges/coverage.json)](https://github.com/cplieger/metrics/actions/workflows/coverage.yml)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13214/badge)](https://www.bestpractices.dev/projects/13214)
 
 > Hand-rolled Prometheus text-format exposition library for Go
 
