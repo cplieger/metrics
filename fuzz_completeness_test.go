@@ -64,14 +64,20 @@ func FuzzHelpTextExposition(f *testing.F) {
 			if strings.ContainsRune(helpContent, '\n') {
 				t.Fatal("raw newline in HELP line")
 			}
-			// No unescaped backslashes: every \ must be followed by \ or n
+			// No raw carriage returns: helpEscaper escapes CR to \r so a raw CR
+			// must never reach the exposition output (matches the OpenMetrics path).
+			if strings.ContainsRune(helpContent, '\r') {
+				t.Fatalf("raw CR in HELP line: %q", helpContent)
+			}
+			// No unescaped backslashes: every \ must be followed by \, n, or r
+			// (helpEscaper emits \\, \n, and \r).
 			for i := 0; i < len(helpContent); i++ {
 				if helpContent[i] == '\\' {
 					if i+1 >= len(helpContent) {
 						t.Fatal("trailing backslash in HELP line")
 					}
 					next := helpContent[i+1]
-					if next != '\\' && next != 'n' {
+					if next != '\\' && next != 'n' && next != 'r' {
 						t.Fatalf("invalid escape \\%c in HELP line", next)
 					}
 					i++ // skip next
