@@ -1,7 +1,6 @@
 package metrics
 
 import (
-	"fmt"
 	"log/slog"
 	"os"
 	"runtime"
@@ -37,6 +36,22 @@ var processStartTime = time.Now()
 // goosLinux is the runtime.GOOS value for Linux, the only platform where
 // /proc-based process metrics are expected to succeed.
 const goosLinux = "linux"
+
+// linuxUserHZ is the assumed value of sysconf(_SC_CLK_TCK), the unit in which
+// the Linux kernel reports per-process CPU time in /proc/self/stat (utime and
+// stime are counted in "clock ticks" of 1/USER_HZ seconds). It is 100 on the
+// overwhelming majority of Linux kernels (the CONFIG_HZ=100 default), so
+// process_cpu_seconds_total is computed as (utime+stime)/linuxUserHZ.
+//
+// This is deliberately a hardcoded constant rather than a runtime lookup:
+// reading the real sysconf(_SC_CLK_TCK) requires either cgo or
+// golang.org/x/sys/unix, and BOTH would violate this library's core "zero
+// runtime dependencies, standard library only" contract (go.mod has no
+// require). There is no pure-stdlib way to read _SC_CLK_TCK. The only
+// observable consequence of the assumption is that process_cpu_seconds_total is
+// scaled incorrectly on the rare kernel built with a non-100 CONFIG_HZ (e.g.
+// 250 or 1000); every other metric is unaffected.
+const linuxUserHZ = 100.0
 
 var procDegraded atomic.Bool
 
@@ -98,32 +113,57 @@ func collectProcessMetrics(d *processMetricsData) {
 	}
 }
 
-// WriteProcessMetrics writes Go runtime and standard process metrics.
-// process_goroutines/heap/gc/uptime/start_time are emitted on every platform.
-// process_cpu_seconds_total, process_resident_memory_bytes, process_open_fds
-// and process_max_fds are sourced from /proc and are Linux-only; on other
-// platforms they are silently omitted. CPU time assumes USER_HZ=100 (Linux).
-func WriteProcessMetrics(b *strings.Builder) {
+// processFamilies materialises Go runtime and standard process metrics into the
+// neutral IR. process_goroutines/heap/gc/uptime/start_time are emitted on every
+// platform. process_cpu_seconds_total, process_resident_memory_bytes,
+// process_open_fds and process_max_fds are sourced from /proc and are
+// Linux-only; on other platforms they are silently omitted. CPU time is divided
+// by linuxUserHZ (see process_cpu_seconds_total's caveat).
+//
+// The two process counters (GC pause, CPU) carry their _total-suffixed names
+// verbatim, so the Prometheus encoder emits them unchanged while the
+// OpenMetrics encoder derives the _total-stripped base for the family lines —
+// the same dual rendering user counters get.
+func processFamilies() []metricFamily {
 	var d processMetricsData
 	collectProcessMetrics(&d)
-	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", pmGoroutines, helpGoroutines, pmGoroutines, pmGoroutines, d.goroutines)
-	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", pmHeapBytes, helpHeapBytes, pmHeapBytes, pmHeapBytes, d.heapAlloc)
-	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s counter\n%s %s\n", pmGCPauseTotal, helpGCPause, pmGCPauseTotal, pmGCPauseTotal, formatValue(d.gcPause))
-	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n%s %s\n", pmUptime, helpUptime, pmUptime, pmUptime, formatValue(d.uptime))
-	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", pmStartTime, helpStartTime, pmStartTime, pmStartTime, processStartTime.Unix())
 
+	gauge := func(name, help, value string) metricFamily {
+		return metricFamily{name: name, typ: typeGauge, help: help, samples: []sample{{value: value}}}
+	}
+	counter := func(name, help, value string) metricFamily {
+		return metricFamily{name: name, typ: typeCounter, help: help, samples: []sample{{value: value}}}
+	}
+
+	fams := make([]metricFamily, 0, len(processFamilyNames))
+	fams = append(fams,
+		gauge(pmGoroutines, helpGoroutines, strconv.Itoa(d.goroutines)),
+		gauge(pmHeapBytes, helpHeapBytes, strconv.FormatUint(d.heapAlloc, 10)),
+		counter(pmGCPauseTotal, helpGCPause, formatValue(d.gcPause)),
+		gauge(pmUptime, helpUptime, formatValue(d.uptime)),
+		gauge(pmStartTime, helpStartTime, strconv.FormatInt(processStartTime.Unix(), 10)),
+	)
 	if d.hasCPU() {
-		fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s counter\n%s %s\n", pmCPUTotal, helpCPU, pmCPUTotal, pmCPUTotal, formatValue(d.cpuSeconds))
+		fams = append(fams, counter(pmCPUTotal, helpCPU, formatValue(d.cpuSeconds)))
 	}
 	if d.hasRSS() {
-		fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", pmResidentBytes, helpResident, pmResidentBytes, pmResidentBytes, d.rss)
+		fams = append(fams, gauge(pmResidentBytes, helpResident, strconv.FormatInt(d.rss, 10)))
 	}
 	if d.hasOpenFDs() {
-		fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", pmOpenFDs, helpOpenFDs, pmOpenFDs, pmOpenFDs, d.openFDs)
+		fams = append(fams, gauge(pmOpenFDs, helpOpenFDs, strconv.Itoa(d.openFDs)))
 		if d.hasMaxFDs() {
-			fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", pmMaxFDs, helpMaxFDs, pmMaxFDs, pmMaxFDs, d.maxFDs)
+			fams = append(fams, gauge(pmMaxFDs, helpMaxFDs, strconv.FormatInt(d.maxFDs, 10)))
 		}
 	}
+	return fams
+}
+
+// WriteProcessMetrics writes Go runtime and standard process metrics in
+// Prometheus text format. It is a thin shim over the neutral IR
+// (processFamilies) and the Prometheus encoder, preserved as part of the
+// package's exported surface.
+func WriteProcessMetrics(b *strings.Builder) {
+	appendPrometheus(b, processFamilies())
 }
 
 // readProcCPUSeconds reads /proc/self/stat for utime+stime in seconds. Returns -1 on failure.
@@ -156,8 +196,7 @@ func parseProcStatCPU(data []byte) float64 {
 	if err1 != nil || err2 != nil {
 		return -1
 	}
-	clkTck := 100.0 // sysconf(_SC_CLK_TCK) is 100 on Linux
-	return float64(utime+stime) / clkTck
+	return float64(utime+stime) / linuxUserHZ
 }
 
 // readProcRSS reads /proc/self/status for VmRSS in bytes. Returns 0 on failure.

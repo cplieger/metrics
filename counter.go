@@ -1,7 +1,6 @@
 package metrics
 
 import (
-	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -110,10 +109,11 @@ func (lc *LabeledCounter) Delete(labelVals ...string) {
 	lc.mu.Unlock()
 }
 
-// WriteCounter writes a counter in Prometheus text format.
+// WriteCounter writes a counter in Prometheus text format. It is a thin shim
+// over the neutral IR (Counter.family) and the Prometheus encoder, retained as
+// part of the package's exported surface.
 func WriteCounter(b *strings.Builder, c *Counter) {
-	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s counter\n%s %d\n",
-		c.name, helpEscaper.Replace(c.help), c.name, c.name, c.val.Load())
+	appendPrometheus(b, []metricFamily{c.family()})
 }
 
 // loadOrStore returns the entry for key, creating it with makeV under the
@@ -174,21 +174,9 @@ func buildLabelString(labels []string, key labelKey) string {
 	return sb.String()
 }
 
-// WriteLabeledCounter writes a labeled counter in Prometheus text format.
+// WriteLabeledCounter writes a labeled counter in Prometheus text format (IR shim).
 func WriteLabeledCounter(b *strings.Builder, lc *LabeledCounter) {
-	keys := sortedLabelKeys(&lc.mu, lc.vals)
-	if len(keys) == 0 {
-		return
-	}
-	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s counter\n", lc.name, helpEscaper.Replace(lc.help), lc.name)
-	for _, key := range keys {
-		lc.mu.RLock()
-		v := lc.vals[key]
-		lc.mu.RUnlock()
-		if v == nil {
-			continue
-		}
-		labelStr := buildLabelString(lc.labels, key)
-		fmt.Fprintf(b, "%s{%s} %d\n", lc.name, labelStr, v.Load())
+	if f, ok := lc.family(); ok {
+		appendPrometheus(b, []metricFamily{f})
 	}
 }
