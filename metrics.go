@@ -225,29 +225,7 @@ func (r *Registry) Handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		var b strings.Builder
-		r.mu.RLock()
-		for _, lc := range r.labeledCounters {
-			WriteLabeledCounter(&b, lc)
-		}
-		for _, c := range r.counters {
-			WriteCounter(&b, c)
-		}
-		for _, lg := range r.labeledGauges {
-			WriteLabeledGauge(&b, lg)
-		}
-		for _, g := range r.gauges {
-			WriteGauge(&b, g)
-		}
-		for _, h := range r.histograms {
-			WriteHistogram(&b, h)
-		}
-		for _, lh := range r.labeledHistograms {
-			WriteLabeledHistogram(&b, lh)
-		}
-		r.mu.RUnlock()
-		WriteProcessMetrics(&b)
-		if _, err := io.WriteString(w, b.String()); err != nil {
+		if _, err := io.WriteString(w, encodePrometheus(r.collect())); err != nil {
 			slog.Debug("metrics: writing prometheus exposition failed", "error", err)
 		}
 	}

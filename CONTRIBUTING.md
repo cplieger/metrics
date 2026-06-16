@@ -16,19 +16,32 @@ subpackages or `cmd/` binaries.
 The public surface is documented in `README.md`; the load-bearing internals are
 not, and they are easy to break:
 
-- **Two exposition formats, two parallel write paths.** Prometheus text
-  (`0.0.4`) lives in the `Write*` functions (`metrics.go`, `counter.go`,
-  `gauge.go`, `histogram.go`, `process.go`); OpenMetrics (`1.0.0`) lives in the
-  `writeOM*` functions (`openmetrics.go`). Any change to one format almost
-  always needs the mirror change in the other. They differ deliberately:
-  OpenMetrics emits `# TYPE` before `# HELP`, forces the `_total` counter
-  suffix (`omCounterSampleName`), and terminates with a mandatory `# EOF` line;
-  Prometheus output does none of those. Numeric _values_, by contrast, are
-  rendered identically in both formats by a single shared `formatValue`
-  (`metrics.go`) — whole finite values as bare integers (e.g. `42`, no `.0`),
-  others in shortest round-trippable form, and `+Inf`/`-Inf`/`NaN` for
-  non-finite. A per-format float formatter is a bug, not a feature: keep value
-  rendering single-sourced.
+- **One neutral IR, two thin per-format encoders.** A scrape is materialised
+  once into a format-neutral intermediate representation — `[]metricFamily`,
+  each family carrying its name, type, HELP, and a slice of `sample`s
+  (`exposition.go`). Every metric type has a `family()` snapshot method
+  (`exposition.go`) that reuses the shared model (`Histogram.snapshot`,
+  `sortedLabelKeys`, `buildLabelString`, `collectProcessMetrics`); the registry
+  walks its six metric slices plus process metrics once in `Registry.collect`.
+  Two thin encoders then render that IR: `encodePrometheus` (text `0.0.4`) and
+  `encodeOpenMetrics` (`1.0.0`), each owning ONLY the genuinely format-specific
+  bits — HELP/TYPE line order (OpenMetrics emits `# TYPE` before `# HELP`), HELP
+  escaping (`omHelpEscaper` also escapes `"`, `helpEscaper` does not), the
+  counter `_total` suffix (`omCounterBaseName`/`omCounterSampleName` — base name
+  on the family lines, `_total` on the sample series), and the mandatory
+  trailing `# EOF` (OpenMetrics only). Because values and label strings are
+  pre-rendered in the IR by the shared `formatValue` (`metrics.go`) and
+  `buildLabelString`, both formats render numbers and labels identically:
+  whole finite values as bare integers (e.g. `42`, no `.0`), others in shortest
+  round-trippable form, `+Inf`/`-Inf`/`NaN` for non-finite. A per-format float
+  formatter is a bug, not a feature — keep value rendering single-sourced.
+  Exposition output is byte-locked by golden fixtures (`testdata/*.golden`,
+  `golden_test.go`); regenerate them with `UPDATE_GOLDEN=1 go test` only after a
+  deliberate, reviewed format change. The exported `Write*` functions
+  (`counter.go`, `gauge.go`, `histogram.go`, `process.go`) and the
+  `writeOMSimpleCounter`/`writeOMGauge`/`writeOMLabeledGauge` helpers remain as
+  thin shims over the IR + encoders, preserved for the public API and the test
+  suite.
 - **Label storage is a fixed-size key.** `labelKey` is `[4]string`, so a metric
   supports **at most 4 labels** — constructors panic past that. Label values
   are copied into the array and the rendered label string is always sorted by

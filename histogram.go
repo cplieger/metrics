@@ -127,16 +127,9 @@ func (h *Histogram) snapshot() (sum float64, count int64, bucketVals []int64) {
 	return sum, count, bucketVals
 }
 
-// WriteHistogram writes a histogram in Prometheus text format.
+// WriteHistogram writes a histogram in Prometheus text format (IR shim).
 func WriteHistogram(b *strings.Builder, h *Histogram) {
-	sum, count, bucketVals := h.snapshot()
-	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s histogram\n", h.name, helpEscaper.Replace(h.help), h.name)
-	for i, bound := range h.bounds {
-		fmt.Fprintf(b, "%s_bucket{le=\"%s\"} %d\n", h.name, formatValue(bound), bucketVals[i])
-	}
-	fmt.Fprintf(b, "%s_bucket{le=\"+Inf\"} %d\n", h.name, bucketVals[len(h.bounds)])
-	fmt.Fprintf(b, "%s_sum %s\n", h.name, formatValue(sum))
-	fmt.Fprintf(b, "%s_count %d\n", h.name, count)
+	appendPrometheus(b, []metricFamily{h.family()})
 }
 
 // LabeledHistogram tracks histograms per label combination.
@@ -205,28 +198,10 @@ func (lh *LabeledHistogram) Delete(labelVals ...string) {
 	lh.mu.Unlock()
 }
 
-// WriteLabeledHistogram writes all child histograms in Prometheus text format.
+// WriteLabeledHistogram writes all child histograms in Prometheus text format (IR shim).
 func WriteLabeledHistogram(b *strings.Builder, lh *LabeledHistogram) {
-	keys := sortedLabelKeys(&lh.mu, lh.vals)
-	if len(keys) == 0 {
-		return
-	}
-	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s histogram\n", lh.name, helpEscaper.Replace(lh.help), lh.name)
-	for _, key := range keys {
-		lh.mu.RLock()
-		h := lh.vals[key]
-		lh.mu.RUnlock()
-		if h == nil {
-			continue
-		}
-		labelStr := buildLabelString(lh.labels, key)
-		sum, count, bucketVals := h.snapshot()
-		for i, bound := range h.bounds {
-			fmt.Fprintf(b, "%s_bucket{%s,le=\"%s\"} %d\n", lh.name, labelStr, formatValue(bound), bucketVals[i])
-		}
-		fmt.Fprintf(b, "%s_bucket{%s,le=\"+Inf\"} %d\n", lh.name, labelStr, bucketVals[len(h.bounds)])
-		fmt.Fprintf(b, "%s_sum{%s} %s\n", lh.name, labelStr, formatValue(sum))
-		fmt.Fprintf(b, "%s_count{%s} %d\n", lh.name, labelStr, count)
+	if f, ok := lh.family(); ok {
+		appendPrometheus(b, []metricFamily{f})
 	}
 }
 

@@ -1,7 +1,6 @@
 package metrics
 
 import (
-	"fmt"
 	"math"
 	"strings"
 	"sync"
@@ -48,10 +47,9 @@ func (g *Gauge) Dec() { g.Add(-1) }
 // Get returns the current gauge value.
 func (g *Gauge) Get() float64 { return math.Float64frombits(g.bits.Load()) }
 
-// WriteGauge writes a gauge in Prometheus text format.
+// WriteGauge writes a gauge in Prometheus text format (IR shim).
 func WriteGauge(b *strings.Builder, g *Gauge) {
-	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n", g.name, helpEscaper.Replace(g.help), g.name)
-	fmt.Fprintf(b, "%s %s\n", g.name, formatValue(g.Get()))
+	appendPrometheus(b, []metricFamily{g.family()})
 }
 
 // LabeledGauge tracks gauges per label combination.
@@ -104,22 +102,9 @@ func (lg *LabeledGauge) Delete(labelVals ...string) {
 	lg.mu.Unlock()
 }
 
-// WriteLabeledGauge writes a labeled gauge in Prometheus text format.
+// WriteLabeledGauge writes a labeled gauge in Prometheus text format (IR shim).
 func WriteLabeledGauge(b *strings.Builder, lg *LabeledGauge) {
-	keys := sortedLabelKeys(&lg.mu, lg.vals)
-	if len(keys) == 0 {
-		return
-	}
-	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n", lg.name, helpEscaper.Replace(lg.help), lg.name)
-	for _, key := range keys {
-		lg.mu.RLock()
-		ptr := lg.vals[key]
-		lg.mu.RUnlock()
-		if ptr == nil {
-			continue
-		}
-		v := math.Float64frombits(ptr.Load())
-		labelStr := buildLabelString(lg.labels, key)
-		fmt.Fprintf(b, "%s{%s} %s\n", lg.name, labelStr, formatValue(v))
+	if f, ok := lg.family(); ok {
+		appendPrometheus(b, []metricFamily{f})
 	}
 }
