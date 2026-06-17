@@ -258,16 +258,28 @@ func readProcFDs() (open int, maxFDs int64) {
 		}
 		return open, maxFDs
 	}
+	return open, parseProcLimitsMaxFDs(data)
+}
+
+// parseProcLimitsMaxFDs parses /proc/self/limits content for the soft "Max open
+// files" limit in descriptors. Returns 0 when the line is absent or carries no
+// value. Like parseProcStatCPU and parseProcStatusRSS, this is the pure-parse
+// counterpart to its I/O reader (readProcFDs), so the limits parsing is unit
+// testable in isolation.
+func parseProcLimitsMaxFDs(data []byte) int64 {
 	for line := range strings.SplitSeq(string(data), "\n") {
-		if strings.HasPrefix(line, "Max open files") {
-			fields := strings.Fields(line[len("Max open files"):])
-			if len(fields) >= 1 {
-				maxFDs, _ = strconv.ParseInt(fields[0], 10, 64)
-			}
-			break
+		after, ok := strings.CutPrefix(line, "Max open files")
+		if !ok {
+			continue
 		}
+		fields := strings.Fields(after)
+		if len(fields) >= 1 {
+			n, _ := strconv.ParseInt(fields[0], 10, 64)
+			return n
+		}
+		return 0
 	}
-	return open, maxFDs
+	return 0
 }
 
 // openFDCount converts the raw /proc/self/fd entry list into the number of
