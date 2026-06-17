@@ -99,7 +99,7 @@ func TestGkMetricsU1_ServeOpenMetricsLogsOnWriteError(t *testing.T) {
 func TestGkMetricsU1_CollectCapacityCounters(t *testing.T) {
 	const prefix = "gk_metrics_u1_capctr_"
 	reg := NewRegistry("")
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		reg.RegisterCounter(NewCounter(prefix+strconv.Itoa(i)+"_total", "h"))
 	}
 
@@ -117,7 +117,7 @@ func TestGkMetricsU1_CollectCapacityCounters(t *testing.T) {
 func TestGkMetricsU1_CollectCapacityLabeledGauges(t *testing.T) {
 	const prefix = "gk_metrics_u1_caplg_"
 	reg := NewRegistry("")
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		lg := NewLabeledGauge(prefix+strconv.Itoa(i), "h", []string{"k"})
 		reg.RegisterLabeledGauge(lg)
 		lg.Set(1, "v") // a labeled metric only emits a family once a combo is set
@@ -136,7 +136,7 @@ func TestGkMetricsU1_CollectCapacityLabeledGauges(t *testing.T) {
 func TestGkMetricsU1_CollectCapacityHistograms(t *testing.T) {
 	const prefix = "gk_metrics_u1_caphist_"
 	reg := NewRegistry("")
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		reg.RegisterHistogram(NewHistogram(prefix+strconv.Itoa(i), "h"))
 	}
 
@@ -153,7 +153,7 @@ func TestGkMetricsU1_CollectCapacityHistograms(t *testing.T) {
 func TestGkMetricsU1_CollectCapacityLabeledHistograms(t *testing.T) {
 	const prefix = "gk_metrics_u1_caplh_"
 	reg := NewRegistry("")
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		lh := NewLabeledHistogram(prefix+strconv.Itoa(i), "h", []string{"k"})
 		reg.RegisterLabeledHistogram(lh)
 		lh.Observe(0.1, "v")
