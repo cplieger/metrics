@@ -24,38 +24,38 @@ func mustPanicContaining(t *testing.T, want string, fn func()) {
 
 func TestRegistry_DuplicateRegistrationPanics(t *testing.T) {
 	tests := []struct {
-		name     string
 		register func(r *Registry)
+		name     string
 	}{
-		{"two counters, identical name", func(r *Registry) {
+		{name: "two counters, identical name", register: func(r *Registry) {
 			r.RegisterCounter(NewCounter("dup_total", "first"))
 			r.RegisterCounter(NewCounter("dup_total", "second"))
 		}},
-		{"counter base-name collision (reqs vs reqs_total)", func(r *Registry) {
+		{name: "counter base-name collision (reqs vs reqs_total)", register: func(r *Registry) {
 			r.RegisterCounter(NewCounter("reqs", "first"))
 			r.RegisterCounter(NewCounter("reqs_total", "second"))
 		}},
-		{"counter vs gauge, same family", func(r *Registry) {
+		{name: "counter vs gauge, same family", register: func(r *Registry) {
 			r.RegisterCounter(NewCounter("widgets", "first"))
 			r.RegisterGauge(NewGauge("widgets", "second"))
 		}},
-		{"counter vs labeled counter, same base", func(r *Registry) {
+		{name: "counter vs labeled counter, same base", register: func(r *Registry) {
 			r.RegisterCounter(NewCounter("hits_total", "first"))
 			r.RegisterLabeledCounter(NewLabeledCounter("hits", "second", []string{"x"}))
 		}},
-		{"counter _total base collides with plain gauge", func(r *Registry) {
+		{name: "counter _total base collides with plain gauge", register: func(r *Registry) {
 			r.RegisterCounter(NewCounter("http_total", "first"))
 			r.RegisterGauge(NewGauge("http", "second"))
 		}},
-		{"plain gauge collides with later counter _total base", func(r *Registry) {
+		{name: "plain gauge collides with later counter _total base", register: func(r *Registry) {
 			r.RegisterGauge(NewGauge("http", "first"))
 			r.RegisterCounter(NewCounter("http_total", "second"))
 		}},
-		{"gauge vs histogram, same name", func(r *Registry) {
+		{name: "gauge vs histogram, same name", register: func(r *Registry) {
 			r.RegisterGauge(NewGauge("latency", "first"))
 			r.RegisterHistogram(NewHistogram("latency", "second"))
 		}},
-		{"labeled gauge vs labeled histogram, same name", func(r *Registry) {
+		{name: "labeled gauge vs labeled histogram, same name", register: func(r *Registry) {
 			r.RegisterLabeledGauge(NewLabeledGauge("size", "first", []string{"x"}))
 			r.RegisterLabeledHistogram(NewLabeledHistogram("size", "second", []string{"x"}))
 		}},

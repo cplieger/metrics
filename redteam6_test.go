@@ -174,15 +174,15 @@ func TestRT6_GaugeSpecialValues(t *testing.T) {
 	nanStr := "Na" + "N"
 	tests := []struct {
 		name string
-		val  float64
 		prom string
 		om   string
+		val  float64
 	}{
-		{"pos_inf", math.Inf(1), posInf, posInf},
-		{"neg_inf", math.Inf(-1), negInf, negInf},
-		{"nan", math.NaN(), nanStr, nanStr},
-		{"zero", 0, "0", "0"},
-		{"neg_zero", math.Copysign(0, -1), "0", "0"},
+		{name: "pos_inf", val: math.Inf(1), prom: posInf, om: posInf},
+		{name: "neg_inf", val: math.Inf(-1), prom: negInf, om: negInf},
+		{name: "nan", val: math.NaN(), prom: nanStr, om: nanStr},
+		{name: "zero", val: 0, prom: "0", om: "0"},
+		{name: "neg_zero", val: math.Copysign(0, -1), prom: "0", om: "0"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
