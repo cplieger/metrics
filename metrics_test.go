@@ -359,28 +359,28 @@ func TestWriteProcessMetrics(t *testing.T) {
 
 func TestFormatValue(t *testing.T) {
 	tests := []struct {
-		in   float64
 		want string
+		in   float64
 	}{
 		// Whole finite values render as bare integers (valid in both formats).
-		{1.0, "1"},
-		{0, "0"},
-		{-1, "-1"},
-		{42, "42"},
-		{1e15, "1000000000000000"},
+		{in: 1.0, want: "1"},
+		{in: 0, want: "0"},
+		{in: -1, want: "-1"},
+		{in: 42, want: "42"},
+		{in: 1e15, want: "1000000000000000"},
 		// Beyond the int64-exact range, fall back to shortest 'g'.
-		{1e16, "1e+16"},
-		{-1e16, "-1e+16"},
+		{in: 1e16, want: "1e+16"},
+		{in: -1e16, want: "-1e+16"},
 		// Fractional values keep full precision (shortest round-trip).
-		{0.005, "0.005"},
-		{0.5, "0.5"},
-		{0.025, "0.025"},
-		{3.14, "3.14"},
-		{1e-7, "1e-07"},
+		{in: 0.005, want: "0.005"},
+		{in: 0.5, want: "0.5"},
+		{in: 0.025, want: "0.025"},
+		{in: 3.14, want: "3.14"},
+		{in: 1e-7, want: "1e-07"},
 		// Non-finite spec tokens (accepted case-insensitively by both formats).
-		{math.Inf(1), "+Inf"},
-		{math.Inf(-1), "-Inf"},
-		{math.NaN(), "NaN"},
+		{in: math.Inf(1), want: "+Inf"},
+		{in: math.Inf(-1), want: "-Inf"},
+		{in: math.NaN(), want: "NaN"},
 	}
 	for _, tt := range tests {
 		if got := formatValue(tt.in); got != tt.want {
