@@ -129,18 +129,18 @@ OpenMetrics 1.0.0 support: content-type `application/openmetrics-text; version=1
 
 ## Unsupported by design (SKIP list)
 
-| Feature | Reason |
-|---------|--------|
-| **Summary metric type** | Prometheus best practices recommend histograms; complex windowed-quantile implementation for no consumer benefit |
-| **Exemplars (OpenMetrics)** | Niche; requires tracing integration |
-| **Push / remote-write** | All consumers are pull-based |
-| **Protobuf exposition format** | Text format is default in Prometheus 3.0; protobuf requires code generation |
-| **Native histograms (exponential buckets)** | Requires protobuf format; large specialized implementation |
-| **Unregister / dynamic metric lifecycle** | All consumers have static metric sets |
-| **Image metrics** | Prior `EnableImageMetrics` / `SetImageMetrics` / `ImageMetric` API removed in v2; consumers that need per-image gauges layer them on `LabeledGauge` — see registry-stats |
-| **Float64 counter** | Integer counters are sufficient for all consumers |
-| **Gzip response compression** | Use standard HTTP middleware |
-| **`Gauge.SetToCurrentTime()`** | Trivial one-liner users can write themselves |
+| Feature                                     | Reason                                                                                                                                                                   |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Summary metric type**                     | Prometheus best practices recommend histograms; complex windowed-quantile implementation for no consumer benefit                                                         |
+| **Exemplars (OpenMetrics)**                 | Niche; requires tracing integration                                                                                                                                      |
+| **Push / remote-write**                     | All consumers are pull-based                                                                                                                                             |
+| **Protobuf exposition format**              | Text format is default in Prometheus 3.0; protobuf requires code generation                                                                                              |
+| **Native histograms (exponential buckets)** | Requires protobuf format; large specialized implementation                                                                                                               |
+| **Unregister / dynamic metric lifecycle**   | All consumers have static metric sets                                                                                                                                    |
+| **Image metrics**                           | Prior `EnableImageMetrics` / `SetImageMetrics` / `ImageMetric` API removed in v2; consumers that need per-image gauges layer them on `LabeledGauge` — see registry-stats |
+| **Float64 counter**                         | Integer counters are sufficient for all consumers                                                                                                                        |
+| **Gzip response compression**               | Use standard HTTP middleware                                                                                                                                             |
+| **`Gauge.SetToCurrentTime()`**              | Trivial one-liner users can write themselves                                                                                                                             |
 
 ## License
 
