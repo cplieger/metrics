@@ -121,3 +121,20 @@ func TestProcGCPauseSeconds_ScaledToSeconds(t *testing.T) {
 		t.Errorf("process_gc_pause_seconds_total = %v, want a small non-negative seconds value (PauseTotalNs / 1e9)", val)
 	}
 }
+
+func FuzzParseProcStatusRSS_ValueAmongNoise(f *testing.F) {
+	f.Add(uint16(1024), "Threads:\t1\n")
+	f.Add(uint16(0), "")
+	f.Add(uint16(65535), "VmHWM:\t100 kB\nName:\tcat\n")
+	f.Fuzz(func(t *testing.T, kb uint16, noise string) {
+		// parseProcStatusRSS returns the first "VmRSS:" line's value * 1024.
+		// Placing a known VmRSS line first means arbitrary trailing status noise
+		// must not change the parsed bytes. kb is bounded to uint16 so kB*1024
+		// cannot overflow int64.
+		data := []byte("VmRSS:\t" + strconv.FormatUint(uint64(kb), 10) + " kB\n" + noise)
+		want := int64(kb) * 1024
+		if got := parseProcStatusRSS(data); got != want {
+			t.Errorf("parseProcStatusRSS kb=%d noise=%q = %d, want %d", kb, noise, got, want)
+		}
+	})
+}

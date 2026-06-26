@@ -13,7 +13,7 @@ const OpenMetricsContentType = "application/openmetrics-text; version=1.0.0; cha
 
 // omHelpEscaper escapes backslash, newline, AND double-quote per the OpenMetrics
 // 1.0.0 escaped-string rule (Prometheus 0.0.4 helpEscaper does not escape quotes).
-var omHelpEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`, "\r", `\r`, `"`, `\"`)
+var omHelpEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`, `"`, `\"`)
 
 // NegotiateHandler returns an HTTP handler that performs content negotiation.
 // If the client sends an Accept header preferring OpenMetrics, it responds in

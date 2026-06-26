@@ -933,7 +933,7 @@ func TestNewLabeledHistogram_TooManyLabelsPanics(t *testing.T) {
 	NewLabeledHistogram("lh_many", "test", []string{"a", "b", "c", "d", "e"})
 }
 
-func TestWriteCounter_escapes_carriage_return(t *testing.T) {
+func TestWriteCounter_carriage_return_passthrough(t *testing.T) {
 	c := NewCounter("cr_counter", "line1\rline2")
 	c.Inc()
 
@@ -941,15 +941,18 @@ func TestWriteCounter_escapes_carriage_return(t *testing.T) {
 	WriteCounter(&b, c)
 	out := b.String()
 
-	if !strings.Contains(out, `# HELP cr_counter line1\rline2`) {
-		t.Errorf("CR in HELP not escaped to \\r: %q", out)
+	// Carriage return is not a defined escape in the Prometheus text format
+	// (only \, ", and \n are), so a raw CR passes through HELP unchanged rather
+	// than being emitted as the invalid escape sequence \r.
+	if !strings.Contains(out, "# HELP cr_counter line1\rline2") {
+		t.Errorf("raw carriage return not preserved in HELP: %q", out)
 	}
-	if strings.Contains(out, "line1\rline2") {
-		t.Errorf("raw carriage return leaked into exposition output: %q", out)
+	if strings.Contains(out, `# HELP cr_counter line1\rline2`) {
+		t.Errorf("CR was escaped to the invalid \\r sequence: %q", out)
 	}
 }
 
-func TestLabelValueEscapingCarriageReturn(t *testing.T) {
+func TestLabelValueCarriageReturnPassthrough(t *testing.T) {
 	lc := NewLabeledCounter("esc_cr_lc", "test", []string{"msg"})
 	lc.Inc("a\rb")
 
@@ -957,11 +960,13 @@ func TestLabelValueEscapingCarriageReturn(t *testing.T) {
 	WriteLabeledCounter(&b, lc)
 	out := b.String()
 
-	if !strings.Contains(out, `msg="a\rb"`) {
-		t.Errorf("CR in label value not escaped to \\r: %q", out)
+	// CR is not a Prometheus escape, so a raw CR passes through the label value
+	// unchanged rather than being emitted as the invalid escape sequence \r.
+	if !strings.Contains(out, "msg=\"a\rb\"") {
+		t.Errorf("raw carriage return not preserved in label value: %q", out)
 	}
-	if strings.Contains(out, "a\rb") {
-		t.Errorf("raw carriage return leaked into label value: %q", out)
+	if strings.Contains(out, `msg="a\rb"`) {
+		t.Errorf("CR was escaped to the invalid \\r sequence in label value: %q", out)
 	}
 }
 
@@ -1084,4 +1089,63 @@ func TestWriteHistogram_SumRendering(t *testing.T) {
 			t.Errorf("WriteHistogram sum = %q, want line %q", got, "hist_sum_whole_sum 4")
 		}
 	})
+}
+
+func TestLabeledCounterFamily_skipsConcurrentlyDeletedKey(t *testing.T) {
+	lc := NewLabeledCounter("nilguard_total", "help", []string{"k"})
+	lc.Add(5, "live")
+	// A concurrent Delete/Reset can null a map slot between family()'s key
+	// snapshot and its value load; inject that state to exercise the guard
+	// deterministically. "ghost" sorts before "live", so it is processed first
+	// and a missing guard would panic on v.Load() of the nil *atomic.Int64.
+	lc.vals[labelKey{"ghost"}] = nil
+
+	fam, ok := lc.family()
+	if !ok {
+		t.Fatal("family() ok = false, want true (a live key remains)")
+	}
+	if len(fam.samples) != 1 {
+		t.Fatalf("family() emitted %d samples, want 1 (nil-valued key must be skipped)", len(fam.samples))
+	}
+	if fam.samples[0].value != "5" {
+		t.Errorf("family() sample value = %q, want \"5\"", fam.samples[0].value)
+	}
+}
+
+func TestLabeledHistogramFamily_skipsConcurrentlyDeletedKey(t *testing.T) {
+	lh := NewLabeledHistogram("nilguard_seconds", "help", []string{"k"})
+	lh.Observe(0.5, "live")
+	// Same concurrent-Delete race as the labeled counter: a nil map slot must be
+	// skipped, not dereferenced (h.snapshot() on a nil *Histogram panics). "ghost"
+	// sorts before "live" so it is processed first, pinning the guard.
+	lh.vals[labelKey{"ghost"}] = nil
+
+	fam, ok := lh.family()
+	if !ok {
+		t.Fatal("family() ok = false, want true (a live key remains)")
+	}
+	wantSamples := len(DefaultBuckets) + 3 // finite buckets + +Inf + _sum + _count
+	if len(fam.samples) != wantSamples {
+		t.Fatalf("family() emitted %d samples, want %d (nil-valued key must be skipped)", len(fam.samples), wantSamples)
+	}
+}
+
+func TestIsValidLabelName_digitAfterFirstChar(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"letter then digit", "label1", true},
+		{"underscore then digit", "_0", true},
+		{"letters and digits mixed", "http2xx", true},
+		{"leading digit rejected", "1label", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isValidLabelName(tc.in); got != tc.want {
+				t.Errorf("isValidLabelName(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
 }

@@ -89,7 +89,7 @@ func (lc *LabeledCounter) family() (fam metricFamily, ok bool) {
 			value:  strconv.FormatInt(v.Load(), 10),
 		})
 	}
-	return metricFamily{name: lc.name, typ: typeCounter, help: lc.help, samples: samples}, true
+	return metricFamily{name: lc.name, typ: typeCounter, help: lc.help, samples: samples}, len(samples) > 0
 }
 
 // family materialises an unlabeled gauge. An unlabeled gauge is always emitted.
@@ -122,7 +122,7 @@ func (lg *LabeledGauge) family() (fam metricFamily, ok bool) {
 			value:  formatValue(math.Float64frombits(ptr.Load())),
 		})
 	}
-	return metricFamily{name: lg.name, typ: typeGauge, help: lg.help, samples: samples}, true
+	return metricFamily{name: lg.name, typ: typeGauge, help: lg.help, samples: samples}, len(samples) > 0
 }
 
 // family materialises an unlabeled histogram. An unlabeled histogram is always
@@ -153,7 +153,7 @@ func (lh *LabeledHistogram) family() (fam metricFamily, ok bool) {
 		}
 		samples = append(samples, histogramSamples(h, buildLabelString(lh.labels, key))...)
 	}
-	return metricFamily{name: lh.name, typ: typeHistogram, help: lh.help, samples: samples}, true
+	return metricFamily{name: lh.name, typ: typeHistogram, help: lh.help, samples: samples}, len(samples) > 0
 }
 
 // histogramSamples expands one histogram into its cumulative bucket, sum, and

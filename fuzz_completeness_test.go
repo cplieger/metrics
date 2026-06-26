@@ -50,6 +50,7 @@ func FuzzHelpTextExposition(f *testing.F) {
 	f.Add(`back\slash`)
 	f.Add("quote\"here")
 	f.Add("\x00\xff\n\\\n")
+	f.Add("cr\rreturn")
 	f.Fuzz(func(t *testing.T, help string) {
 		c := &Counter{name: "test_counter", help: help}
 		var b strings.Builder
@@ -60,24 +61,23 @@ func FuzzHelpTextExposition(f *testing.F) {
 				continue
 			}
 			helpContent := strings.TrimPrefix(line, "# HELP test_counter ")
-			// No raw newlines within the HELP line (the line itself is split by \n)
+			// No raw newlines within the HELP line (newlines are escaped to \n;
+			// the line itself is split on \n).
 			if strings.ContainsRune(helpContent, '\n') {
 				t.Fatal("raw newline in HELP line")
 			}
-			// No raw carriage returns: helpEscaper escapes CR to \r so a raw CR
-			// must never reach the exposition output (matches the OpenMetrics path).
-			if strings.ContainsRune(helpContent, '\r') {
-				t.Fatalf("raw CR in HELP line: %q", helpContent)
-			}
-			// No unescaped backslashes: every \ must be followed by \, n, or r
-			// (helpEscaper emits \\, \n, and \r).
+			// Carriage return is not a defined Prometheus escape, so helpEscaper
+			// leaves a CR raw rather than emitting the invalid sequence \r; a raw
+			// CR is therefore allowed in the HELP line.
+			// No unescaped backslashes: every \ must be followed by \ or n
+			// (helpEscaper emits only \\ and \n).
 			for i := 0; i < len(helpContent); i++ {
 				if helpContent[i] == '\\' {
 					if i+1 >= len(helpContent) {
 						t.Fatal("trailing backslash in HELP line")
 					}
 					next := helpContent[i+1]
-					if next != '\\' && next != 'n' && next != 'r' {
+					if next != '\\' && next != 'n' {
 						t.Fatalf("invalid escape \\%c in HELP line", next)
 					}
 					i++ // skip next
@@ -203,16 +203,16 @@ func FuzzOpenMetricsHelpExposition(f *testing.F) {
 			if !ok {
 				continue
 			}
-			if strings.ContainsRune(content, '\r') {
-				t.Fatalf("raw CR in OM HELP line: %q", content)
-			}
+			// Carriage return is not a defined OpenMetrics escape, so omHelpEscaper
+			// leaves a CR raw rather than emitting the invalid sequence \r; a raw CR
+			// is therefore allowed in the OM HELP line.
 			for i := 0; i < len(content); i++ {
 				switch content[i] {
 				case '\\':
 					if i+1 >= len(content) {
 						t.Fatalf("trailing backslash in OM HELP: %q", content)
 					}
-					if n := content[i+1]; n != '\\' && n != 'n' && n != 'r' && n != '"' {
+					if n := content[i+1]; n != '\\' && n != 'n' && n != '"' {
 						t.Fatalf("invalid escape \\%c in OM HELP: %q", n, content)
 					}
 					i++
