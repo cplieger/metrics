@@ -1,0 +1,197 @@
+package metrics
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// countFamiliesWithPrefix counts collected families whose name has prefix.
+func countFamiliesWithPrefix(fams []metricFamily, prefix string) int {
+	n := 0
+	for i := range fams {
+		if strings.HasPrefix(fams[i].name, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestLabeledCounterFamily_skipsConcurrentlyDeletedKey(t *testing.T) {
+	lc := NewLabeledCounter("nilguard_total", "help", []string{"k"})
+	lc.Add(5, "live")
+	// A concurrent Delete/Reset can null a map slot between family()'s key
+	// snapshot and its value load; inject that state to exercise the guard
+	// deterministically. "ghost" sorts before "live", so it is processed first
+	// and a missing guard would panic on v.Load() of the nil *atomic.Int64.
+	lc.vals[labelKey{"ghost"}] = nil
+
+	fam, ok := lc.family()
+	if !ok {
+		t.Fatal("family() ok = false, want true (a live key remains)")
+	}
+	if len(fam.samples) != 1 {
+		t.Fatalf("family() emitted %d samples, want 1 (nil-valued key must be skipped)", len(fam.samples))
+	}
+	if fam.samples[0].value != "5" {
+		t.Errorf("family() sample value = %q, want \"5\"", fam.samples[0].value)
+	}
+}
+
+func TestLabeledHistogramFamily_skipsConcurrentlyDeletedKey(t *testing.T) {
+	lh := NewLabeledHistogram("nilguard_seconds", "help", []string{"k"})
+	lh.Observe(0.5, "live")
+	// Same concurrent-Delete race as the labeled counter: a nil map slot must be
+	// skipped, not dereferenced (h.snapshot() on a nil *Histogram panics). "ghost"
+	// sorts before "live" so it is processed first, pinning the guard.
+	lh.vals[labelKey{"ghost"}] = nil
+
+	fam, ok := lh.family()
+	if !ok {
+		t.Fatal("family() ok = false, want true (a live key remains)")
+	}
+	wantSamples := len(DefaultBuckets) + 3 // finite buckets + +Inf + _sum + _count
+	if len(fam.samples) != wantSamples {
+		t.Fatalf("family() emitted %d samples, want %d (nil-valued key must be skipped)", len(fam.samples), wantSamples)
+	}
+}
+
+// The four Collect_capacity tests register more metrics of a single type than
+// the built-in process-family count, then read them all back. This guards each
+// term of collect()'s preallocation sum: a wrong sign on any term would make
+// the make() capacity negative and panic before any family is returned.
+
+func TestCollect_capacityCounters(t *testing.T) {
+	const prefix = "capctr_"
+	reg := NewRegistry("")
+	for i := range 20 {
+		reg.RegisterCounter(NewCounter(prefix+strconv.Itoa(i)+"_total", "h"))
+	}
+
+	fams := reg.collect()
+
+	if got := countFamiliesWithPrefix(fams, prefix); got != 20 {
+		t.Fatalf("collect() emitted %d %q families, want 20", got, prefix)
+	}
+}
+
+func TestCollect_capacityLabeledGauges(t *testing.T) {
+	const prefix = "caplg_"
+	reg := NewRegistry("")
+	for i := range 20 {
+		lg := NewLabeledGauge(prefix+strconv.Itoa(i), "h", []string{"k"})
+		reg.RegisterLabeledGauge(lg)
+		lg.Set(1, "v") // a labeled metric only emits a family once a combo is set
+	}
+
+	fams := reg.collect()
+
+	if got := countFamiliesWithPrefix(fams, prefix); got != 20 {
+		t.Fatalf("collect() emitted %d %q families, want 20", got, prefix)
+	}
+}
+
+func TestCollect_capacityHistograms(t *testing.T) {
+	const prefix = "caphist_"
+	reg := NewRegistry("")
+	for i := range 20 {
+		reg.RegisterHistogram(NewHistogram(prefix+strconv.Itoa(i), "h"))
+	}
+
+	fams := reg.collect()
+
+	if got := countFamiliesWithPrefix(fams, prefix); got != 20 {
+		t.Fatalf("collect() emitted %d %q families, want 20", got, prefix)
+	}
+}
+
+func TestCollect_capacityLabeledHistograms(t *testing.T) {
+	const prefix = "caplh_"
+	reg := NewRegistry("")
+	for i := range 20 {
+		lh := NewLabeledHistogram(prefix+strconv.Itoa(i), "h", []string{"k"})
+		reg.RegisterLabeledHistogram(lh)
+		lh.Observe(0.1, "v")
+	}
+
+	fams := reg.collect()
+
+	if got := countFamiliesWithPrefix(fams, prefix); got != 20 {
+		t.Fatalf("collect() emitted %d %q families, want 20", got, prefix)
+	}
+}
+
+// TestEncoders_bothFormats_allTypes verifies every metric type appears in both
+// exposition formats and that the format-specific trailer differs: OpenMetrics
+// ends with "# EOF", Prometheus does not.
+func TestEncoders_bothFormats_allTypes(t *testing.T) {
+	r := NewRegistry("")
+	c := NewCounter("parity_counter", "A counter")
+	g := NewGauge("parity_gauge", "A gauge")
+	h := NewHistogram("parity_hist", "A histogram", WithBuckets([]float64{0.1, 1}))
+	lc := NewLabeledCounter("parity_lc", "Labeled counter", []string{"k"})
+	lg := NewLabeledGauge("parity_lg", "Labeled gauge", []string{"k"})
+	lh := NewLabeledHistogram("parity_lh", "Labeled histogram", []string{"k"}, WithBuckets([]float64{0.5}))
+
+	r.RegisterCounter(c)
+	r.RegisterGauge(g)
+	r.RegisterHistogram(h)
+	r.RegisterLabeledCounter(lc)
+	r.RegisterLabeledGauge(lg)
+	r.RegisterLabeledHistogram(lh)
+
+	c.Add(10)
+	g.Set(3.14)
+	h.Observe(0.05)
+	h.Observe(5.0)
+	lc.Inc("v1")
+	lg.Set(99, "v1")
+	lh.Observe(0.3, "v1")
+
+	rec1 := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	prom := rec1.Body.String()
+
+	rec2 := httptest.NewRecorder()
+	r.OpenMetricsHandler().ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	om := rec2.Body.String()
+
+	for _, name := range []string{"parity_counter", "parity_gauge", "parity_hist", "parity_lc", "parity_lg", "parity_lh"} {
+		if !strings.Contains(prom, name) {
+			t.Errorf("Prometheus missing %s", name)
+		}
+		if !strings.Contains(om, name) {
+			t.Errorf("OpenMetrics missing %s", name)
+		}
+	}
+
+	if !strings.HasSuffix(om, "# EOF\n") {
+		t.Error("OpenMetrics missing EOF")
+	}
+	if strings.Contains(prom, "# EOF") {
+		t.Error("Prometheus should not have EOF")
+	}
+}
+
+// TestHelpEscaping_PrometheusVsOpenMetrics locks the one HELP-escaping
+// difference between the formats: Prometheus escapes backslash and newline but
+// leaves the double-quote raw, while OpenMetrics also escapes the double-quote.
+func TestHelpEscaping_PrometheusVsOpenMetrics(t *testing.T) {
+	help := "line1\\line2\nline3\"quoted\""
+	c := NewCounter("help_esc", help)
+	c.Inc()
+
+	var b strings.Builder
+	WriteCounter(&b, c)
+	if out := b.String(); !strings.Contains(out, `# HELP help_esc line1\\line2\nline3"quoted"`) {
+		t.Errorf("Prometheus HELP escaping wrong:\n%s", out)
+	}
+
+	b.Reset()
+	writeOMSimpleCounter(&b, c)
+	if omOut := b.String(); !strings.Contains(omOut, `# HELP help_esc line1\\line2\nline3\"quoted\"`) {
+		t.Errorf("OpenMetrics HELP escaping wrong:\n%s", omOut)
+	}
+}
