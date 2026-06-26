@@ -29,11 +29,11 @@ import (
 )
 
 // helpEscaper escapes backslashes and newlines in HELP text per Prometheus exposition format.
-var helpEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`, "\r", `\r`)
+var helpEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`)
 
 // Process metric family names, defined once so the reservation list
-// (processFamilyNames) and both writers (WriteProcessMetrics,
-// writeOMProcessMetrics) reference a single source and cannot drift.
+// (processFamilyNames) and the process-metric IR builder (processFamilies,
+// rendered by both encoders) reference a single source and cannot drift.
 const (
 	pmGoroutines    = "process_goroutines"
 	pmHeapBytes     = "process_heap_bytes"
@@ -48,7 +48,7 @@ const (
 	pmMaxFDs        = "process_max_fds"
 )
 
-// processFamilyNames are the family names WriteProcessMetrics / writeOMProcessMetrics emit
+// processFamilyNames are the family names processFamilies emits
 // unconditionally. Reserved at creation so a user metric colliding with one fails fast like any
 // other duplicate instead of silently producing a duplicate "# TYPE" line that breaks the scrape.
 // Both the OM counter base and the Prometheus _total TYPE form are listed for the two process
@@ -140,6 +140,17 @@ func (r *Registry) reserveHistogramFamily(name, kind string) {
 	r.reserveName(name+"_count", kind)
 }
 
+// reserveCounterFamily reserves the OpenMetrics base name plus the _total
+// sample-series name a counter emits across both formats, mirroring
+// reserveHistogramFamily. Callers must hold r.mu.
+func (r *Registry) reserveCounterFamily(name, kind string) {
+	base := omCounterBaseName(name)
+	r.reserveName(base, kind)
+	if sample := omCounterSampleName(name); sample != base {
+		r.reserveName(sample, kind)
+	}
+}
+
 // RegisterCounter adds a counter to the registry.
 func (r *Registry) RegisterCounter(c *Counter) {
 	r.mu.Lock()
@@ -148,11 +159,7 @@ func (r *Registry) RegisterCounter(c *Counter) {
 		panic("metrics: counter already registered")
 	}
 	c.name = r.prefixed(c.name)
-	base := omCounterBaseName(c.name)
-	r.reserveName(base, "counter")
-	if sample := omCounterSampleName(c.name); sample != base {
-		r.reserveName(sample, "counter")
-	}
+	r.reserveCounterFamily(c.name, "counter")
 	r.counters = append(r.counters, c)
 }
 
@@ -176,11 +183,7 @@ func (r *Registry) RegisterLabeledCounter(lc *LabeledCounter) {
 		panic("metrics: labeled counter already registered")
 	}
 	lc.name = r.prefixed(lc.name)
-	base := omCounterBaseName(lc.name)
-	r.reserveName(base, "labeled counter")
-	if sample := omCounterSampleName(lc.name); sample != base {
-		r.reserveName(sample, "labeled counter")
-	}
+	r.reserveCounterFamily(lc.name, "labeled counter")
 	r.labeledCounters = append(r.labeledCounters, lc)
 }
 

@@ -116,6 +116,7 @@ func main() {
 
 - `process_goroutines`, `process_heap_bytes`, `process_gc_pause_seconds_total`, `process_uptime_seconds`, `process_start_time_seconds`.
 - Linux only: `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds`, `process_max_fds`.
+  - Caveat: `process_cpu_seconds_total` assumes `USER_HZ` (`sysconf(_SC_CLK_TCK)`) = 100, the near-universal Linux default; on a kernel built with a different `CONFIG_HZ` the value is scaled by a constant factor. Reading the real value would require cgo or `golang.org/x/sys`, which the zero-dependency contract excludes.
 
 ### Low-level writers
 

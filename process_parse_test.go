@@ -139,3 +139,22 @@ func TestOpenFDCount(t *testing.T) {
 		})
 	}
 }
+
+func FuzzParseProcStatCPU_CommRobustness(f *testing.F) {
+	f.Add("cat")
+	f.Add("weird (proc) name")
+	f.Add("has)trailing")
+	f.Add("")
+	f.Add("new\nline")
+	f.Fuzz(func(t *testing.T, comm string) {
+		// /proc/self/stat is "pid (comm) state ...". parseProcStatCPU keys off the
+		// LAST ')', so an arbitrary comm (embedded spaces, parens, newlines) must
+		// not corrupt utime/stime field indexing. The trailing fields contain no
+		// ')', so the appended ')' is always the last one; with utime=200,stime=100
+		// at field indices 11,12 the result stays 3.0s for any comm.
+		stat := []byte("1234 (" + comm + ") S 0 0 0 0 0 0 0 0 0 0 200 100")
+		if got := parseProcStatCPU(stat); got != 3.0 {
+			t.Errorf("parseProcStatCPU with comm %q = %v, want 3.0", comm, got)
+		}
+	})
+}

@@ -67,9 +67,9 @@ type processMetricsData struct {
 	maxFDs     int64
 }
 
-// Series-presence predicates shared by both process-metric writers
-// (WriteProcessMetrics and writeOMProcessMetrics). Single-sourcing them here
-// keeps the two exposition formats emitting the same optional series set.
+// Series-presence predicates used by processFamilies when materialising the
+// process-metric IR. Gating them in one place keeps both exposition formats
+// (encodePrometheus / encodeOpenMetrics) emitting the same optional series set.
 func (d *processMetricsData) hasCPU() bool     { return d.cpuSeconds >= 0 }
 func (d *processMetricsData) hasRSS() bool     { return d.rss > 0 }
 func (d *processMetricsData) hasOpenFDs() bool { return d.openFDs >= 0 }
