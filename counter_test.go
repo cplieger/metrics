@@ -1,0 +1,410 @@
+package metrics
+
+import (
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+)
+
+func TestCounterInc(t *testing.T) {
+	c := NewCounter("test_counter", "test")
+	c.Inc()
+	c.Inc()
+	if got := c.val.Load(); got != 2 {
+		t.Errorf("Counter.Inc() = %d, want 2", got)
+	}
+}
+
+func TestCounterAdd(t *testing.T) {
+	c := NewCounter("test_counter_add", "test")
+	c.Add(5)
+	c.Add(3)
+	if got := c.val.Load(); got != 8 {
+		t.Errorf("Counter.Add() = %d, want 8", got)
+	}
+}
+
+func TestCounterAddNegativePanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for negative Add")
+		}
+	}()
+	c := NewCounter("test_counter_neg", "test")
+	c.Add(-1)
+}
+
+// TestCounterAdd_ZeroIsAllowedNoPanic pins the negative guard at its inclusive
+// boundary: Add(0) is a legal no-op (the guard is n < 0, not n <= 0).
+func TestCounterAdd_ZeroIsAllowedNoPanic(t *testing.T) {
+	c := NewCounter("mk_counter_add0", "test")
+	c.Add(0) // must not panic
+	if got := c.val.Load(); got != 0 {
+		t.Errorf("Counter.Add(0) value = %d, want 0", got)
+	}
+	c.Add(7)
+	if got := c.val.Load(); got != 7 {
+		t.Errorf("Counter.Add(7) after Add(0) = %d, want 7", got)
+	}
+}
+
+func TestLabeledCounterInc(t *testing.T) {
+	lc := NewLabeledCounter("test_lc", "test", []string{"method", "status"})
+	lc.Inc("GET", "200")
+	lc.Inc("GET", "200")
+	lc.Inc("POST", "201")
+
+	key := labelKey{"GET", "200", "", ""}
+	if got := lc.vals[key].Load(); got != 2 {
+		t.Errorf("LabeledCounter[GET,200] = %d, want 2", got)
+	}
+	key2 := labelKey{"POST", "201", "", ""}
+	if got := lc.vals[key2].Load(); got != 1 {
+		t.Errorf("LabeledCounter[POST,201] = %d, want 1", got)
+	}
+}
+
+func TestLabeledCounterArityPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for arity mismatch")
+		}
+	}()
+	lc := NewLabeledCounter("test_lc_arity", "test", []string{"method", "status"})
+	lc.Inc("GET") // wrong arity
+}
+
+func TestLabeledCounterTooManyLabelsPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for >4 labels")
+		}
+	}()
+	NewLabeledCounter("test_lc_many", "test", []string{"a", "b", "c", "d", "e"})
+}
+
+// TestNewLabeledCounter_ExactlyFourLabelsAllowed pins the arity guard at its
+// inclusive maximum: four labels is the legal maximum (the guard is > 4).
+func TestNewLabeledCounter_ExactlyFourLabelsAllowed(t *testing.T) {
+	lc := NewLabeledCounter("mk_lc4_total", "test", []string{"a", "b", "c", "d"})
+	lc.Inc("1", "2", "3", "4") // must not panic with four labels
+	if got := lc.vals[labelKey{"1", "2", "3", "4"}].Load(); got != 1 {
+		t.Errorf("LabeledCounter[4 labels] = %d, want 1", got)
+	}
+}
+
+func TestLabeledCounterAdd(t *testing.T) {
+	lc := NewLabeledCounter("test_lc_add", "test", []string{"method", "status"})
+	lc.Add(5, "GET", "200") // new key: Store(5)
+	lc.Add(3, "GET", "200") // existing key: Add(3) -> 8
+	lc.Add(10, "POST", "201")
+
+	key := labelKey{"GET", "200", "", ""}
+	if got := lc.vals[key].Load(); got != 8 {
+		t.Errorf("LabeledCounter.Add[GET,200] = %d, want 8", got)
+	}
+	key2 := labelKey{"POST", "201", "", ""}
+	if got := lc.vals[key2].Load(); got != 10 {
+		t.Errorf("LabeledCounter.Add[POST,201] = %d, want 10", got)
+	}
+}
+
+func TestLabeledCounterAdd_zeroOnNewKey(t *testing.T) {
+	lc := NewLabeledCounter("test_lc_add_zero", "test", []string{"k"})
+	lc.Add(0, "a")
+	key := labelKey{"a", "", "", ""}
+	v, ok := lc.vals[key]
+	if !ok {
+		t.Fatal("Add(0) should create the label entry")
+	}
+	if got := v.Load(); got != 0 {
+		t.Errorf("LabeledCounter.Add(0)[a] = %d, want 0", got)
+	}
+}
+
+func TestLabeledCounterAdd_negativePanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for negative Add")
+		}
+	}()
+	lc := NewLabeledCounter("test_lc_add_neg", "test", []string{"k"})
+	lc.Add(-1, "a") // correct arity: hits the negative guard, not the arity guard
+}
+
+func TestLabeledCounterAdd_arityMismatchPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for arity mismatch")
+		}
+	}()
+	lc := NewLabeledCounter("test_lc_add_arity", "test", []string{"method", "status"})
+	lc.Add(1, "GET") // n>=0 passes negative guard, then arity guard fires
+}
+
+func TestLabeledCounter_Reset(t *testing.T) {
+	lc := NewLabeledCounter("lc_reset_total", "test", []string{"host"})
+	lc.Inc("a")
+	lc.Inc("b")
+	lc.Reset()
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	if b.Len() != 0 {
+		t.Errorf("expected empty output after Reset, got: %s", b.String())
+	}
+}
+
+func TestLabeledCounter_Delete(t *testing.T) {
+	lc := NewLabeledCounter("lc_delete_total", "test", []string{"host"})
+	lc.Inc("a")
+	lc.Inc("b")
+	lc.Delete("a")
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	out := b.String()
+	if strings.Contains(out, `host="a"`) {
+		t.Errorf("deleted key still present: %s", out)
+	}
+	if !strings.Contains(out, `host="b"`) {
+		t.Errorf("remaining key missing: %s", out)
+	}
+}
+
+func TestLabeledCounter_DeleteArityPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for arity mismatch")
+		}
+	}()
+	lc := NewLabeledCounter("lc_del_panic_total", "test", []string{"a", "b"})
+	lc.Delete("only_one")
+}
+
+// TestLabeledCounter_emptyLabelSet exercises a labeled counter declared with no
+// label names: Inc with no values is valid and the family is still emitted.
+func TestLabeledCounter_emptyLabelSet(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("zero-label counter panicked: %v", r)
+		}
+	}()
+	lc := NewLabeledCounter("rt6_empty_labels", "test", []string{})
+	lc.Inc()
+	lc.Inc()
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	out := b.String()
+	if !strings.Contains(out, "rt6_empty_labels") {
+		t.Errorf("empty label counter missing: %s", out)
+	}
+}
+
+func TestWriteCounterFormat(t *testing.T) {
+	c := NewCounter("http_requests_total", "Total HTTP requests")
+	c.Inc()
+	c.Inc()
+	c.Inc()
+
+	var b strings.Builder
+	WriteCounter(&b, c)
+	out := b.String()
+
+	if !strings.Contains(out, "# HELP http_requests_total Total HTTP requests") {
+		t.Error("missing HELP line")
+	}
+	if !strings.Contains(out, "# TYPE http_requests_total counter") {
+		t.Error("missing TYPE line")
+	}
+	if !strings.Contains(out, "http_requests_total 3") {
+		t.Errorf("missing counter value: %s", out)
+	}
+}
+
+func TestWriteCounter_helpCarriageReturnRaw(t *testing.T) {
+	c := NewCounter("cr_counter", "line1\rline2")
+	c.Inc()
+
+	var b strings.Builder
+	WriteCounter(&b, c)
+	out := b.String()
+
+	// Carriage return is not a defined escape in the Prometheus text format
+	// (only \, ", and \n are), so a raw CR passes through HELP unchanged rather
+	// than being emitted as the invalid escape sequence \r.
+	if !strings.Contains(out, "# HELP cr_counter line1\rline2") {
+		t.Errorf("raw carriage return not preserved in HELP: %q", out)
+	}
+	if strings.Contains(out, `# HELP cr_counter line1\rline2`) {
+		t.Errorf("CR was escaped to the invalid \\r sequence: %q", out)
+	}
+}
+
+func TestWriteLabeledCounterSorted(t *testing.T) {
+	lc := NewLabeledCounter("sorted_lc", "test", []string{"method", "path", "status"})
+	lc.Inc("POST", "/b", "201")
+	lc.Inc("GET", "/a", "200")
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	out := b.String()
+	if !strings.Contains(out, `method="GET",path="/a",status="200"`) {
+		t.Errorf("labels not sorted: %s", out)
+	}
+}
+
+func TestLabelValueEscaping(t *testing.T) {
+	lc := NewLabeledCounter("esc_lc", "test", []string{"path"})
+	lc.Inc("C:\\DIR\\FILE.TXT")
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	out := b.String()
+
+	if !strings.Contains(out, `path="C:\\DIR\\FILE.TXT"`) {
+		t.Errorf("label value not escaped correctly: %s", out)
+	}
+}
+
+func TestLabelValueEscapingNewlineAndQuote(t *testing.T) {
+	lc := NewLabeledCounter("esc_lc2", "test", []string{"msg"})
+	lc.Inc("hello\n\"world\"")
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	out := b.String()
+
+	if !strings.Contains(out, `msg="hello\n\"world\""`) {
+		t.Errorf("label escaping wrong: %s", out)
+	}
+}
+
+func TestLabelValueTabNotOverEscaped(t *testing.T) {
+	lc := NewLabeledCounter("esc_lc3", "test", []string{"msg"})
+	lc.Inc("a\tb") // tab should NOT be escaped
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	out := b.String()
+
+	if !strings.Contains(out, "msg=\"a\tb\"") {
+		t.Errorf("tab should pass through unescaped: %s", out)
+	}
+}
+
+func TestLabelValueCarriageReturnPassthrough(t *testing.T) {
+	lc := NewLabeledCounter("esc_cr_lc", "test", []string{"msg"})
+	lc.Inc("a\rb")
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	out := b.String()
+
+	// CR is not a Prometheus escape, so a raw CR passes through the label value
+	// unchanged rather than being emitted as the invalid escape sequence \r.
+	if !strings.Contains(out, "msg=\"a\rb\"") {
+		t.Errorf("raw carriage return not preserved in label value: %q", out)
+	}
+	if strings.Contains(out, `msg="a\rb"`) {
+		t.Errorf("CR was escaped to the invalid \\r sequence in label value: %q", out)
+	}
+}
+
+func TestSortedLabelKeys_returnsLexicographicOrder(t *testing.T) {
+	var mu sync.RWMutex
+	vals := map[labelKey]int{
+		{"b", "2", "", ""}: 1,
+		{"a", "9", "", ""}: 1,
+		{"a", "1", "", ""}: 1,
+		{"c", "0", "", ""}: 1,
+	}
+	got := sortedLabelKeys(&mu, vals)
+	want := []labelKey{
+		{"a", "1", "", ""},
+		{"a", "9", "", ""},
+		{"b", "2", "", ""},
+		{"c", "0", "", ""},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("sortedLabelKeys() = %v, want %v", got, want)
+	}
+}
+
+func TestSortedLabelKeys_empty(t *testing.T) {
+	var mu sync.RWMutex
+	if got := sortedLabelKeys(&mu, map[labelKey]int{}); len(got) != 0 {
+		t.Errorf("sortedLabelKeys(empty) = %v, want empty", got)
+	}
+}
+
+func TestLabeledCounterConcurrent(t *testing.T) {
+	lc := NewLabeledCounter("conc_lc", "test", []string{"method", "status"})
+	done := make(chan struct{})
+	for range 100 {
+		go func() {
+			lc.Inc("GET", "200")
+			done <- struct{}{}
+		}()
+	}
+	for range 100 {
+		<-done
+	}
+	key := labelKey{"GET", "200", "", ""}
+	if got := lc.vals[key].Load(); got != 100 {
+		t.Errorf("concurrent LabeledCounter = %d, want 100", got)
+	}
+}
+
+// TestCounter_Inc_Concurrent asserts the unlabeled atomic counter totals every
+// concurrent increment without loss.
+func TestCounter_Inc_Concurrent(t *testing.T) {
+	c := NewCounter("rt6_counter_hot", "hot path")
+	const n = 100
+	const iters = 1000
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() {
+			for range iters {
+				c.Inc()
+			}
+		})
+	}
+	wg.Wait()
+	if got := c.val.Load(); got != int64(n*iters) {
+		t.Errorf("counter = %d, want %d", got, n*iters)
+	}
+}
+
+func BenchmarkLabeledCounterInc(b *testing.B) {
+	lc := NewLabeledCounter("bench_lc", "bench", []string{"method", "path", "status"})
+	lc.Inc("GET", "/api", "200")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		lc.Inc("GET", "/api", "200")
+	}
+}
+
+func BenchmarkLabeledCounterInc_NewKey(b *testing.B) {
+	lc := NewLabeledCounter("bench_lc_new", "bench", []string{"method", "path", "status"})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		lc.Inc("GET", "/api/"+strings.Repeat("x", i%8), "200")
+	}
+}
+
+func BenchmarkLabeledCounterInc_Parallel(b *testing.B) {
+	lc := NewLabeledCounter("bench_lc_par", "bench", []string{"method", "path", "status"})
+	lc.Inc("GET", "/api", "200")
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			lc.Inc("GET", "/api", "200")
+		}
+	})
+}
