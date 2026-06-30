@@ -58,7 +58,56 @@ func TestLabeledHistogramFamily_skipsConcurrentlyDeletedKey(t *testing.T) {
 	}
 }
 
-// The four Collect_capacity tests register more metrics of a single type than
+// The next three tests are the boundary companions to the
+// *Family_skipsConcurrentlyDeletedKey tests: when a racing Delete/Reset nulls
+// EVERY observed key's slot (not just some), no sample survives, so family()
+// must report ok=false. collect() emits a family only when ok is true, so a
+// false-positive ok would leak a bare "# HELP"/"# TYPE" block with no samples —
+// malformed exposition that both parsers reject.
+
+func TestLabeledCounterFamily_reportsNotOkWhenAllObservedKeysNilValued(t *testing.T) {
+	lc := NewLabeledCounter("allnil_total", "help", []string{"k"})
+	// The sole observed key, nulled between family()'s key snapshot and its
+	// value load. keys stays non-empty (so the len(keys)==0 early-out does not
+	// fire), but the guarded loop appends nothing.
+	lc.vals[labelKey{"ghost"}] = nil
+
+	fam, ok := lc.family()
+	if ok {
+		t.Error("family() ok = true, want false when every observed key is nil-valued")
+	}
+	if len(fam.samples) != 0 {
+		t.Errorf("family() emitted %d samples, want 0", len(fam.samples))
+	}
+}
+
+func TestLabeledGaugeFamily_reportsNotOkWhenAllObservedKeysNilValued(t *testing.T) {
+	lg := NewLabeledGauge("allnil", "help", []string{"k"})
+	lg.vals[labelKey{"ghost"}] = nil
+
+	fam, ok := lg.family()
+	if ok {
+		t.Error("family() ok = true, want false when every observed key is nil-valued")
+	}
+	if len(fam.samples) != 0 {
+		t.Errorf("family() emitted %d samples, want 0", len(fam.samples))
+	}
+}
+
+func TestLabeledHistogramFamily_reportsNotOkWhenAllObservedKeysNilValued(t *testing.T) {
+	lh := NewLabeledHistogram("allnil_seconds", "help", []string{"k"})
+	lh.vals[labelKey{"ghost"}] = nil
+
+	fam, ok := lh.family()
+	if ok {
+		t.Error("family() ok = true, want false when every observed key is nil-valued")
+	}
+	if len(fam.samples) != 0 {
+		t.Errorf("family() emitted %d samples, want 0", len(fam.samples))
+	}
+}
+
+// The five Collect_capacity tests register more metrics of a single type than
 // the built-in process-family count, then read them all back. This guards each
 // term of collect()'s preallocation sum: a wrong sign on any term would make
 // the make() capacity negative and panic before any family is returned.
@@ -114,6 +163,20 @@ func TestCollect_capacityLabeledHistograms(t *testing.T) {
 		lh := NewLabeledHistogram(prefix+strconv.Itoa(i), "h", []string{"k"})
 		reg.RegisterLabeledHistogram(lh)
 		lh.Observe(0.1, "v")
+	}
+
+	fams := reg.collect()
+
+	if got := countFamiliesWithPrefix(fams, prefix); got != 20 {
+		t.Fatalf("collect() emitted %d %q families, want 20", got, prefix)
+	}
+}
+
+func TestCollect_capacityGauges(t *testing.T) {
+	const prefix = "capg_"
+	reg := NewRegistry("")
+	for i := range 20 {
+		reg.RegisterGauge(NewGauge(prefix+strconv.Itoa(i), "h"))
 	}
 
 	fams := reg.collect()
