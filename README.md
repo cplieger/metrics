@@ -2,7 +2,6 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/metrics/v2.svg)](https://pkg.go.dev/github.com/cplieger/metrics/v2)
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/metrics)](https://github.com/cplieger/metrics/blob/main/go.mod)
-[![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/metrics)](https://goreportcard.com/report/github.com/cplieger/metrics)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/metrics/badges/coverage.json)](https://github.com/cplieger/metrics/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/metrics/badges/mutation.json)](https://github.com/cplieger/metrics/issues?q=label%3Agremlins-tracker)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13214/badge)](https://www.bestpractices.dev/projects/13214)
@@ -130,18 +129,24 @@ OpenMetrics 1.0.0 support: content-type `application/openmetrics-text; version=1
 
 ## Unsupported by design (SKIP list)
 
-| Feature                                     | Reason                                                                                                                                                                   |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Summary metric type**                     | Prometheus best practices recommend histograms; complex windowed-quantile implementation for no consumer benefit                                                         |
-| **Exemplars (OpenMetrics)**                 | Niche; requires tracing integration                                                                                                                                      |
-| **Push / remote-write**                     | All consumers are pull-based                                                                                                                                             |
-| **Protobuf exposition format**              | Text format is default in Prometheus 3.0; protobuf requires code generation                                                                                              |
-| **Native histograms (exponential buckets)** | Requires protobuf format; large specialized implementation                                                                                                               |
-| **Unregister / dynamic metric lifecycle**   | All consumers have static metric sets                                                                                                                                    |
-| **Image metrics**                           | Prior `EnableImageMetrics` / `SetImageMetrics` / `ImageMetric` API removed in v2; consumers that need per-image gauges layer them on `LabeledGauge` — see registry-stats |
-| **Float64 counter**                         | Integer counters are sufficient for all consumers                                                                                                                        |
-| **Gzip response compression**               | Use standard HTTP middleware                                                                                                                                             |
-| **`Gauge.SetToCurrentTime()`**              | Trivial one-liner users can write themselves                                                                                                                             |
+| Feature                                     | Reason                                                                                                                                              |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Summary metric type**                     | Prometheus best practices recommend histograms; complex windowed-quantile implementation for no consumer benefit                                    |
+| **Exemplars (OpenMetrics)**                 | Niche; requires tracing integration                                                                                                                 |
+| **Push / remote-write**                     | All consumers are pull-based                                                                                                                        |
+| **Protobuf exposition format**              | Text format is default in Prometheus 3.0; protobuf requires code generation                                                                         |
+| **Native histograms (exponential buckets)** | Requires protobuf format; large specialized implementation                                                                                          |
+| **Unregister / dynamic metric lifecycle**   | All consumers have static metric sets                                                                                                               |
+| **Image metrics**                           | Prior `EnableImageMetrics` / `SetImageMetrics` / `ImageMetric` API removed in v2; consumers that need per-image gauges layer them on `LabeledGauge` |
+| **Float64 counter**                         | Integer counters are sufficient for all consumers                                                                                                   |
+| **Gzip response compression**               | Use standard HTTP middleware                                                                                                                        |
+| **`Gauge.SetToCurrentTime()`**              | Trivial one-liner users can write themselves                                                                                                        |
+
+## Disclaimer
+
+This project is built with care and follows security best practices, but it is intended for personal / self-hosted use. No guarantees of fitness for production environments. Use at your own risk.
+
+This project was built with AI-assisted tooling using [Claude Opus](https://www.anthropic.com/claude) and [Kiro](https://kiro.dev). The human maintainer defines architecture, supervises implementation, and makes all final decisions.
 
 ## License
 
