@@ -470,6 +470,24 @@ func TestNewLabeledHistogram_ExactlyFourLabelsAllowed(t *testing.T) {
 	}
 }
 
+// TestNewLabeledHistogram_LabelNameLePanics pins the cycle-1 guard that reserves
+// the label name "le" for the implicit bucket bound: constructing a labeled
+// histogram with an "le" label must panic with the reserved-label message. It
+// fails with "expected panic" if the guard is removed or relaxed.
+func TestNewLabeledHistogram_LabelNameLePanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal(`expected panic for reserved label name "le"`)
+		}
+		msg, _ := r.(string)
+		if !strings.Contains(msg, `label name "le" is reserved`) {
+			t.Errorf("panic message = %v, want it to contain %q", r, `label name "le" is reserved`)
+		}
+	}()
+	NewLabeledHistogram("lh_reserved_le", "test", []string{"method", "le"})
+}
+
 // TestLabeledHistogram_Concurrent asserts every concurrent Observe across
 // several label combinations is counted, exercising the per-key lazy histogram
 // creation under contention.

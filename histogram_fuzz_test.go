@@ -48,44 +48,63 @@ func FuzzHistogram_BucketPlacementInvariant(f *testing.F) {
 	})
 }
 
-// FuzzHistogramObserve checks observe-side invariants for any value: the count
-// increments by one, a finite input never produces a NaN sum, and the
-// cumulative bucket counts stay monotonically non-decreasing.
+// FuzzHistogramObserve constructs a fresh histogram per fuzz input so inputs are
+// independent (no cross-iteration state that would let one iteration's NaN
+// poison a later finite input), then pins the single-observation contract: count
+// is exactly one, the sum reflects that lone observation (NaN/±Inf preserved,
+// finite echoed exactly), and each cumulative bucket counts the value iff it is
+// <= the bound, with the implicit +Inf bucket always counting it.
 func FuzzHistogramObserve(f *testing.F) {
 	f.Add(0.001)
 	f.Add(0.5)
 	f.Add(1.0)
 	f.Add(10.0)
 	f.Add(math.MaxFloat64)
+	f.Add(math.Inf(1))
+	f.Add(math.Inf(-1))
+	f.Add(math.NaN())
 	f.Add(0.0)
 	f.Add(-1.0)
 
-	h := NewHistogram("fuzz_test", "fuzz")
-
 	f.Fuzz(func(t *testing.T, val float64) {
-		countBefore := h.count.Load()
+		h := NewHistogram("fuzz_test", "fuzz")
 		h.Observe(val)
-		countAfter := h.count.Load()
 
-		if countAfter != countBefore+1 {
-			t.Errorf("count did not increment: before=%d after=%d", countBefore, countAfter)
+		sum, count, bucketVals := h.snapshot()
+		if count != 1 {
+			t.Fatalf("count = %d, want 1", count)
 		}
 
-		if !math.IsNaN(val) && !math.IsInf(val, 0) {
-			sumBits := h.sumBits.Load()
-			sum := math.Float64frombits(sumBits)
-			if math.IsNaN(sum) {
-				t.Error("sum became NaN from finite input")
+		switch {
+		case math.IsNaN(val):
+			if !math.IsNaN(sum) {
+				t.Fatalf("sum after NaN observe = %v, want NaN", sum)
+			}
+		case math.IsInf(val, 1):
+			if !math.IsInf(sum, 1) {
+				t.Fatalf("sum after +Inf observe = %v, want +Inf", sum)
+			}
+		case math.IsInf(val, -1):
+			if !math.IsInf(sum, -1) {
+				t.Fatalf("sum after -Inf observe = %v, want -Inf", sum)
+			}
+		default:
+			if sum != val {
+				t.Fatalf("sum after finite observe = %v, want %v", sum, val)
 			}
 		}
 
-		var prev int64
-		for i := range h.buckets {
-			cur := h.buckets[i].Load()
-			if cur < prev {
-				t.Errorf("bucket[%d] count %d < prev %d", i, cur, prev)
+		for i, bound := range h.bounds {
+			want := int64(0)
+			if val <= bound {
+				want = 1
 			}
-			prev = cur
+			if got := bucketVals[i]; got != want {
+				t.Errorf("val=%v bound[%d]=%v: bucket=%d, want %d", val, i, bound, got, want)
+			}
+		}
+		if got := bucketVals[len(h.bounds)]; got != 1 {
+			t.Errorf("+Inf bucket = %d, want 1", got)
 		}
 	})
 }

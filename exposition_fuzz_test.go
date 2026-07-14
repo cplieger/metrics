@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // FuzzPrometheusHelpExposition asserts the Prometheus HELP line for an arbitrary
@@ -56,6 +57,12 @@ func FuzzRegistryFullExposition(f *testing.F) {
 	f.Add("quote\"x", "nl\ny")
 	f.Add("back\\s", "\x00")
 	f.Fuzz(func(t *testing.T, lv1, lv2 string) {
+		// Invalid-UTF-8 label values fail fast at series creation
+		// (validateLabelValues); this target exercises exposition structure of
+		// storable series, so skip out-of-domain inputs.
+		if !utf8.ValidString(lv1) || !utf8.ValidString(lv2) {
+			t.Skip()
+		}
 		reg := NewRegistry("")
 		c := NewCounter("fuzz_counter", "counter help")
 		c.Inc()
@@ -77,7 +84,8 @@ func FuzzRegistryFullExposition(f *testing.F) {
 			if line == "" {
 				continue
 			}
-			if !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "fuzz_") && !strings.HasPrefix(line, "process_") {
+			if !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "fuzz_") &&
+				!strings.HasPrefix(line, "process_") && !strings.HasPrefix(line, "go_") {
 				t.Fatalf("unexpected line: %q", line)
 			}
 			if strings.HasPrefix(line, "# TYPE ") {
@@ -111,6 +119,12 @@ func FuzzLabeledExposition_balanced(f *testing.F) {
 	f.Add("emoji🎉", 7.0)
 
 	f.Fuzz(func(t *testing.T, val string, gaugeVal float64) {
+		// Invalid-UTF-8 label values fail fast at series creation
+		// (validateLabelValues); this target exercises escaping of storable
+		// series, so skip out-of-domain inputs.
+		if !utf8.ValidString(val) {
+			t.Skip()
+		}
 		lc := NewLabeledCounter("fuzz_counter", "fuzz help", []string{"v"})
 		lc.Inc(val)
 		lg := NewLabeledGauge("fuzz_gauge", "fuzz help", []string{"v"})

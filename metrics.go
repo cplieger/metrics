@@ -35,17 +35,17 @@ var helpEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`)
 // (processFamilyNames) and the process-metric IR builder (processFamilies,
 // rendered by both encoders) reference a single source and cannot drift.
 const (
-	pmGoroutines    = "process_goroutines"
-	pmHeapBytes     = "process_heap_bytes"
-	pmGCPause       = "process_gc_pause_seconds"
-	pmGCPauseTotal  = "process_gc_pause_seconds_total"
-	pmUptime        = "process_uptime_seconds"
-	pmStartTime     = "process_start_time_seconds"
-	pmCPU           = "process_cpu_seconds"
-	pmCPUTotal      = "process_cpu_seconds_total"
-	pmResidentBytes = "process_resident_memory_bytes"
-	pmOpenFDs       = "process_open_fds"
-	pmMaxFDs        = "process_max_fds"
+	pmGoroutines     = "go_goroutines"
+	pmHeapAllocBytes = "go_memstats_heap_alloc_bytes"
+	pmGCPause        = "process_gc_pause_seconds"
+	pmGCPauseTotal   = "process_gc_pause_seconds_total"
+	pmUptime         = "process_uptime_seconds"
+	pmStartTime      = "process_start_time_seconds"
+	pmCPU            = "process_cpu_seconds"
+	pmCPUTotal       = "process_cpu_seconds_total"
+	pmResidentBytes  = "process_resident_memory_bytes"
+	pmOpenFDs        = "process_open_fds"
+	pmMaxFDs         = "process_max_fds"
 )
 
 // processFamilyNames are the family names processFamilies emits
@@ -55,7 +55,7 @@ const (
 // counters, because a user counter normalizes to the base while a user gauge/histogram reserves
 // its name verbatim.
 var processFamilyNames = []string{
-	pmGoroutines, pmHeapBytes,
+	pmGoroutines, pmHeapAllocBytes,
 	pmGCPause, pmGCPauseTotal,
 	pmUptime, pmStartTime,
 	pmCPU, pmCPUTotal,
@@ -65,8 +65,8 @@ var processFamilyNames = []string{
 // Process metric HELP text, single-sourced so the Prometheus and OpenMetrics
 // writers cannot expose divergent descriptions for the same family.
 const (
-	helpGoroutines = "Number of goroutines"
-	helpHeapBytes  = "Heap memory in use"
+	helpGoroutines = "Number of goroutines that currently exist."
+	helpHeapAlloc  = "Number of heap bytes allocated and currently in use."
 	helpGCPause    = "Total GC pause time"
 	helpUptime     = "Process uptime"
 	helpStartTime  = "Start time of the process since unix epoch in seconds"
@@ -253,7 +253,7 @@ func formatValue(v float64) string {
 	case math.IsNaN(v):
 		return "NaN"
 	}
-	if v == float64(int64(v)) && v >= -1e15 && v <= 1e15 {
+	if v >= -1e15 && v <= 1e15 && v == float64(int64(v)) {
 		return strconv.FormatInt(int64(v), 10)
 	}
 	return strconv.FormatFloat(v, 'g', -1, 64)

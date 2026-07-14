@@ -39,12 +39,12 @@ api_latency_seconds_bucket{endpoint="list",le="1"} 2
 api_latency_seconds_bucket{endpoint="list",le="+Inf"} 2
 api_latency_seconds_sum{endpoint="list"} 0.6
 api_latency_seconds_count{endpoint="list"} 2
-# HELP process_goroutines Number of goroutines
-# TYPE process_goroutines gauge
-process_goroutines <value>
-# HELP process_heap_bytes Heap memory in use
-# TYPE process_heap_bytes gauge
-process_heap_bytes <value>
+# HELP go_goroutines Number of goroutines that currently exist.
+# TYPE go_goroutines gauge
+go_goroutines <value>
+# HELP go_memstats_heap_alloc_bytes Number of heap bytes allocated and currently in use.
+# TYPE go_memstats_heap_alloc_bytes gauge
+go_memstats_heap_alloc_bytes <value>
 # HELP process_gc_pause_seconds_total Total GC pause time
 # TYPE process_gc_pause_seconds_total counter
 process_gc_pause_seconds_total <value>

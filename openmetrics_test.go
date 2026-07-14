@@ -245,8 +245,8 @@ func TestOpenMetricsHandler_ProcessMetrics(t *testing.T) {
 
 	body := rec.Body.String()
 	for _, want := range []string{
-		"# TYPE process_goroutines gauge",
-		"# TYPE process_heap_bytes gauge",
+		"# TYPE go_goroutines gauge",
+		"# TYPE go_memstats_heap_alloc_bytes gauge",
 		"# TYPE process_gc_pause_seconds counter",
 		"# TYPE process_uptime_seconds gauge",
 		"# TYPE process_start_time_seconds gauge",
@@ -398,8 +398,13 @@ func BenchmarkOpenMetricsHandler(b *testing.B) {
 	}
 }
 
+// TestOpenMetricsHistogram_IntegerBucketBound_CanonicalLE pins the per-format le
+// rendering: the OpenMetrics Canonical Numbers rule appends ".0" to a whole
+// bound (le="1.0", le="2.0") while Prometheus text keeps the bare integer
+// (le="1"). Fractional bounds (0.5) and the implicit +Inf bucket are identical
+// across both formats.
 func TestOpenMetricsHistogram_IntegerBucketBound_CanonicalLE(t *testing.T) {
-	t.Run("unlabeled", func(t *testing.T) {
+	t.Run("openmetrics unlabeled", func(t *testing.T) {
 		r := NewRegistry("")
 		h := NewHistogram("om_le_seconds", "latency", WithBuckets([]float64{0.5, 1, 2}))
 		r.RegisterHistogram(h)
@@ -409,18 +414,21 @@ func TestOpenMetricsHistogram_IntegerBucketBound_CanonicalLE(t *testing.T) {
 		r.OpenMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 		body := rec.Body.String()
 
-		if !strings.Contains(body, `om_le_seconds_bucket{le="1"} 1`) {
-			t.Errorf("integer bound must render as le=\"1\" in OpenMetrics:\n%s", body)
+		if !strings.Contains(body, `om_le_seconds_bucket{le="1.0"} 1`) {
+			t.Errorf("integer bound must render as le=\"1.0\" in OpenMetrics:\n%s", body)
 		}
-		if !strings.Contains(body, `om_le_seconds_bucket{le="2"} 1`) {
-			t.Errorf("integer bound must render as le=\"2\" in OpenMetrics:\n%s", body)
+		if !strings.Contains(body, `om_le_seconds_bucket{le="2.0"} 1`) {
+			t.Errorf("integer bound must render as le=\"2.0\" in OpenMetrics:\n%s", body)
 		}
 		if !strings.Contains(body, `om_le_seconds_bucket{le="0.5"} 1`) {
 			t.Errorf("fractional bound must render as le=\"0.5\":\n%s", body)
 		}
+		if !strings.Contains(body, `om_le_seconds_bucket{le="+Inf"} 1`) {
+			t.Errorf("+Inf bucket must render as le=\"+Inf\":\n%s", body)
+		}
 	})
 
-	t.Run("labeled", func(t *testing.T) {
+	t.Run("openmetrics labeled", func(t *testing.T) {
 		r := NewRegistry("")
 		lh := NewLabeledHistogram("om_le_lbl_seconds", "latency", []string{"op"}, WithBuckets([]float64{0.5, 1}))
 		r.RegisterLabeledHistogram(lh)
@@ -430,8 +438,32 @@ func TestOpenMetricsHistogram_IntegerBucketBound_CanonicalLE(t *testing.T) {
 		r.OpenMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 		body := rec.Body.String()
 
-		if !strings.Contains(body, `om_le_lbl_seconds_bucket{op="read",le="1"} 1`) {
-			t.Errorf("labeled integer bound must render as le=\"1\":\n%s", body)
+		if !strings.Contains(body, `om_le_lbl_seconds_bucket{op="read",le="1.0"} 1`) {
+			t.Errorf("labeled integer bound must render as le=\"1.0\":\n%s", body)
+		}
+	})
+
+	t.Run("prometheus keeps bare integer le", func(t *testing.T) {
+		r := NewRegistry("")
+		h := NewHistogram("prom_le_seconds", "latency", WithBuckets([]float64{0.5, 1, 2}))
+		r.RegisterHistogram(h)
+		h.Observe(0.1)
+
+		rec := httptest.NewRecorder()
+		r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		body := rec.Body.String()
+
+		if !strings.Contains(body, `prom_le_seconds_bucket{le="1"} 1`) {
+			t.Errorf("Prometheus text must keep bare integer le=\"1\":\n%s", body)
+		}
+		if !strings.Contains(body, `prom_le_seconds_bucket{le="2"} 1`) {
+			t.Errorf("Prometheus text must keep bare integer le=\"2\":\n%s", body)
+		}
+		if strings.Contains(body, `prom_le_seconds_bucket{le="1.0"}`) {
+			t.Errorf("Prometheus text must NOT canonicalize le to \"1.0\":\n%s", body)
+		}
+		if !strings.Contains(body, `prom_le_seconds_bucket{le="0.5"} 1`) {
+			t.Errorf("fractional bound must render as le=\"0.5\":\n%s", body)
 		}
 	})
 }

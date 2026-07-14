@@ -65,7 +65,7 @@ type LabeledGauge struct {
 // NewLabeledGauge creates a labeled gauge.
 func NewLabeledGauge(name, help string, labels []string) *LabeledGauge {
 	validateMetricName(name)
-	validateLabelNames(labels)
+	labels = validateLabelNames(labels)
 	if len(labels) > 4 {
 		panic("metrics: LabeledGauge supports at most 4 labels")
 	}

@@ -52,6 +52,20 @@ func validateBuckets(bounds []float64) {
 	}
 }
 
+// resolveBuckets applies the histogram options over DefaultBuckets, validates the
+// resulting bounds, and returns an owned clone. Shared by NewHistogram and
+// NewLabeledHistogram so the default-seed and nil-option-skip invariant is single-sourced.
+func resolveBuckets(opts []Option) []float64 {
+	cfg := histogramCfg{buckets: DefaultBuckets}
+	for _, o := range opts {
+		if o != nil {
+			o(&cfg)
+		}
+	}
+	validateBuckets(cfg.buckets)
+	return slices.Clone(cfg.buckets)
+}
+
 // Histogram tracks a distribution using cumulative buckets and atomic CAS for sum.
 type Histogram struct {
 	name       string
@@ -72,15 +86,8 @@ type Histogram struct {
 // NewHistogram creates a histogram with the given name and help text.
 // By default it uses DefaultBuckets; use WithBuckets to override.
 func NewHistogram(name, help string, opts ...Option) *Histogram {
-	cfg := histogramCfg{buckets: DefaultBuckets}
-	for _, o := range opts {
-		if o != nil {
-			o(&cfg)
-		}
-	}
 	validateMetricName(name)
-	validateBuckets(cfg.buckets)
-	bounds := slices.Clone(cfg.buckets)
+	bounds := resolveBuckets(opts)
 	h := &Histogram{
 		name:    name,
 		help:    help,
@@ -146,19 +153,17 @@ type LabeledHistogram struct {
 // NewLabeledHistogram creates a labeled histogram with the given name, help, and label names.
 // By default it uses DefaultBuckets; use WithBuckets to override.
 func NewLabeledHistogram(name, help string, labels []string, opts ...Option) *LabeledHistogram {
-	cfg := histogramCfg{buckets: DefaultBuckets}
-	for _, o := range opts {
-		if o != nil {
-			o(&cfg)
+	validateMetricName(name)
+	labels = validateLabelNames(labels)
+	for _, l := range labels {
+		if l == "le" {
+			panic(`metrics: LabeledHistogram label name "le" is reserved for the bucket bound`)
 		}
 	}
-	validateMetricName(name)
-	validateLabelNames(labels)
 	if len(labels) > 4 {
 		panic("metrics: LabeledHistogram supports at most 4 labels")
 	}
-	validateBuckets(cfg.buckets)
-	bounds := slices.Clone(cfg.buckets)
+	bounds := resolveBuckets(opts)
 	return &LabeledHistogram{
 		name:   name,
 		help:   help,

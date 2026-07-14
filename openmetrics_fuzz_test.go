@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // FuzzOpenMetricsLabelExposition asserts the OpenMetrics handler keeps labeled
@@ -16,6 +17,11 @@ func FuzzOpenMetricsLabelExposition(f *testing.F) {
 	f.Add("new\nline")
 	f.Add("\x00\xff")
 	f.Fuzz(func(t *testing.T, val string) {
+		// Invalid-UTF-8 label values are a documented fail-fast programmer error
+		// (validateLabelValues), out of domain for this escaping-structure target.
+		if !utf8.ValidString(val) {
+			t.Skip()
+		}
 		reg := NewRegistry("")
 		lc := NewLabeledCounter("om_fuzz_counter", "help", []string{"lbl"})
 		reg.RegisterLabeledCounter(lc)
