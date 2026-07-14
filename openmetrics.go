@@ -91,16 +91,12 @@ func mediaQuality(accept, mediaType string) (q float64, present bool) {
 	return q, present
 }
 
-// omCounterBaseName returns the base metric name for a counter, stripping _total if present.
+// omCounterBaseName returns the base metric name for a counter, stripping
+// _total if present. The result is always non-empty: the degenerate name
+// "_total" is rejected at construction (rejectTotalOnlyCounterName in
+// NewCounter/NewLabeledCounter), so it never reaches the encoder.
 func omCounterBaseName(name string) string {
-	base := strings.TrimSuffix(name, "_total")
-	if base == "" {
-		// A counter named exactly "_total" strips to an empty base, which would
-		// emit a malformed "# TYPE  counter" line with no metric name. Keep the
-		// full name so the family stays valid and non-empty.
-		return name
-	}
-	return base
+	return strings.TrimSuffix(name, "_total")
 }
 
 // omCounterSampleName returns the sample name for a counter, ensuring _total suffix.
@@ -109,23 +105,4 @@ func omCounterSampleName(name string) string {
 		return name
 	}
 	return name + "_total"
-}
-
-// writeOMSimpleCounter writes an unlabeled counter in OpenMetrics format. It is
-// a thin shim over the neutral IR and the OpenMetrics encoder, retained because
-// it is referenced by the test suite.
-func writeOMSimpleCounter(b *strings.Builder, c *Counter) {
-	appendOpenMetrics(b, []metricFamily{c.family()})
-}
-
-// writeOMGauge writes an unlabeled gauge in OpenMetrics format (IR shim).
-func writeOMGauge(b *strings.Builder, g *Gauge) {
-	appendOpenMetrics(b, []metricFamily{g.family()})
-}
-
-// writeOMLabeledGauge writes a labeled gauge in OpenMetrics format (IR shim).
-func writeOMLabeledGauge(b *strings.Builder, lg *LabeledGauge) {
-	if f, ok := lg.family(); ok {
-		appendOpenMetrics(b, []metricFamily{f})
-	}
 }

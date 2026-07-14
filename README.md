@@ -44,15 +44,18 @@ func main() {
 	r.RegisterLabeledCounter(reqs) // exposed as myapp_http_requests_total
 	r.RegisterHistogram(dur)       // exposed as myapp_http_request_duration_seconds
 
-	// One-shot HTTP instrumentation: caller owns the label set.
+	// HTTP instrumentation: call RecordHTTP from middleware once the
+	// response status is known. Caller owns the label set.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/widget", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	instrumented := metrics.InstrumentHandler(mux, reqs, dur,
-		func(rq *http.Request, status int) []string {
-			return []string{rq.Method, strconv.Itoa(status)}
-		})
+	instrumented := http.HandlerFunc(func(w http.ResponseWriter, rq *http.Request) {
+		start := time.Now()
+		status := http.StatusOK // in real code, capture via a status-recording writer
+		mux.ServeHTTP(w, rq)
+		metrics.RecordHTTP(reqs, dur, time.Since(start), rq.Method, strconv.Itoa(status))
+	})
 
 	// Or measure a code path with the labeled-histogram timer.
 	work := metrics.NewLabeledHistogram("op_seconds", "op", []string{"kind"})
@@ -80,6 +83,8 @@ func main() {
 - `NewCounter(name, help) *Counter` — monotonic counter; `Inc()`, `Add(n int64)`.
 - `NewLabeledCounter(name, help, labels) *LabeledCounter` — `Inc(vals...)`, `Add(int64, vals...)`, `Delete(vals...)`, `Reset()`; panics on label-arity mismatch.
 
+Counter names must not be exactly `_total` (rejected at construction; the OpenMetrics base name would be empty).
+
 ### Gauges
 
 - `NewGauge(name, help) *Gauge` — float64 gauge; `Set`, `Add`, `Sub`, `Inc`, `Dec`, `Get`.
@@ -97,13 +102,13 @@ func main() {
 - `(*LabeledHistogram).NewTimer(vals...) *Timer` — starts a timer for the given label set, so per-label latency can use `defer t.ObserveDuration()` ergonomics.
 - `(*Timer).ObserveDuration() time.Duration` — records elapsed time and returns it.
 
-### HTTP instrumentation (zero-dep `net/http`)
+### HTTP instrumentation
 
-- `StatusRecorder` / `NewStatusRecorder(w)` — wraps `http.ResponseWriter` to capture the response status; implements `Unwrap` so `http.ResponseController` reaches Flusher / Hijacker.
-- `RecordHTTP(c *LabeledCounter, h *Histogram, d time.Duration, labelVals ...string)` — record one request into the caller-supplied counter/histogram (either may be `nil`).
-- `InstrumentHandler(next, c, h, labelValues func(r, status) []string) http.Handler` — middleware wrapper. The caller owns the label set, ordering, and any path templating.
+- `RecordHTTP(c *LabeledCounter, h *Histogram, d time.Duration, labelVals ...string)` — record one request into the caller-supplied counter/histogram (either may be `nil`). The caller owns the label set, ordering, and any path templating.
 
-Label values are caller-owned and must be valid UTF-8: recording a label combination whose value is not valid UTF-8 panics at record time (Prometheus/OpenMetrics require valid UTF-8), not at construction. Values derived from untrusted input (raw request paths, header contents) must be templated or validated before use. Inside an http handler `net/http`'s per-request recover catches the panic and the process survives, but a metric update from a context without panic recovery (a background goroutine, not an http handler) will crash the process on such input.
+`RecordHTTP` is the metrics-side hook: pair it with middleware that captures the response status — [webhttp](https://github.com/cplieger/webhttp) (its `StatusRecorder` plus `Logging`'s `WithRecordMetric`), or any middleware of your own that knows the final status — and call `RecordHTTP` from there with caller-owned labels.
+
+Label values are caller-owned and should be valid UTF-8 (Prometheus/OpenMetrics require it). The library never panics on invalid UTF-8: a label value that is not valid UTF-8 is sanitized at record time with the Unicode replacement character (U+FFFD, `�`) and a warning naming the metric is logged when the sanitized series is first created (repeat records of an already-seen value do not re-warn). Two consequences of sanitizing: distinct raw values that sanitize to the same string merge into one series, and records carrying invalid UTF-8 always take the slower series-creation path — so template or validate values derived from untrusted input (raw request paths, header contents) before use. Label values from untrusted input are also a cardinality risk: every distinct label combination allocates a series that is retained until `Delete`/`Reset`, so labeling by raw request path or header content lets a client grow memory and scrape size without bound — template paths to a fixed route set before use.
 
 ### Registry
 
@@ -117,7 +122,7 @@ Label values are caller-owned and must be valid UTF-8: recording a label combina
 
 - `go_goroutines`, `go_memstats_heap_alloc_bytes`, `process_gc_pause_seconds_total`, `process_uptime_seconds`, `process_start_time_seconds` (the goroutine and heap-alloc names match `client_golang`).
 - Linux only: `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds`, `process_max_fds`.
-  - Caveat: `process_cpu_seconds_total` assumes `USER_HZ` (`sysconf(_SC_CLK_TCK)`) = 100, the near-universal Linux default; on a kernel built with a different `CONFIG_HZ` the value is scaled by a constant factor. Reading the real value would require cgo or `golang.org/x/sys`, which the zero-dependency contract excludes.
+  - Caveat: `process_cpu_seconds_total` assumes `USER_HZ` (`sysconf(_SC_CLK_TCK)`) = 100. `USER_HZ` is a fixed kernel ABI constant of 100 on all modern Linux architectures (independent of the kernel's internal `CONFIG_HZ`); only legacy ports (e.g. alpha/ia64) differ, where the value would be scaled by a constant factor. Reading the real value would require cgo or `golang.org/x/sys`, which the zero-dependency contract excludes.
 
 ### Low-level writers
 
@@ -125,9 +130,11 @@ Label values are caller-owned and must be valid UTF-8: recording a label combina
 
 ## Spec conformance
 
-Valid Prometheus text exposition format 0.0.4: label values escape only `\`, `"`, and `\n` (as `\\`, `\"`, `\n`); HELP text escapes `\` and `\n`; metric/label names are validated at creation (panic on invalid); label arity is enforced (panic on mismatch); label values must be valid UTF-8 (panic at record time on the first invalid value for a series); duplicate metric family names panic at registration (fail-fast, including the reserved `process_*` names); histogram bucket bounds are validated at creation (panic unless strictly increasing and finite); histograms always include a `+Inf` bucket equal to `_count`.
+Valid Prometheus text exposition format 0.0.4: label values escape only `\`, `"`, and `\n` (as `\\`, `\"`, `\n`); HELP text escapes `\` and `\n`; metric/label names are validated at creation (panic on invalid); label arity is enforced (panic on mismatch); label values are always exposed as valid UTF-8 (invalid input is sanitized with U+FFFD and warned when the degraded series is first created); HELP text is also exposed as valid UTF-8 (invalid input is sanitized with U+FFFD and warned at construction); neither path panics; duplicate metric family names panic at registration (fail-fast, including the reserved `process_*` names); histogram bucket bounds are validated at creation (panic unless strictly increasing and finite); histograms always include a `+Inf` bucket equal to `_count`.
 
 OpenMetrics 1.0.0 support: content-type `application/openmetrics-text; version=1.0.0; charset=utf-8`, mandatory trailing `# EOF`, TYPE before HELP, counter samples use the `_total` suffix. Numeric values render through a single canonical formatter shared by both formats, so a given value is exposed identically: whole values as bare integers (e.g. `42`), other values in shortest round-trippable form, and `+Inf`/`-Inf`/`NaN` for non-finite. Use `NegotiateHandler()` for content negotiation, `OpenMetricsHandler()` for direct OpenMetrics output.
+
+Histograms constructed with negative bucket bounds omit their `_sum` and `_count` samples from OpenMetrics exposition, per the spec's negative-threshold rule ("Negative threshold buckets MAY be used, but then the Histogram MetricPoint MUST NOT contain a sum value", with `_count` emitted if and only if `_sum` is). The observation count remains available as the `le="+Inf"` bucket value; Prometheus text format is unaffected and exposes both samples. Declare negative bounds if you observe negative values — as with client_golang, observations outside your declared bucket range remain the caller's conformance responsibility.
 
 ## Unsupported by design (SKIP list)
 

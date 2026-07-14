@@ -38,20 +38,27 @@ not, and they are easy to break:
   Exposition output is byte-locked by golden fixtures (`testdata/*.golden`,
   `golden_test.go`); regenerate them with `UPDATE_GOLDEN=1 go test` only after a
   deliberate, reviewed format change. The exported `Write*` functions
-  (`counter.go`, `gauge.go`, `histogram.go`, `process.go`) and the
-  `writeOMSimpleCounter`/`writeOMGauge`/`writeOMLabeledGauge` helpers remain as
-  thin shims over the IR + encoders, preserved for the public API and the test
-  suite.
+  (`counter.go`, `gauge.go`, `histogram.go`, `process.go`) remain as thin shims
+  over the IR + encoders because they are public API; unexported test-only
+  wrappers are not kept — tests call the encoder
+  (`appendOpenMetrics`) directly.
 - **Label storage is a fixed-size key.** `labelKey` is `[4]string`, so a metric
   supports **at most 4 labels** — constructors panic past that. Label values
   are copied into the array and the rendered label string is always sorted by
   label name (`buildLabelString`) for deterministic output.
-- **Validation and arity are fail-fast panics, by design.** Metric/label names
-  are validated at construction (`validate.go`); `Inc`/`Observe`/`Set` panic on
-  label-arity mismatch; `Counter.Add` panics on a negative delta; registering
-  two metrics whose exposition family names collide panics (`reserveName`,
-  including the pre-seeded `process_*` family names). Tests assert these
-  panics — don't soften them to error returns.
+- **Name, arity, and bucket validation are fail-fast panics, by design.**
+  Metric/label names are validated at construction (`validate.go`);
+  `Inc`/`Observe`/`Set` panic on label-arity mismatch; `Counter.Add` panics on
+  a negative delta; registering two metrics whose exposition family names
+  collide panics (`reserveName`, including the pre-seeded `process_*` family
+  names); histogram bucket bounds panic unless strictly increasing and finite.
+  Tests assert these panics — don't soften them to error returns. Invalid
+  UTF-8 is deliberately NOT in that set: label values and help text are
+  sanitized with the Unicode replacement character (U+FFFD) by the shared
+  `sanitizeUTF8` engine (`validate.go`), with a one-time `slog` warning per
+  newly created sanitized series (label path) and per constructor (help
+  text); repeated records sanitizing onto an existing series do not
+  re-warn. The library never panics on invalid UTF-8.
 - **Spec-exact escaping is non-negotiable.** `labelEscaper` escapes only `\`,
   `"`, and `\n`; `helpEscaper` escapes only `\` and `\n`. The fuzz and red-team
   tests pin this exactly — widening or narrowing the set will fail them.
@@ -84,19 +91,23 @@ go vet ./...
 ```
 
 Tests live beside the code they cover (standard Go layout), including
-conformance tests (`openmetrics_test.go`), executable README examples
-(`example_readme_test.go`), and adversarial suites (`redteam*_test.go`,
-`fuzz_completeness_test.go`). Run a fuzz target directly when touching parsing,
+conformance tests (`openmetrics_test.go`), golden-file exposition locks
+(`golden_test.go` + `testdata/*.golden`), and an executable README example
+(`example_test.go`). Run a fuzz target directly when touching parsing,
 validation, or escaping:
 
 ```sh
-go test -run '^$' -fuzz FuzzLabelValueExposition -fuzztime 30s
+go test -run '^$' -fuzz FuzzLabeledExposition_balanced -fuzztime 30s
 ```
 
 Available fuzz targets include `FuzzMetricNameValidation`,
-`FuzzLabelNameValidation`, `FuzzHelpTextExposition`,
-`FuzzLabelValueExposition`, `FuzzOpenMetricsLabelExposition`,
-`FuzzRegistryFullExposition`, and `FuzzHistogramObserve`.
+`FuzzLabelNameValidation`, `FuzzLabelValueValidation`,
+`FuzzPrometheusHelpExposition`, `FuzzOpenMetricsHelpExposition`,
+`FuzzOpenMetricsLabelExposition`, `FuzzLabeledExposition_balanced`,
+`FuzzRegistryFullExposition`, `FuzzHistogramObserve`,
+`FuzzHistogram_BucketPlacementInvariant`, `FuzzFormatValueRoundTrip`,
+`FuzzAcceptsOpenMetrics`, and the `/proc` parser targets in
+`process_fuzz_test.go`.
 
 ## Linting and formatting
 

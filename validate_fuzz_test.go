@@ -46,9 +46,10 @@ func FuzzLabelNameValidation(f *testing.F) {
 	})
 }
 
-// FuzzLabelValueValidation asserts the series-creation label-value guard fires
-// exactly on invalid-UTF-8 values: creating a labeled series must panic iff the
-// value is not valid UTF-8, and never for a well-formed value.
+// FuzzLabelValueValidation asserts the record-time label-value UTF-8 policy:
+// recording never panics (for correct arity), the stored label value is always
+// valid UTF-8 (invalid input is sanitized with U+FFFD), and a valid value
+// round-trips into the stored series key unchanged.
 func FuzzLabelValueValidation(f *testing.F) {
 	f.Add("plain")
 	f.Add("héllo")
@@ -56,18 +57,26 @@ func FuzzLabelValueValidation(f *testing.F) {
 	f.Add("\xff\xfe")
 	f.Add("\xc3\x28")
 	f.Fuzz(func(t *testing.T, s string) {
-		wantPanic := !utf8.ValidString(s)
+		lc := NewLabeledCounter("fuzz_val_total", "test", []string{"m"})
 		func() {
 			defer func() {
-				r := recover()
-				if wantPanic && r == nil {
-					t.Errorf("expected panic for invalid-UTF-8 value %q, got none", s)
-				}
-				if !wantPanic && r != nil {
-					t.Errorf("unexpected panic for valid value %q: %v", s, r)
+				if r := recover(); r != nil {
+					t.Errorf("unexpected panic recording value %q: %v", s, r)
 				}
 			}()
-			NewLabeledCounter("fuzz_val_total", "test", []string{"m"}).Inc(s)
+			lc.Inc(s)
 		}()
+		if got := len(lc.vals); got != 1 {
+			t.Fatalf("series count = %d, want 1 for value %q", got, s)
+		}
+		for key := range lc.vals {
+			stored := key[0]
+			if !utf8.ValidString(stored) {
+				t.Errorf("stored label value %q is not valid UTF-8 (input %q)", stored, s)
+			}
+			if utf8.ValidString(s) && stored != s {
+				t.Errorf("valid input %q stored as %q, want unchanged round-trip", s, stored)
+			}
+		}
 	})
 }

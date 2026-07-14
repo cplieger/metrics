@@ -187,7 +187,7 @@ func TestGauge_specialValues(t *testing.T) {
 			}
 
 			b.Reset()
-			writeOMGauge(&b, g)
+			appendOpenMetrics(&b, []metricFamily{g.family()})
 			omOut := b.String()
 			if !strings.Contains(omOut, "rt6_special_"+tt.name+" "+tt.om) {
 				t.Errorf("OpenMetrics: expected %q in:\n%s", tt.om, omOut)
@@ -360,7 +360,7 @@ func TestGauge_reservedSuffixNamesRenderVerbatim(t *testing.T) {
 		t.Errorf("gauge named _total mangled (Prometheus):\n%s", out)
 	}
 	b.Reset()
-	writeOMGauge(&b, gt)
+	appendOpenMetrics(&b, []metricFamily{gt.family()})
 	// The OM _total stripping is gated on the counter type; a gauge keeps its
 	// name verbatim in the TYPE line and the sample.
 	if out := b.String(); !strings.Contains(out, "# TYPE weird_total gauge") || !strings.Contains(out, "weird_total 7") {

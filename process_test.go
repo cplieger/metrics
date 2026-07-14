@@ -196,7 +196,7 @@ func TestParseProcStatusRSS(t *testing.T) {
 	}
 }
 
-func TestProcMetricsDegraded(t *testing.T) {
+func TestProcOKMask(t *testing.T) {
 	tests := []struct {
 		name       string
 		goos       string
@@ -204,30 +204,31 @@ func TestProcMetricsDegraded(t *testing.T) {
 		rss        int64
 		openFDs    int
 		maxFDs     int64
-		want       bool
+		want       uint32
 	}{
-		{"linux all healthy", "linux", 1.5, 4096, 12, 1024, false},
-		{"linux cpu read failed", "linux", -1, 4096, 12, 1024, true},
+		{"linux all healthy", "linux", 1.5, 4096, 12, 1024, procOKAll},
+		{"linux cpu read failed", "linux", -1, 4096, 12, 1024, procOKAll &^ procOKCPU},
 		// cpuSeconds == 0 and openFDs == 0 are HEALTHY readings: the failure
 		// guards are strict (< 0), so a <= 0 mutation would wrongly degrade them.
-		{"linux cpu zero healthy", "linux", 0, 4096, 12, 1024, false},
-		{"linux rss zero", "linux", 1.5, 0, 12, 1024, true},
-		{"linux rss negative", "linux", 1.5, -1, 12, 1024, true},
-		{"linux fds read failed", "linux", 1.5, 4096, -1, 1024, true},
-		{"linux fds zero healthy", "linux", 1.5, 4096, 0, 1024, false},
+		{"linux cpu zero healthy", "linux", 0, 4096, 12, 1024, procOKAll},
+		{"linux rss zero", "linux", 1.5, 0, 12, 1024, procOKAll &^ procOKRSS},
+		{"linux rss negative", "linux", 1.5, -1, 12, 1024, procOKAll &^ procOKRSS},
+		{"linux fds read failed", "linux", 1.5, 4096, -1, 1024, procOKAll &^ procOKOpenFDs},
+		{"linux fds zero healthy", "linux", 1.5, 4096, 0, 1024, procOKAll},
 		// maxFDs: the unlimited sentinel is a successful reading (not degraded);
 		// a non-positive maxFDs that is NOT the sentinel is a failed limits read.
-		{"linux max fds unlimited healthy", "linux", 1.5, 4096, 12, unlimitedMaxFDs, false},
-		{"linux max fds read failed", "linux", 1.5, 4096, 12, 0, true},
-		{"linux all failed", "linux", -1, 0, -1, 0, true},
-		{"non-linux all failed stays quiet", "darwin", -1, 0, -1, 0, false},
-		{"non-linux healthy", "windows", 1.5, 4096, 12, 1024, false},
+		{"linux max fds unlimited healthy", "linux", 1.5, 4096, 12, unlimitedMaxFDs, procOKAll},
+		{"linux max fds read failed", "linux", 1.5, 4096, 12, 0, procOKAll &^ procOKMaxFDs},
+		{"linux all failed", "linux", -1, 0, -1, 0, 0},
+		{"non-linux all failed stays quiet", "darwin", -1, 0, -1, 0, procOKAll},
+		{"non-linux healthy", "windows", 1.5, 4096, 12, 1024, procOKAll},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := procMetricsDegraded(tc.goos, tc.cpuSeconds, tc.rss, tc.openFDs, tc.maxFDs)
+			d := &processMetricsData{cpuSeconds: tc.cpuSeconds, rss: tc.rss, openFDs: tc.openFDs, maxFDs: tc.maxFDs}
+			got := procOKMask(tc.goos, d)
 			if got != tc.want {
-				t.Errorf("procMetricsDegraded(%q, %v, %d, %d, %d) = %v, want %v",
+				t.Errorf("procOKMask(%q, {cpu:%v rss:%d fds:%d max:%d}) = %#05b, want %#05b",
 					tc.goos, tc.cpuSeconds, tc.rss, tc.openFDs, tc.maxFDs, got, tc.want)
 			}
 		})
@@ -254,28 +255,31 @@ func TestOpenFDCount(t *testing.T) {
 }
 
 func TestProcDegradedTransition(t *testing.T) {
+	cpuFailed := procOKAll &^ procOKCPU
+	cpuRSSFailed := procOKAll &^ (procOKCPU | procOKRSS)
 	tests := []struct {
-		name     string
-		initial  bool
-		degraded bool
-		want     bool
-		wantNext bool
+		name    string
+		initial uint32
+		mask    uint32
+		want    bool
 	}{
-		{"healthy->healthy (no edge)", false, false, false, false},
-		{"healthy->degraded (edge)", false, true, true, true},
-		{"degraded->degraded (no edge)", true, true, false, true},
-		{"degraded->healthy (edge)", true, false, true, false},
+		{"all-ok -> all-ok (no change)", procOKAll, procOKAll, false},
+		{"all-ok -> cpu failed (degraded edge)", procOKAll, cpuFailed, true},
+		{"cpu failed -> cpu failed (no change)", cpuFailed, cpuFailed, false},
+		{"cpu failed -> cpu+rss failed (failure-set widening)", cpuFailed, cpuRSSFailed, true},
+		{"cpu+rss failed -> rss failed (partial recovery)", cpuRSSFailed, procOKAll &^ procOKRSS, true},
+		{"cpu failed -> all-ok (recovered edge)", cpuFailed, procOKAll, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var s atomic.Bool
+			var s atomic.Uint32
 			s.Store(tt.initial)
-			if got := procDegradedTransition(&s, tt.degraded); got != tt.want {
-				t.Errorf("procDegradedTransition(%v, %v) = %v, want %v",
-					tt.initial, tt.degraded, got, tt.want)
+			if got := procDegradedTransition(&s, tt.mask); got != tt.want {
+				t.Errorf("procDegradedTransition(%#05b, %#05b) = %v, want %v",
+					tt.initial, tt.mask, got, tt.want)
 			}
-			if got := s.Load(); got != tt.wantNext {
-				t.Errorf("state after transition = %v, want %v", got, tt.wantNext)
+			if got := s.Load(); got != tt.mask {
+				t.Errorf("state after transition = %#05b, want %#05b", got, tt.mask)
 			}
 		})
 	}
@@ -380,6 +384,9 @@ func TestParseProcLimitsMaxFDs(t *testing.T) {
 		{"unlimited mixed case", "Max open files Unlimited\n", unlimitedMaxFDs},
 		// A malformed (non-numeric, non-"unlimited") value is a failed read.
 		{"malformed value", "Max open files notanumber\n", 0},
+		// A malformed negative value is a failed read, never a collision with
+		// the unlimitedMaxFDs sentinel (-1).
+		{"negative malformed", "Max open files  -1  4096  files\n", 0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -543,5 +550,64 @@ func TestWriteProcessMetrics_LinuxFDsEmitted(t *testing.T) {
 	// ("1.8446744073709552e+19"), so parse it as a float rather than an int.
 	if n, err := strconv.ParseFloat(maxVal, 64); err != nil || n <= 0 {
 		t.Errorf("process_max_fds = %q, want a positive number", maxVal)
+	}
+}
+
+// TestCollectProcessMetrics_LogsRecoveryTransition pins the recovery half of
+// the one-log-per-transition contract end-to-end: a scrape whose ok-mask
+// returns to all-ok after a degraded scrape logs the Info recovery line
+// exactly once, and a subsequent healthy scrape stays silent. Serial: it
+// captures slog.Default and mutates the package-level procDegraded state.
+func TestCollectProcessMetrics_LogsRecoveryTransition(t *testing.T) {
+	// Settle the environment's real mask first; the test needs an all-ok
+	// environment so the injected degraded mask transitions back to healthy.
+	var d processMetricsData
+	collectProcessMetrics(&d)
+	if procDegraded.Load() != procOKAll {
+		t.Skip("process metric collection degraded in this environment")
+	}
+
+	buf := captureDebugLogs(t)
+	t.Cleanup(func() { procDegraded.Store(procOKAll) })
+	procDegraded.Store(procOKAll &^ procOKCPU) // simulate a prior degraded scrape
+
+	collectProcessMetrics(&d)
+
+	if logs := buf.String(); !strings.Contains(logs, "process metric collection recovered") {
+		t.Fatalf("logs after degraded->healthy scrape = %q, want the recovery Info line", logs)
+	}
+	if got := procDegraded.Load(); got != procOKAll {
+		t.Errorf("procDegraded after recovery = %#05b, want procOKAll", got)
+	}
+
+	// One log per transition: a second healthy scrape must not re-log.
+	collectProcessMetrics(&d)
+	if got := strings.Count(buf.String(), "process metric collection recovered"); got != 1 {
+		t.Errorf("recovery logged %d times across two healthy scrapes, want exactly 1", got)
+	}
+}
+
+// TestCollectProcessMetrics_StartTimeFallbackToPackageInit forces the memoized
+// kernel start time to its -1 failure sentinel and verifies collectProcessMetrics
+// falls back to the package-init anchor while preserving the documented
+// "start + uptime == now" reconciliation. Serial: it mutates the package-level
+// memoized procStartTimeVal.
+func TestCollectProcessMetrics_StartTimeFallbackToPackageInit(t *testing.T) {
+	resolvedProcStartTime() // ensure the sync.Once has fired before overriding
+	prev := procStartTimeVal
+	t.Cleanup(func() { procStartTimeVal = prev })
+	procStartTimeVal = -1
+
+	var d processMetricsData
+	collectProcessMetrics(&d)
+
+	want := float64(processStartTime.Unix())
+	if d.startTime != want {
+		t.Errorf("startTime = %v, want package-init fallback %v", d.startTime, want)
+	}
+	now := float64(time.Now().Unix())
+	if diff := now - (d.startTime + d.uptime); diff < -2 || diff > 2 {
+		t.Errorf("start(%v) + uptime(%v) = %v, want ~= now(%v); diff=%v",
+			d.startTime, d.uptime, d.startTime+d.uptime, now, diff)
 	}
 }

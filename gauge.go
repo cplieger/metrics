@@ -18,22 +18,27 @@ type Gauge struct {
 // NewGauge creates a named gauge.
 func NewGauge(name, help string) *Gauge {
 	validateMetricName(name)
+	help = sanitizeHelp(name, help)
 	return &Gauge{name: name, help: help}
 }
 
 // Set sets the gauge to an arbitrary float64 value.
 func (g *Gauge) Set(v float64) { g.bits.Store(math.Float64bits(v)) }
 
-// Add adds a float64 delta to the gauge.
-func (g *Gauge) Add(delta float64) {
+// addFloatBits atomically adds delta to the float64 stored as IEEE-754 bits
+// in u via a compare-and-swap loop -- the package's canonical lock-free float
+// accumulate, shared by Gauge.Add and Histogram.Observe's sum update.
+func addFloatBits(u *atomic.Uint64, delta float64) {
 	for {
-		old := g.bits.Load()
-		newV := math.Float64frombits(old) + delta
-		if g.bits.CompareAndSwap(old, math.Float64bits(newV)) {
+		old := u.Load()
+		if u.CompareAndSwap(old, math.Float64bits(math.Float64frombits(old)+delta)) {
 			return
 		}
 	}
 }
+
+// Add adds a float64 delta to the gauge.
+func (g *Gauge) Add(delta float64) { addFloatBits(&g.bits, delta) }
 
 // Sub subtracts a float64 delta from the gauge.
 func (g *Gauge) Sub(delta float64) { g.Add(-delta) }
@@ -65,6 +70,7 @@ type LabeledGauge struct {
 // NewLabeledGauge creates a labeled gauge.
 func NewLabeledGauge(name, help string, labels []string) *LabeledGauge {
 	validateMetricName(name)
+	help = sanitizeHelp(name, help)
 	labels = validateLabelNames(labels)
 	if len(labels) > 4 {
 		panic("metrics: LabeledGauge supports at most 4 labels")
@@ -80,7 +86,7 @@ func NewLabeledGauge(name, help string, labels []string) *LabeledGauge {
 // Set sets the gauge for the given label values.
 func (lg *LabeledGauge) Set(v float64, labelVals ...string) {
 	key := labelKeyFor(lg.labels, labelVals)
-	if ptr, loaded := loadOrStore(&lg.mu, lg.vals, key,
+	if ptr, loaded := loadOrStore(&lg.mu, lg.vals, &lg.name, key,
 		func() *atomic.Uint64 { u := &atomic.Uint64{}; u.Store(math.Float64bits(v)); return u }); loaded {
 		ptr.Store(math.Float64bits(v))
 	}
@@ -95,11 +101,11 @@ func (lg *LabeledGauge) Reset() {
 
 // Delete removes a single label combination from the gauge.
 // It panics if the number of label values does not match the label count.
+// Label values are sanitized to valid UTF-8 the same way recording sanitizes
+// them, so Delete called with the original raw values removes the series
+// recording created.
 func (lg *LabeledGauge) Delete(labelVals ...string) {
-	key := labelKeyFor(lg.labels, labelVals)
-	lg.mu.Lock()
-	delete(lg.vals, key)
-	lg.mu.Unlock()
+	deleteSeries(&lg.mu, lg.vals, lg.labels, labelVals)
 }
 
 // WriteLabeledGauge writes a labeled gauge in Prometheus text format (IR shim).

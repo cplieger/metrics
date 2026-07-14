@@ -17,8 +17,10 @@ func FuzzOpenMetricsLabelExposition(f *testing.F) {
 	f.Add("new\nline")
 	f.Add("\x00\xff")
 	f.Fuzz(func(t *testing.T, val string) {
-		// Invalid-UTF-8 label values are a documented fail-fast programmer error
-		// (validateLabelValues), out of domain for this escaping-structure target.
+		// Invalid-UTF-8 label values are rewritten to U+FFFD at record time
+		// (sanitizeUTF8 via sanitizeLabelKey); the sanitized result is a
+		// valid-UTF-8 value the fuzzer already reaches directly, so skipping
+		// these inputs loses no escaping-structure coverage.
 		if !utf8.ValidString(val) {
 			t.Skip()
 		}
@@ -45,7 +47,7 @@ func FuzzOpenMetricsHelpExposition(f *testing.F) {
 	f.Fuzz(func(t *testing.T, help string) {
 		c := &Counter{name: "om_help_counter", help: help}
 		var b strings.Builder
-		writeOMSimpleCounter(&b, c)
+		appendOpenMetrics(&b, []metricFamily{c.family()})
 		for line := range strings.SplitSeq(b.String(), "\n") {
 			content, ok := strings.CutPrefix(line, "# HELP om_help_counter ")
 			if !ok {
