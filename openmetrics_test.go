@@ -468,14 +468,14 @@ func TestOpenMetricsHistogram_IntegerBucketBound_CanonicalLE(t *testing.T) {
 	})
 }
 
-func TestOMCounterBaseName_TotalOnlyNameStaysNonEmpty(t *testing.T) {
-	// A counter named exactly "_total" must not strip to an empty base, which
-	// would emit a malformed "# TYPE  counter" line with no metric name.
+func TestOMCounterBaseName_StripsTotalSuffix(t *testing.T) {
+	// The degenerate name "_total" never reaches this function: construction
+	// rejects it (see TestNewCounter_TotalOnlyNameRejected in counter_test.go),
+	// so a plain suffix strip always yields a non-empty base.
 	tests := []struct {
 		in   string
 		want string
 	}{
-		{"_total", "_total"},
 		{"foo_total", "foo"},
 		{"foo", "foo"},
 		{"requests_total", "requests"},
@@ -618,5 +618,161 @@ func TestMediaQuality_duplicateTypeKeepsLargestQ(t *testing.T) {
 		"application/openmetrics-text")
 	if !present || q != 0.8 {
 		t.Errorf("mediaQuality(duplicate type) = (%v, %v), want (0.8, true)", q, present)
+	}
+}
+
+// TestHandlers_VaryAndNosniffHeaders pins the handler header contract: both
+// exposition handlers set X-Content-Type-Options: nosniff, and NegotiateHandler
+// sets Vary: Accept on both negotiation outcomes.
+func TestHandlers_VaryAndNosniffHeaders(t *testing.T) {
+	r := NewRegistry("")
+	r.RegisterCounter(NewCounter("hdr_total", "h"))
+
+	prom := httptest.NewRecorder()
+	r.Handler().ServeHTTP(prom, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if got := prom.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("Handler X-Content-Type-Options = %q, want \"nosniff\"", got)
+	}
+
+	om := httptest.NewRecorder()
+	r.OpenMetricsHandler().ServeHTTP(om, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if got := om.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("OpenMetricsHandler X-Content-Type-Options = %q, want \"nosniff\"", got)
+	}
+
+	neg := r.NegotiateHandler()
+	for _, accept := range []string{"", "application/openmetrics-text"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
+		neg.ServeHTTP(rec, req)
+		if got := rec.Header().Get("Vary"); got != "Accept" {
+			t.Errorf("NegotiateHandler(Accept=%q) Vary = %q, want \"Accept\"", accept, got)
+		}
+	}
+}
+
+// TestOpenMetricsHandler_NegativeBuckets_omitsSumCount pins the OpenMetrics 1.0
+// negative-threshold rule: a histogram constructed with any negative bucket
+// bound MUST NOT expose a _sum sample, and _count is emitted if and only if
+// _sum is — so both are omitted from OpenMetrics output only. The bucket
+// samples (including +Inf, which still carries the count) remain, and the
+// Prometheus text format for the same registry is unaffected.
+func TestOpenMetricsHandler_NegativeBuckets_omitsSumCount(t *testing.T) {
+	r := NewRegistry("")
+	h := NewHistogram("neg_bound_hist", "test", WithBuckets([]float64{-5, 0, 5}))
+	r.RegisterHistogram(h)
+	h.Observe(-3)
+	h.Observe(1)
+	h.Observe(7)
+
+	rec := httptest.NewRecorder()
+	r.OpenMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	om := rec.Body.String()
+
+	for _, want := range []string{
+		"# TYPE neg_bound_hist histogram",
+		`neg_bound_hist_bucket{le="-5.0"} 0`,
+		`neg_bound_hist_bucket{le="0.0"} 1`,
+		`neg_bound_hist_bucket{le="5.0"} 2`,
+		`neg_bound_hist_bucket{le="+Inf"} 3`,
+	} {
+		if !strings.Contains(om, want) {
+			t.Errorf("OpenMetrics output missing %q:\n%s", want, om)
+		}
+	}
+	if strings.Contains(om, "neg_bound_hist_sum") {
+		t.Errorf("OpenMetrics output must omit _sum for negative bucket bounds:\n%s", om)
+	}
+	if strings.Contains(om, "neg_bound_hist_count") {
+		t.Errorf("OpenMetrics output must omit _count for negative bucket bounds:\n%s", om)
+	}
+
+	// Prometheus text format 0.0.4 has no negative-threshold rule: the same
+	// registry exposes _sum and _count unchanged.
+	rec = httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	prom := rec.Body.String()
+
+	for _, want := range []string{
+		`neg_bound_hist_bucket{le="+Inf"} 3`,
+		"neg_bound_hist_sum 5",
+		"neg_bound_hist_count 3",
+	} {
+		if !strings.Contains(prom, want) {
+			t.Errorf("Prometheus output missing %q:\n%s", want, prom)
+		}
+	}
+}
+
+// TestOpenMetricsHandler_LabeledNegativeBuckets_omitsSumCount covers the
+// labeled variant of the negative-threshold rule: every label combination of a
+// LabeledHistogram with negative bounds omits _sum/_count in OpenMetrics while
+// Prometheus output keeps both.
+func TestOpenMetricsHandler_LabeledNegativeBuckets_omitsSumCount(t *testing.T) {
+	r := NewRegistry("")
+	lh := NewLabeledHistogram("neg_bound_lhist", "test", []string{"op"}, WithBuckets([]float64{-1, 1}))
+	r.RegisterLabeledHistogram(lh)
+	lh.Observe(-0.5, "read")
+	lh.Observe(2, "read")
+
+	rec := httptest.NewRecorder()
+	r.OpenMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	om := rec.Body.String()
+
+	for _, want := range []string{
+		`neg_bound_lhist_bucket{op="read",le="-1.0"} 0`,
+		`neg_bound_lhist_bucket{op="read",le="1.0"} 1`,
+		`neg_bound_lhist_bucket{op="read",le="+Inf"} 2`,
+	} {
+		if !strings.Contains(om, want) {
+			t.Errorf("OpenMetrics output missing %q:\n%s", want, om)
+		}
+	}
+	if strings.Contains(om, "neg_bound_lhist_sum") {
+		t.Errorf("OpenMetrics output must omit labeled _sum for negative bucket bounds:\n%s", om)
+	}
+	if strings.Contains(om, "neg_bound_lhist_count") {
+		t.Errorf("OpenMetrics output must omit labeled _count for negative bucket bounds:\n%s", om)
+	}
+
+	rec = httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	prom := rec.Body.String()
+
+	for _, want := range []string{
+		`neg_bound_lhist_sum{op="read"} 1.5`,
+		`neg_bound_lhist_count{op="read"} 2`,
+	} {
+		if !strings.Contains(prom, want) {
+			t.Errorf("Prometheus output missing %q:\n%s", want, prom)
+		}
+	}
+}
+
+// TestOpenMetricsHandler_ZeroFirstBound_keepsSumCount pins the boundary of
+// the OpenMetrics negative-threshold rule: a first bucket bound of exactly 0
+// is NOT negative, so _sum and _count MUST still be emitted in OpenMetrics
+// output. Guards hasNegativeBounds' strict "< 0" comparison against an
+// off-by-one (<= 0) that would silently drop both series for zero-based
+// histograms.
+func TestOpenMetricsHandler_ZeroFirstBound_keepsSumCount(t *testing.T) {
+	r := NewRegistry("")
+	h := NewHistogram("zero_bound_hist", "test", WithBuckets([]float64{0, 5}))
+	r.RegisterHistogram(h)
+	h.Observe(0)
+	h.Observe(3)
+
+	rec := httptest.NewRecorder()
+	r.OpenMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	om := rec.Body.String()
+
+	if !strings.Contains(om, "zero_bound_hist_sum 3") {
+		t.Errorf("OpenMetrics output must keep _sum for a zero (non-negative) first bound:\n%s", om)
+	}
+	if !strings.Contains(om, "zero_bound_hist_count 2") {
+		t.Errorf("OpenMetrics output must keep _count for a zero (non-negative) first bound:\n%s", om)
 	}
 }

@@ -25,6 +25,22 @@ func TestCounterAdd(t *testing.T) {
 	}
 }
 
+func TestNewCounter_TotalOnlyNameRejected(t *testing.T) {
+	// A counter named exactly "_total" has an empty base name, so its
+	// OpenMetrics encoding cannot be conformant (the sample name would equal
+	// the family name). Construction rejects it fail-fast.
+	mustPanicContaining(t, "empty base name", func() { NewCounter("_total", "h") })
+	mustPanicContaining(t, "empty base name", func() { NewLabeledCounter("_total", "h", []string{"k"}) })
+	// The guard is scoped to the exact name "_total": a normally suffixed
+	// counter still constructs fine.
+	if c := NewCounter("requests_total", "h"); c == nil {
+		t.Fatal("NewCounter(\"requests_total\") returned nil")
+	}
+	if lc := NewLabeledCounter("api_requests_total", "h", []string{"k"}); lc == nil {
+		t.Fatal("NewLabeledCounter(\"api_requests_total\") returned nil")
+	}
+}
+
 func TestCounterAddNegativePanics(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
@@ -378,6 +394,35 @@ func TestCounter_Inc_Concurrent(t *testing.T) {
 	}
 }
 
+// TestLabeledMetricCardinalityWarning pins the one-time cardinality-threshold
+// warning in loadOrStore: it fires exactly once when the series count reaches
+// cardinalityWarnThreshold and names the metric and series count. Serial: it
+// captures slog.Default().
+func TestLabeledMetricCardinalityWarning(t *testing.T) {
+	buf := captureDebugLogs(t)
+	lc := NewLabeledCounter("cardinality_warn_total", "test", []string{"path"})
+
+	for i := range cardinalityWarnThreshold {
+		lc.Inc(string(rune('A' + i)))
+	}
+
+	logs := buf.String()
+	if !strings.Contains(logs, "possible label-cardinality explosion") {
+		t.Fatalf("cardinality warning log = %q, want threshold warning", logs)
+	}
+	if !strings.Contains(logs, "metric=cardinality_warn_total") {
+		t.Errorf("cardinality warning log = %q, want metric name", logs)
+	}
+	if !strings.Contains(logs, "series=1000") {
+		t.Errorf("cardinality warning log = %q, want series=1000", logs)
+	}
+
+	lc.Inc("beyond-threshold")
+	if got := strings.Count(buf.String(), "possible label-cardinality explosion"); got != 1 {
+		t.Errorf("cardinality warnings after crossing threshold = %d, want 1", got)
+	}
+}
+
 func BenchmarkLabeledCounterInc(b *testing.B) {
 	lc := NewLabeledCounter("bench_lc", "bench", []string{"method", "path", "status"})
 	lc.Inc("GET", "/api", "200")
@@ -407,4 +452,69 @@ func BenchmarkLabeledCounterInc_Parallel(b *testing.B) {
 			lc.Inc("GET", "/api", "200")
 		}
 	})
+}
+
+// TestStoreNewSeries_doubleCheckLoadsExistingWithoutWarn pins the write-lock
+// double-check in storeNewSeries: when the key was inserted between the
+// caller's RLock miss and the write lock (simulated by pre-populating the
+// map), the existing entry is returned unchanged, makeV is never invoked, no
+// duplicate insert happens, and no warning is signalled (zero seriesWarnings —
+// including the sanitize warning, which must not fire on the
+// double-check-found path).
+func TestStoreNewSeries_doubleCheckLoadsExistingWithoutWarn(t *testing.T) {
+	var mu sync.RWMutex
+	key := labelKey{"a"}
+	existing := new(int)
+	*existing = 7
+	m := map[labelKey]*int{key: existing}
+	name := "double_check_total"
+
+	made := false
+	v, loaded, w := storeNewSeries(&mu, m, &name, key, func() *int {
+		made = true
+		return new(int)
+	})
+
+	if !loaded {
+		t.Fatal("storeNewSeries loaded = false, want true for a key inserted before the write lock")
+	}
+	if v != existing {
+		t.Error("storeNewSeries returned a different entry; want the pre-existing one")
+	}
+	if made {
+		t.Error("storeNewSeries invoked makeV although the key already existed")
+	}
+	if w != (seriesWarnings{}) {
+		t.Errorf("storeNewSeries warnings = %+v, want zero value on the double-check path", w)
+	}
+	if len(m) != 1 {
+		t.Errorf("map len = %d, want 1 (no duplicate insert)", len(m))
+	}
+}
+
+// TestLabeledCounterDelete_SanitizesLabelValues pins create/delete symmetry
+// for invalid-UTF-8 label values: recording stores the series under the
+// sanitized key, so Delete called with the SAME raw invalid values must
+// sanitize its lookup key the same way and remove that series. Asserted via
+// exposition, not map internals. One labeled type suffices: all three Delete
+// methods share sanitizeLabelKey. Serial: it captures slog.Default.
+func TestLabeledCounterDelete_SanitizesLabelValues(t *testing.T) {
+	captureDebugLogs(t)
+	bad := "\xff\xfe"
+	lc := NewLabeledCounter("del_sanval_counter_total", "test", []string{"m"})
+	lc.Inc(bad)
+
+	var b strings.Builder
+	WriteLabeledCounter(&b, lc)
+	if out := b.String(); !strings.Contains(out, "\uFFFD") {
+		t.Fatalf("exposition missing sanitized series before Delete: %q", out)
+	}
+
+	lc.Delete(bad)
+
+	b.Reset()
+	WriteLabeledCounter(&b, lc)
+	if out := b.String(); strings.Contains(out, "\uFFFD") {
+		t.Errorf("exposition still contains sanitized series after Delete with raw values: %q", out)
+	}
 }

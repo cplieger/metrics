@@ -57,9 +57,10 @@ func FuzzRegistryFullExposition(f *testing.F) {
 	f.Add("quote\"x", "nl\ny")
 	f.Add("back\\s", "\x00")
 	f.Fuzz(func(t *testing.T, lv1, lv2 string) {
-		// Invalid-UTF-8 label values fail fast at series creation
-		// (validateLabelValues); this target exercises exposition structure of
-		// storable series, so skip out-of-domain inputs.
+		// Invalid-UTF-8 label values are rewritten to U+FFFD at record time
+		// (sanitizeUTF8 via sanitizeLabelKey), so they store as valid-UTF-8
+		// series the fuzzer already reaches directly; skipping them loses no
+		// structural coverage and keeps the input the value actually exposed.
 		if !utf8.ValidString(lv1) || !utf8.ValidString(lv2) {
 			t.Skip()
 		}
@@ -119,9 +120,10 @@ func FuzzLabeledExposition_balanced(f *testing.F) {
 	f.Add("emoji🎉", 7.0)
 
 	f.Fuzz(func(t *testing.T, val string, gaugeVal float64) {
-		// Invalid-UTF-8 label values fail fast at series creation
-		// (validateLabelValues); this target exercises escaping of storable
-		// series, so skip out-of-domain inputs.
+		// Invalid-UTF-8 label values are rewritten to U+FFFD at record time
+		// (sanitizeUTF8 via sanitizeLabelKey); the sanitized result is a
+		// valid-UTF-8 value the fuzzer already reaches directly, so skipping
+		// keeps the escaping under test aligned with the value as stored.
 		if !utf8.ValidString(val) {
 			t.Skip()
 		}
@@ -139,7 +141,9 @@ func FuzzLabeledExposition_balanced(f *testing.F) {
 		assertExpositionLabelsBalanced(t, b.String())
 
 		b.Reset()
-		writeOMLabeledGauge(&b, lg)
+		if fam, famOK := lg.family(); famOK {
+			appendOpenMetrics(&b, []metricFamily{fam})
+		}
 		assertExpositionLabelsBalanced(t, b.String())
 	})
 }

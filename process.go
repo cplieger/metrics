@@ -12,24 +12,6 @@ import (
 	"time"
 )
 
-// Timer measures elapsed time and reports to a Histogram.
-type Timer struct {
-	start   time.Time
-	observe func(float64)
-}
-
-// NewTimer starts a timer that will observe into the given histogram.
-func NewTimer(h *Histogram) *Timer {
-	return &Timer{start: time.Now(), observe: h.Observe}
-}
-
-// ObserveDuration records the elapsed time since the timer was created.
-func (t *Timer) ObserveDuration() time.Duration {
-	d := time.Since(t.start)
-	t.observe(d.Seconds())
-	return d
-}
-
 // processStartTime is captured at package init as the fallback anchor for
 // process_start_time_seconds (and, via it, process_uptime_seconds) when the
 // kernel-derived start time cannot be read. On Linux the true start time comes
@@ -45,8 +27,9 @@ const goosLinux = "linux"
 
 // linuxUserHZ is the assumed value of sysconf(_SC_CLK_TCK), the unit in which
 // the Linux kernel reports per-process CPU time in /proc/self/stat (utime and
-// stime are counted in "clock ticks" of 1/USER_HZ seconds). It is 100 on the
-// overwhelming majority of Linux kernels (the CONFIG_HZ=100 default), so
+// stime are counted in "clock ticks" of 1/USER_HZ seconds). USER_HZ is a
+// fixed kernel-to-userspace ABI constant of 100 on all modern Linux
+// architectures, independent of the kernel's internal CONFIG_HZ, so
 // process_cpu_seconds_total is computed as (utime+stime)/linuxUserHZ.
 //
 // This is deliberately a hardcoded constant rather than a runtime lookup:
@@ -55,18 +38,40 @@ const goosLinux = "linux"
 // runtime dependencies, standard library only" contract (go.mod has no
 // require). There is no pure-stdlib way to read _SC_CLK_TCK. The only
 // observable consequence of the assumption is that process_cpu_seconds_total is
-// scaled incorrectly on the rare kernel built with a non-100 CONFIG_HZ (e.g.
-// 250 or 1000); every other metric is unaffected.
+// scaled incorrectly on a legacy architecture whose USER_HZ is not 100 (e.g.
+// old alpha/ia64 ports); every other metric is unaffected.
 const linuxUserHZ = 100.0
 
 // unlimitedMaxFDs is the sentinel stored in processMetricsData.maxFDs when
 // /proc/self/limits reports the soft "Max open files" limit as the literal
 // token "unlimited". It is distinct from 0 (the absent/read-failure value) so
-// an unlimited limit is treated as a successful reading and exposed as +Inf
-// rather than silently dropped.
+// an unlimited limit is treated as a successful reading and exposed as
+// float64(math.MaxUint64), matching client_golang (see formatMaxFDs), rather
+// than silently dropped.
 const unlimitedMaxFDs int64 = -1
 
-var procDegraded atomic.Bool
+// Process-metric ok-mask bits. Each bit is set when the corresponding /proc
+// read succeeded, so the mask records WHICH process_* series are currently
+// collectable, not just whether any read failed.
+const (
+	procOKCPU uint32 = 1 << iota
+	procOKRSS
+	procOKOpenFDs
+	procOKMaxFDs
+
+	// procOKAll is the all-ok mask: every /proc read succeeded.
+	procOKAll = procOKCPU | procOKRSS | procOKOpenFDs | procOKMaxFDs
+)
+
+// procDegraded holds the last stored ok-mask. It starts all-ok so the first
+// scrape logs only when a read actually failed (never a spurious "recovered").
+var procDegraded = newProcDegradedState()
+
+func newProcDegradedState() *atomic.Uint32 {
+	var s atomic.Uint32
+	s.Store(procOKAll)
+	return &s
+}
 
 // processMetricsData holds collected process metrics for shared use.
 type processMetricsData struct {
@@ -89,23 +94,38 @@ func (d *processMetricsData) hasRSS() bool     { return d.rss > 0 }
 func (d *processMetricsData) hasOpenFDs() bool { return d.openFDs >= 0 }
 func (d *processMetricsData) hasMaxFDs() bool  { return d.maxFDs > 0 || d.maxFDs == unlimitedMaxFDs }
 
-// procMetricsDegraded reports whether process metric collection partially
-// failed on a platform where /proc-based metrics are expected (Linux).
-// cpuSeconds < 0, rss <= 0, openFDs < 0, or a non-positive maxFDs (excluding
-// the unlimitedMaxFDs sentinel, which is a successful "unlimited" reading) each
-// signal a failed read.
-func procMetricsDegraded(goos string, cpuSeconds float64, rss int64, openFDs int, maxFDs int64) bool {
-	return goos == goosLinux && (cpuSeconds < 0 || rss <= 0 || openFDs < 0 ||
-		(maxFDs <= 0 && maxFDs != unlimitedMaxFDs))
+// procOKMask computes the 4-bit ok-mask for process metric collection from the
+// series-presence predicates. On platforms other than Linux, where /proc-based
+// metrics are not expected, it returns procOKAll so degradation is never
+// reported. Failed reads are signalled by the predicates: cpuSeconds < 0,
+// rss <= 0, openFDs < 0, or a non-positive maxFDs (excluding the
+// unlimitedMaxFDs sentinel, which is a successful "unlimited" reading).
+func procOKMask(goos string, d *processMetricsData) uint32 {
+	if goos != goosLinux {
+		return procOKAll
+	}
+	var mask uint32
+	if d.hasCPU() {
+		mask |= procOKCPU
+	}
+	if d.hasRSS() {
+		mask |= procOKRSS
+	}
+	if d.hasOpenFDs() {
+		mask |= procOKOpenFDs
+	}
+	if d.hasMaxFDs() {
+		mask |= procOKMaxFDs
+	}
+	return mask
 }
 
-// procDegradedTransition stores the new degraded state in s and reports
-// whether this call changed it. Callers log only when it returns true.
-func procDegradedTransition(s *atomic.Bool, degraded bool) bool {
-	if degraded {
-		return s.CompareAndSwap(false, true)
-	}
-	return s.CompareAndSwap(true, false)
+// procDegradedTransition stores the new ok-mask in s and reports whether this
+// call changed it. Callers log only when it returns true, which preserves the
+// one-log-per-transition guarantee while making a widening of the failure set
+// and a partial recovery observable, not just the healthy<->degraded edges.
+func procDegradedTransition(s *atomic.Uint32, mask uint32) bool {
+	return s.Swap(mask) != mask
 }
 
 // collectProcessMetrics gathers all process metrics into a struct.
@@ -125,12 +145,12 @@ func collectProcessMetrics(d *processMetricsData) {
 	d.cpuSeconds = readProcCPUSeconds()
 	d.rss = readProcRSS()
 	d.openFDs, d.maxFDs = readProcFDs()
-	degraded := procMetricsDegraded(runtime.GOOS, d.cpuSeconds, d.rss, d.openFDs, d.maxFDs)
-	if procDegradedTransition(&procDegraded, degraded) {
-		if degraded {
+	mask := procOKMask(runtime.GOOS, d)
+	if procDegradedTransition(procDegraded, mask) {
+		if mask != procOKAll {
 			slog.Warn("process metric collection partially failed; some process_* metrics will be omitted",
-				"cpu_ok", d.cpuSeconds >= 0, "rss_ok", d.rss > 0, "fds_ok", d.openFDs >= 0,
-				"max_fds_ok", d.hasMaxFDs())
+				"cpu_ok", mask&procOKCPU != 0, "rss_ok", mask&procOKRSS != 0,
+				"fds_ok", mask&procOKOpenFDs != 0, "max_fds_ok", mask&procOKMaxFDs != 0)
 		} else {
 			slog.Info("process metric collection recovered; process_* metrics restored")
 		}
@@ -382,7 +402,8 @@ func readProcFDs() (open int, maxFDs int64) {
 // parseProcLimitsMaxFDs parses /proc/self/limits content for the soft "Max open
 // files" limit in descriptors. Returns the unlimitedMaxFDs sentinel for the
 // literal "unlimited" token (a successful reading), and 0 when the line is
-// absent, carries no value, or holds a malformed number. Like parseProcStatCPU
+// absent, carries no value, or holds a malformed or negative number (a
+// negative token must never collide with the unlimitedMaxFDs sentinel). Like parseProcStatCPU
 // and parseProcStatusRSS, this is the pure-parse counterpart to its I/O reader
 // (readProcFDs), so the limits parsing is unit testable in isolation.
 func parseProcLimitsMaxFDs(data []byte) int64 {
@@ -397,7 +418,7 @@ func parseProcLimitsMaxFDs(data []byte) int64 {
 				return unlimitedMaxFDs
 			}
 			n, err := strconv.ParseInt(fields[0], 10, 64)
-			if err != nil {
+			if err != nil || n < 0 {
 				return 0
 			}
 			return n

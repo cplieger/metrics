@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -253,8 +254,32 @@ func TestHelpEscaping_PrometheusVsOpenMetrics(t *testing.T) {
 	}
 
 	b.Reset()
-	writeOMSimpleCounter(&b, c)
+	appendOpenMetrics(&b, []metricFamily{c.family()})
 	if omOut := b.String(); !strings.Contains(omOut, `# HELP help_esc line1\\line2\nline3\"quoted\"`) {
 		t.Errorf("OpenMetrics HELP escaping wrong:\n%s", omOut)
+	}
+}
+
+// TestOMLEValue_canonicalNumbers pins the OpenMetrics Canonical Numbers le
+// formatter directly: whole bounds (positive, zero, negative) gain ".0",
+// fractional and exponent-form bounds pass through, +Inf keeps the spec token.
+func TestOMLEValue_canonicalNumbers(t *testing.T) {
+	tests := []struct {
+		want  string
+		bound float64
+	}{
+		{want: "1.0", bound: 1},
+		{want: "10.0", bound: 10},
+		{want: "0.0", bound: 0},
+		{want: "-10.0", bound: -10},
+		{want: "0.5", bound: 0.5},
+		{want: "0.005", bound: 0.005},
+		{want: "1e+16", bound: 1e16},
+		{want: "+Inf", bound: math.Inf(1)},
+	}
+	for _, tt := range tests {
+		if got := omLEValue(tt.bound); got != tt.want {
+			t.Errorf("omLEValue(%v) = %q, want %q", tt.bound, got, tt.want)
+		}
 	}
 }

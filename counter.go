@@ -1,11 +1,19 @@
 package metrics
 
 import (
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 )
+
+// cardinalityWarnThreshold is the per-metric series count at which loadOrStore
+// emits its one-time label-cardinality warning. Log-only: no cap or rejection
+// is imposed and recording behavior is unchanged; the warning turns silent
+// unbounded series growth (e.g. a caller using raw request paths as a label
+// value) into an actionable, alertable signal before memory is exhausted.
+const cardinalityWarnThreshold = 1000
 
 // Counter is a monotonically increasing counter.
 type Counter struct {
@@ -22,7 +30,19 @@ type Counter struct {
 // (name+"_total"). Naming counters with `_total` keeps both formats consistent.
 func NewCounter(name, help string) *Counter {
 	validateMetricName(name)
+	rejectTotalOnlyCounterName(name)
+	help = sanitizeHelp(name, help)
 	return &Counter{name: name, help: help}
+}
+
+// rejectTotalOnlyCounterName panics when a counter is named exactly "_total".
+// Stripping the conventional suffix leaves an empty base name, so the
+// OpenMetrics encoding cannot be conformant (the sample name would equal the
+// family name). Counters are the only metric type with this restriction.
+func rejectTotalOnlyCounterName(name string) {
+	if name == "_total" {
+		panic(`metrics: counter name "_total" has an empty base name; OpenMetrics cannot encode it`)
+	}
 }
 
 // Inc increments the counter by 1.
@@ -64,6 +84,8 @@ type LabeledCounter struct {
 // stay consistent (OpenMetrics always appends `_total` to the sample name).
 func NewLabeledCounter(name, help string, labels []string) *LabeledCounter {
 	validateMetricName(name)
+	rejectTotalOnlyCounterName(name)
+	help = sanitizeHelp(name, help)
 	labels = validateLabelNames(labels)
 	if len(labels) > 4 {
 		panic("metrics: LabeledCounter supports at most 4 labels")
@@ -87,7 +109,7 @@ func (lc *LabeledCounter) Add(n int64, labelVals ...string) {
 		panic("metrics: LabeledCounter.Add called with negative value")
 	}
 	key := labelKeyFor(lc.labels, labelVals)
-	if v, loaded := loadOrStore(&lc.mu, lc.vals, key,
+	if v, loaded := loadOrStore(&lc.mu, lc.vals, &lc.name, key,
 		func() *atomic.Int64 { a := &atomic.Int64{}; a.Store(n); return a }); loaded {
 		v.Add(n)
 	}
@@ -102,11 +124,11 @@ func (lc *LabeledCounter) Reset() {
 
 // Delete removes a single label combination from the counter.
 // It panics if the number of label values does not match the label count.
+// Label values are sanitized to valid UTF-8 the same way recording sanitizes
+// them, so Delete called with the original raw values removes the series
+// recording created.
 func (lc *LabeledCounter) Delete(labelVals ...string) {
-	key := labelKeyFor(lc.labels, labelVals)
-	lc.mu.Lock()
-	delete(lc.vals, key)
-	lc.mu.Unlock()
+	deleteSeries(&lc.mu, lc.vals, lc.labels, labelVals)
 }
 
 // WriteCounter writes a counter in Prometheus text format. It is a thin shim
@@ -118,22 +140,110 @@ func WriteCounter(b *strings.Builder, c *Counter) {
 
 // loadOrStore returns the entry for key, creating it with makeV under the
 // write lock when absent. loaded reports whether the entry already existed.
-func loadOrStore[V any](mu *sync.RWMutex, m map[labelKey]V, key labelKey, makeV func() V) (v V, loaded bool) {
+// name points at the owning metric's name field; it is taken by pointer so the
+// hot loaded-path never reads it. Label values carrying invalid UTF-8 are
+// sanitized with U+FFFD on the series-creation path (see storeNewSeries), and
+// when storing a new series pushes the map exactly to
+// cardinalityWarnThreshold, a one-time warning names the metric so a
+// label-cardinality explosion is observable before it exhausts memory. All
+// warning captures (the metric name, the representative sanitized value)
+// happen under the lock in storeNewSeries, so exactly one inserter observes
+// each event and the name read is synchronized with the mutex-guarded rename
+// in Register*; the warnings themselves are emitted AFTER the write lock is
+// released so arbitrary slog handler code never runs under the metric lock.
+func loadOrStore[V any](mu *sync.RWMutex, m map[labelKey]V, name *string, key labelKey, makeV func() V) (v V, loaded bool) {
 	mu.RLock()
 	v, loaded = m[key]
 	mu.RUnlock()
 	if loaded {
 		return v, true
 	}
+	var w seriesWarnings
+	v, loaded, w = storeNewSeries(mu, m, name, key, makeV)
+	if w.san {
+		slog.Warn("metrics: label value contained invalid UTF-8; sanitized with U+FFFD",
+			"metric", w.name, "value", w.sanValue)
+	}
+	if w.card {
+		slog.Warn("metrics: labeled metric series count crossed threshold; possible label-cardinality explosion",
+			"metric", w.name, "series", cardinalityWarnThreshold)
+	}
+	return v, loaded
+}
+
+// seriesWarnings carries the warning captures storeNewSeries takes under the
+// write lock so loadOrStore can emit the corresponding slog warnings after the
+// lock is released.
+type seriesWarnings struct {
+	name     string // metric name, captured under the lock when any warning fires
+	sanValue string // representative sanitized label value, truncated for logging
+	san      bool   // sanitization created a new series
+	card     bool   // this insert pushed the map exactly to cardinalityWarnThreshold
+}
+
+// sanitizeLabelKey runs sanitizeUTF8 over each of key's values. It returns the
+// sanitized key, one representative sanitized value (truncated via
+// maxLogValueLen for logging), and whether any value changed.
+func sanitizeLabelKey(key labelKey) (labelKey, string, bool) {
+	var rep string
+	changed := false
+	for i, v := range key {
+		san, ch := sanitizeUTF8(v)
+		if !ch {
+			continue
+		}
+		key[i] = san
+		if !changed {
+			rep = truncateForLog(san)
+		}
+		changed = true
+	}
+	return key, rep, changed
+}
+
+// storeNewSeries sanitizes key's label values to valid UTF-8 and inserts the
+// sanitized key under the write lock (double-checked). The raw key is never
+// stored, so records carrying invalid UTF-8 always miss loadOrStore's RLock
+// fast path and re-take this slow path, landing on the same sanitized series —
+// deliberate: degraded input gets the slow path. Distinct raw values may merge
+// into one sanitized series — also deliberate. The returned seriesWarnings is
+// captured under the lock (the metric name reads are synchronized with the
+// mutex-guarded rename in Register*): w.san fires only when a sanitization
+// actually CREATED a new series (the double-check-found path never warns), and
+// w.card fires when this insert pushed the map exactly to
+// cardinalityWarnThreshold. The defer keeps the unlock on a makeV panic path.
+func storeNewSeries[V any](mu *sync.RWMutex, m map[labelKey]V, name *string, key labelKey, makeV func() V) (v V, loaded bool, w seriesWarnings) {
+	sanKey, sanValue, sanitized := sanitizeLabelKey(key)
 	mu.Lock()
 	defer mu.Unlock()
-	if v, loaded = m[key]; loaded {
-		return v, true
+	if v, loaded = m[sanKey]; loaded {
+		return v, true, seriesWarnings{}
 	}
-	validateLabelValues(key)
 	v = makeV()
-	m[key] = v
-	return v, false
+	m[sanKey] = v
+	if sanitized {
+		w.san = true
+		w.sanValue = sanValue
+	}
+	if len(m) == cardinalityWarnThreshold {
+		w.card = true
+	}
+	if w.san || w.card {
+		w.name = *name
+	}
+	return v, false, w
+}
+
+// deleteSeries removes the series for labelVals from m under the write lock.
+// The lookup key is sanitized to valid UTF-8 exactly as recording sanitizes it
+// (sanitizeLabelKey), so Delete called with the original raw values removes
+// the series recording created. Shared by the three labeled Delete methods.
+func deleteSeries[V any](mu *sync.RWMutex, m map[labelKey]V, labels, labelVals []string) {
+	key := labelKeyFor(labels, labelVals)
+	key, _, _ = sanitizeLabelKey(key)
+	mu.Lock()
+	delete(m, key)
+	mu.Unlock()
 }
 
 // sortLabelKeys sorts label keys lexicographically.

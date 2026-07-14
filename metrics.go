@@ -5,6 +5,13 @@
 // Use Handler() for Prometheus format, OpenMetricsHandler() for OpenMetrics, or
 // NegotiateHandler() for automatic content negotiation based on the Accept header.
 //
+// Registration order: complete all Register* calls before serving a custom
+// handler built on the low-level Write* functions. Write* reads the metric
+// name without the registry lock, so it is not synchronized with a concurrent
+// Register* rename of the same metric. The Registry handlers (guarded by the
+// registry lock) and the record paths (Inc/Add/Set/Observe, guarded by the
+// metric lock) are safe to run concurrently with registration.
+//
 // Unsupported by design (SKIP list):
 //   - Summary metric type: Prometheus best practices recommend histograms
 //   - Exemplars (OpenMetrics): niche; requires tracing integration
@@ -182,7 +189,9 @@ func (r *Registry) RegisterLabeledCounter(lc *LabeledCounter) {
 	if !lc.registered.CompareAndSwap(false, true) {
 		panic("metrics: labeled counter already registered")
 	}
+	lc.mu.Lock()
 	lc.name = r.prefixed(lc.name)
+	lc.mu.Unlock()
 	r.reserveCounterFamily(lc.name, "labeled counter")
 	r.labeledCounters = append(r.labeledCounters, lc)
 }
@@ -194,7 +203,9 @@ func (r *Registry) RegisterLabeledGauge(lg *LabeledGauge) {
 	if !lg.registered.CompareAndSwap(false, true) {
 		panic("metrics: labeled gauge already registered")
 	}
+	lg.mu.Lock()
 	lg.name = r.prefixed(lg.name)
+	lg.mu.Unlock()
 	r.reserveName(lg.name, "labeled gauge")
 	r.labeledGauges = append(r.labeledGauges, lg)
 }
@@ -218,7 +229,9 @@ func (r *Registry) RegisterLabeledHistogram(lh *LabeledHistogram) {
 	if !lh.registered.CompareAndSwap(false, true) {
 		panic("metrics: labeled histogram already registered")
 	}
+	lh.mu.Lock()
 	lh.name = r.prefixed(lh.name)
+	lh.mu.Unlock()
 	r.reserveHistogramFamily(lh.name, "labeled histogram")
 	r.labeledHistograms = append(r.labeledHistograms, lh)
 }

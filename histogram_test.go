@@ -106,6 +106,18 @@ func TestWithBuckets_doesNotMutateInput(t *testing.T) {
 	}
 }
 
+// TestNewHistogram_callerMutationAfterConstructionIsolated verifies the
+// constructor owns its bucket slice: mutating the caller's slice after
+// construction must not alter the histogram's bounds.
+func TestNewHistogram_callerMutationAfterConstructionIsolated(t *testing.T) {
+	input := []float64{1, 2, 3}
+	h := NewHistogram("mutafter_hist", "test", WithBuckets(input))
+	input[0] = 99
+	if !slices.Equal(h.bounds, []float64{1, 2, 3}) {
+		t.Errorf("h.bounds = %v, want [1 2 3] (caller mutation leaked into owned bounds)", h.bounds)
+	}
+}
+
 func TestWithBuckets_lastWins(t *testing.T) {
 	h := NewHistogram("multi_buckets_hist", "test",
 		WithBuckets([]float64{1, 2, 3}),
@@ -143,6 +155,37 @@ func TestNewHistogram_emptyAndNilBuckets(t *testing.T) {
 			t.Errorf("count = %d, want 1", h.count.Load())
 		}
 	})
+}
+
+// TestLabeledHistogram_emptyBuckets covers a labeled histogram constructed with
+// an empty bound set: only the implicit +Inf bucket, _sum, and _count are
+// emitted per label combination (the labeled companion to
+// TestNewHistogram_emptyAndNilBuckets).
+func TestLabeledHistogram_emptyBuckets(t *testing.T) {
+	lh := NewLabeledHistogram("lhx_empty_buckets", "test", []string{"k"}, WithBuckets(nil))
+	lh.Observe(1.5, "v")
+	lh.Observe(0.5, "v")
+
+	fam, ok := lh.family()
+	if !ok {
+		t.Fatal("family() ok = false, want true")
+	}
+	if len(fam.samples) != 3 {
+		t.Fatalf("family() emitted %d samples, want 3 (+Inf bucket, _sum, _count)", len(fam.samples))
+	}
+
+	var b strings.Builder
+	WriteLabeledHistogram(&b, lh)
+	out := b.String()
+	for _, want := range []string{
+		`lhx_empty_buckets_bucket{k="v",le="+Inf"} 2`,
+		`lhx_empty_buckets_sum{k="v"} 2`,
+		`lhx_empty_buckets_count{k="v"} 2`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("empty-bucket labeled histogram missing %q:\n%s", want, out)
+		}
+	}
 }
 
 func TestHistogramObserve(t *testing.T) {
@@ -548,6 +591,35 @@ func TestLabeledHistogramTimer(t *testing.T) {
 	if out := body(t, r); !strings.Contains(out, `op_seconds_count{kind="scan"} 1`) {
 		t.Errorf("labeled timer should record one observation:\n%s", out)
 	}
+}
+
+// TestLabeledHistogramTimer_CopiesLabelValuesAtConstruction verifies NewTimer
+// snapshots the caller's variadic label values at construction: mutating the
+// caller-owned slice before ObserveDuration must not change the recorded
+// label set.
+func TestLabeledHistogramTimer_CopiesLabelValuesAtConstruction(t *testing.T) {
+	lh := NewLabeledHistogram("op_seconds_copy", "op", []string{"kind"})
+	r := NewRegistry("")
+	r.RegisterLabeledHistogram(lh)
+	vals := []string{"scan"}
+	tm := lh.NewTimer(vals...)
+	vals[0] = "mutated"
+	tm.ObserveDuration()
+	out := body(t, r)
+	if !strings.Contains(out, `op_seconds_copy_count{kind="scan"} 1`) {
+		t.Fatalf("timer did not preserve construction-time label value:\n%s", out)
+	}
+	if strings.Contains(out, `kind="mutated"`) {
+		t.Fatalf("caller slice mutation leaked into timer labels:\n%s", out)
+	}
+}
+
+// TestLabeledHistogramNewTimer_ArityMismatchPanicsAtConstruction pins the
+// eager arity guard: a wrong-arity NewTimer panics when the timer is created,
+// not later in ObserveDuration.
+func TestLabeledHistogramNewTimer_ArityMismatchPanicsAtConstruction(t *testing.T) {
+	lh := NewLabeledHistogram("timer_arity_seconds", "test", []string{"a", "b"})
+	mustPanicContaining(t, "label arity mismatch", func() { lh.NewTimer("only_one") })
 }
 
 func TestAPIBucketsWide(t *testing.T) {

@@ -23,6 +23,10 @@ import (
 //   - HELP escaping (Prometheus does not escape the double-quote; OpenMetrics does)
 //   - counter naming (OpenMetrics strips _total for the TYPE/HELP family name and
 //     ensures _total on the sample series; Prometheus uses the registered name verbatim)
+//   - histogram _sum/_count omission for negative bucket bounds (OpenMetrics only,
+//     via metricFamily.omitOMSumCount): the OpenMetrics 1.0 spec forbids a sum
+//     value when negative threshold buckets are used, and _count is emitted if
+//     and only if _sum is; Prometheus text format has no such rule and emits both
 //   - the trailing "# EOF\n" (OpenMetrics only)
 //
 // Counters carry their registered name verbatim in metricFamily.name (the
@@ -43,6 +47,11 @@ type metricFamily struct {
 	typ     string
 	help    string
 	samples []sample
+	// omitOMSumCount marks a histogram family constructed with negative bucket
+	// bounds: the OpenMetrics encoder skips its _sum and _count samples per the
+	// spec's negative-threshold rule (see the package comment above), while the
+	// Prometheus encoder emits them unchanged. Always false for non-histograms.
+	omitOMSumCount bool
 }
 
 // sample is a single exposition line within a family. nameSuffix is appended to
@@ -168,10 +177,11 @@ func (lg *LabeledGauge) family() (fam metricFamily, ok bool) {
 // emitted.
 func (h *Histogram) family() metricFamily {
 	return metricFamily{
-		name:    h.name,
-		typ:     typeHistogram,
-		help:    h.help,
-		samples: histogramSamples(h, ""),
+		name:           h.name,
+		typ:            typeHistogram,
+		help:           h.help,
+		samples:        histogramSamples(h, ""),
+		omitOMSumCount: h.negBounds,
 	}
 }
 
@@ -192,7 +202,7 @@ func (lh *LabeledHistogram) family() (fam metricFamily, ok bool) {
 		}
 		samples = append(samples, histogramSamples(h, buildLabelString(lh.labels, key))...)
 	}
-	return metricFamily{name: lh.name, typ: typeHistogram, help: lh.help, samples: samples}, len(samples) > 0
+	return metricFamily{name: lh.name, typ: typeHistogram, help: lh.help, samples: samples, omitOMSumCount: lh.negBounds}, len(samples) > 0
 }
 
 // histogramSamples expands one histogram into its cumulative bucket, sum, and
@@ -314,6 +324,9 @@ func appendOpenMetrics(b *strings.Builder, fams []metricFamily) {
 		fmt.Fprintf(b, "# TYPE %s %s\n# HELP %s %s\n", headerName, f.typ, headerName, omHelpEscaper.Replace(f.help))
 		for j := range f.samples {
 			s := &f.samples[j]
+			if f.omitOMSumCount && (s.nameSuffix == "_sum" || s.nameSuffix == "_count") {
+				continue
+			}
 			writeSample(b, seriesBase+s.nameSuffix, s.leString(omLEValue), s.value)
 		}
 	}

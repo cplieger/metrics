@@ -66,6 +66,14 @@ func resolveBuckets(opts []Option) []float64 {
 	return slices.Clone(cfg.buckets)
 }
 
+// hasNegativeBounds reports whether a validated bound set contains a negative
+// bucket threshold. Bounds are strictly increasing (validateBuckets), so
+// checking the first element suffices. Shared by NewHistogram and
+// NewLabeledHistogram to seed negBounds.
+func hasNegativeBounds(bounds []float64) bool {
+	return len(bounds) > 0 && bounds[0] < 0
+}
+
 // Histogram tracks a distribution using cumulative buckets and atomic CAS for sum.
 type Histogram struct {
 	name       string
@@ -75,6 +83,13 @@ type Histogram struct {
 	sumBits    atomic.Uint64
 	count      atomic.Int64
 	registered atomic.Bool
+	// negBounds records at construction whether bounds contains a negative
+	// threshold. It drives the OpenMetrics-only omission of the _sum and
+	// _count samples per the OpenMetrics 1.0 negative-threshold rule
+	// ("Negative threshold buckets MAY be used, but then the Histogram
+	// MetricPoint MUST NOT contain a sum value", and _count is emitted if and
+	// only if _sum is). Prometheus text format is unaffected.
+	negBounds bool
 	// mu is used with inverted RWMutex semantics: Observe holds RLock (writers
 	// mutate sum/count/buckets via atomics, so they run concurrently), while
 	// snapshot holds the exclusive Lock to read a consistent view with no
@@ -87,12 +102,14 @@ type Histogram struct {
 // By default it uses DefaultBuckets; use WithBuckets to override.
 func NewHistogram(name, help string, opts ...Option) *Histogram {
 	validateMetricName(name)
+	help = sanitizeHelp(name, help)
 	bounds := resolveBuckets(opts)
 	h := &Histogram{
-		name:    name,
-		help:    help,
-		bounds:  bounds,
-		buckets: make([]atomic.Int64, len(bounds)+1),
+		name:      name,
+		help:      help,
+		bounds:    bounds,
+		buckets:   make([]atomic.Int64, len(bounds)+1),
+		negBounds: hasNegativeBounds(bounds),
 	}
 	return h
 }
@@ -101,13 +118,7 @@ func NewHistogram(name, help string, opts ...Option) *Histogram {
 func (h *Histogram) Observe(seconds float64) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	for {
-		old := h.sumBits.Load()
-		newF := math.Float64frombits(old) + seconds
-		if h.sumBits.CompareAndSwap(old, math.Float64bits(newF)) {
-			break
-		}
-	}
+	addFloatBits(&h.sumBits, seconds)
 	h.count.Add(1)
 	for i, bound := range h.bounds {
 		if seconds <= bound {
@@ -141,11 +152,15 @@ func WriteHistogram(b *strings.Builder, h *Histogram) {
 
 // LabeledHistogram tracks histograms per label combination.
 type LabeledHistogram struct {
-	vals       map[labelKey]*Histogram
-	name       string
-	help       string
-	bounds     []float64
-	labels     []string
+	vals   map[labelKey]*Histogram
+	name   string
+	help   string
+	bounds []float64
+	labels []string
+	// negBounds mirrors Histogram.negBounds for the shared bound set: it
+	// drives the OpenMetrics-only _sum/_count omission per the OpenMetrics
+	// negative-threshold rule. Prometheus text format is unaffected.
+	negBounds  bool
 	registered atomic.Bool
 	mu         sync.RWMutex
 }
@@ -154,6 +169,7 @@ type LabeledHistogram struct {
 // By default it uses DefaultBuckets; use WithBuckets to override.
 func NewLabeledHistogram(name, help string, labels []string, opts ...Option) *LabeledHistogram {
 	validateMetricName(name)
+	help = sanitizeHelp(name, help)
 	labels = validateLabelNames(labels)
 	for _, l := range labels {
 		if l == "le" {
@@ -165,23 +181,25 @@ func NewLabeledHistogram(name, help string, labels []string, opts ...Option) *La
 	}
 	bounds := resolveBuckets(opts)
 	return &LabeledHistogram{
-		name:   name,
-		help:   help,
-		labels: labels,
-		bounds: bounds,
-		vals:   make(map[labelKey]*Histogram),
+		name:      name,
+		help:      help,
+		labels:    labels,
+		bounds:    bounds,
+		negBounds: hasNegativeBounds(bounds),
+		vals:      make(map[labelKey]*Histogram),
 	}
 }
 
 // Observe records a value for the given label values.
 func (lh *LabeledHistogram) Observe(seconds float64, labelVals ...string) {
 	key := labelKeyFor(lh.labels, labelVals)
-	h, _ := loadOrStore(&lh.mu, lh.vals, key, func() *Histogram {
+	h, _ := loadOrStore(&lh.mu, lh.vals, &lh.name, key, func() *Histogram {
 		return &Histogram{
-			name:    lh.name,
-			help:    lh.help,
-			bounds:  lh.bounds,
-			buckets: make([]atomic.Int64, len(lh.bounds)+1),
+			name:      lh.name,
+			help:      lh.help,
+			bounds:    lh.bounds,
+			buckets:   make([]atomic.Int64, len(lh.bounds)+1),
+			negBounds: lh.negBounds,
 		}
 	})
 	h.Observe(seconds)
@@ -196,11 +214,11 @@ func (lh *LabeledHistogram) Reset() {
 
 // Delete removes a single label combination from the histogram.
 // It panics if the number of label values does not match the label count.
+// Label values are sanitized to valid UTF-8 the same way recording sanitizes
+// them, so Delete called with the original raw values removes the series
+// recording created.
 func (lh *LabeledHistogram) Delete(labelVals ...string) {
-	key := labelKeyFor(lh.labels, labelVals)
-	lh.mu.Lock()
-	delete(lh.vals, key)
-	lh.mu.Unlock()
+	deleteSeries(&lh.mu, lh.vals, lh.labels, labelVals)
 }
 
 // WriteLabeledHistogram writes all child histograms in Prometheus text format (IR shim).
@@ -210,10 +228,33 @@ func WriteLabeledHistogram(b *strings.Builder, lh *LabeledHistogram) {
 	}
 }
 
+// Timer measures elapsed time and reports to a Histogram.
+type Timer struct {
+	start   time.Time
+	observe func(float64)
+}
+
+// NewTimer starts a timer that will observe into the given histogram.
+func NewTimer(h *Histogram) *Timer {
+	return &Timer{start: time.Now(), observe: h.Observe}
+}
+
+// ObserveDuration records the elapsed time since the timer was created.
+func (t *Timer) ObserveDuration() time.Duration {
+	d := time.Since(t.start)
+	t.observe(d.Seconds())
+	return d
+}
+
 // NewTimer returns a Timer that, on ObserveDuration, records the elapsed time
 // into this labeled histogram with the given label values. This lets the
 // common per-label latency case use Timer's defer-ObserveDuration ergonomics
 // (plain NewTimer only composes with an unlabeled Histogram).
 func (lh *LabeledHistogram) NewTimer(labelVals ...string) *Timer {
-	return &Timer{start: time.Now(), observe: func(s float64) { lh.Observe(s, labelVals...) }}
+	// Fail fast on arity mismatch at construction (labelKeyFor panics), so a
+	// wrong-arity timer surfaces where it is created rather than inside a
+	// deferred ObserveDuration.
+	_ = labelKeyFor(lh.labels, labelVals)
+	vals := slices.Clone(labelVals)
+	return &Timer{start: time.Now(), observe: func(s float64) { lh.Observe(s, vals...) }}
 }
