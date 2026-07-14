@@ -103,6 +103,8 @@ func main() {
 - `RecordHTTP(c *LabeledCounter, h *Histogram, d time.Duration, labelVals ...string)` — record one request into the caller-supplied counter/histogram (either may be `nil`).
 - `InstrumentHandler(next, c, h, labelValues func(r, status) []string) http.Handler` — middleware wrapper. The caller owns the label set, ordering, and any path templating.
 
+Label values are caller-owned and must be valid UTF-8: recording a label combination whose value is not valid UTF-8 panics at record time (Prometheus/OpenMetrics require valid UTF-8), not at construction. Values derived from untrusted input (raw request paths, header contents) must be templated or validated before use. Inside an http handler `net/http`'s per-request recover catches the panic and the process survives, but a metric update from a context without panic recovery (a background goroutine, not an http handler) will crash the process on such input.
+
 ### Registry
 
 - `NewRegistry(prefix) *Registry` — every registered metric name is prefixed with `<prefix>_` (process metrics excepted). Pass `""` for no prefix.
@@ -113,7 +115,7 @@ func main() {
 
 ### Process metrics (emitted automatically)
 
-- `process_goroutines`, `process_heap_bytes`, `process_gc_pause_seconds_total`, `process_uptime_seconds`, `process_start_time_seconds`.
+- `go_goroutines`, `go_memstats_heap_alloc_bytes`, `process_gc_pause_seconds_total`, `process_uptime_seconds`, `process_start_time_seconds` (the goroutine and heap-alloc names match `client_golang`).
 - Linux only: `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds`, `process_max_fds`.
   - Caveat: `process_cpu_seconds_total` assumes `USER_HZ` (`sysconf(_SC_CLK_TCK)`) = 100, the near-universal Linux default; on a kernel built with a different `CONFIG_HZ` the value is scaled by a constant factor. Reading the real value would require cgo or `golang.org/x/sys`, which the zero-dependency contract excludes.
 
@@ -123,7 +125,7 @@ func main() {
 
 ## Spec conformance
 
-Valid Prometheus text exposition format 0.0.4: label values escape only `\`, `"`, and `\n` (as `\\`, `\"`, `\n`); HELP text escapes `\` and `\n`; metric/label names are validated at creation (panic on invalid); label arity is enforced (panic on mismatch); duplicate metric family names panic at registration (fail-fast, including the reserved `process_*` names); histogram bucket bounds are validated at creation (panic unless strictly increasing and finite); histograms always include a `+Inf` bucket equal to `_count`.
+Valid Prometheus text exposition format 0.0.4: label values escape only `\`, `"`, and `\n` (as `\\`, `\"`, `\n`); HELP text escapes `\` and `\n`; metric/label names are validated at creation (panic on invalid); label arity is enforced (panic on mismatch); label values must be valid UTF-8 (panic at record time on the first invalid value for a series); duplicate metric family names panic at registration (fail-fast, including the reserved `process_*` names); histogram bucket bounds are validated at creation (panic unless strictly increasing and finite); histograms always include a `+Inf` bucket equal to `_count`.
 
 OpenMetrics 1.0.0 support: content-type `application/openmetrics-text; version=1.0.0; charset=utf-8`, mandatory trailing `# EOF`, TYPE before HELP, counter samples use the `_total` suffix. Numeric values render through a single canonical formatter shared by both formats, so a given value is exposed identically: whole values as bare integers (e.g. `42`), other values in shortest round-trippable form, and `+Inf`/`-Inf`/`NaN` for non-finite. Use `NegotiateHandler()` for content negotiation, `OpenMetricsHandler()` for direct OpenMetrics output.
 

@@ -47,14 +47,53 @@ type metricFamily struct {
 
 // sample is a single exposition line within a family. nameSuffix is appended to
 // the family's series base name ("" for counters and gauges; "_bucket"/"_sum"/
-// "_count" for histograms). labels is the pre-rendered, spec-escaped label
-// content WITHOUT the surrounding braces ("" when the sample has no labels).
-// value is the pre-rendered value token (formatValue output or a base-10
-// integer), identical across both exposition formats.
+// "_count" for histograms). labels is the pre-rendered, spec-escaped USER label
+// content WITHOUT the surrounding braces and WITHOUT the implicit le label ("" when
+// the sample has no user labels). value is the pre-rendered value token
+// (formatValue output or a base-10 integer), identical across both exposition
+// formats.
+//
+// Histogram bucket samples set isBucket and carry the numeric bucket bound in
+// leBound; the implicit le label is NOT pre-rendered into labels but formatted
+// per-format by the encoder (leString): Prometheus text uses formatValue (a
+// bare integer bound stays le="1"), while OpenMetrics applies the Canonical
+// Numbers rule (an integer bound becomes le="1.0"). All other samples leave
+// isBucket false and leBound unused.
 type sample struct {
 	nameSuffix string
 	labels     string
 	value      string
+	leBound    float64
+	isBucket   bool
+}
+
+// leString returns the sample's full label content (user labels plus the
+// implicit le label) for a bucket sample, formatting the le bound with the
+// given per-format formatter; for a non-bucket sample it returns the user
+// labels unchanged.
+func (s *sample) leString(leFmt func(float64) string) string {
+	if !s.isBucket {
+		return s.labels
+	}
+	return leLabels(s.labels, leFmt(s.leBound))
+}
+
+// omLEValue formats a histogram le bucket bound per the OpenMetrics Canonical
+// Numbers rule, matching client_golang's writeOpenMetricsFloat: the value uses
+// the library's shared shortest-round-trip form (formatValue), and a trailing
+// ".0" is appended when that rendering has neither a decimal point nor an
+// exponent, so a whole bound like 1 becomes "1.0" and 10 becomes "10.0".
+// Non-finite bounds (the implicit +Inf bucket) and bounds that already carry a
+// fractional part or exponent (0.5, 0.005, 1e+16) are returned unchanged.
+func omLEValue(bound float64) string {
+	s := formatValue(bound)
+	if math.IsInf(bound, 0) || math.IsNaN(bound) {
+		return s
+	}
+	if !strings.ContainsAny(s, ".eE") {
+		return s + ".0"
+	}
+	return s
 }
 
 // family materialises an unlabeled counter into the IR. An unlabeled counter is
@@ -158,21 +197,25 @@ func (lh *LabeledHistogram) family() (fam metricFamily, ok bool) {
 
 // histogramSamples expands one histogram into its cumulative bucket, sum, and
 // count samples. labelStr is the pre-rendered user-label content (empty for an
-// unlabeled histogram); the implicit le label is appended to each bucket. The
-// ordering — every finite bucket, then the +Inf bucket, then _sum, then _count
-// — matches the writers and both exposition formats.
+// unlabeled histogram); each bucket carries its numeric bound in leBound so the
+// implicit le label can be formatted per-format by the encoder (Prometheus
+// bare, OpenMetrics canonical). The ordering — every finite bucket, then the
+// +Inf bucket, then _sum, then _count — matches the writers and both exposition
+// formats.
 func histogramSamples(h *Histogram, labelStr string) []sample {
 	sum, count, bucketVals := h.snapshot()
 	samples := make([]sample, 0, len(h.bounds)+3)
 	for i, bound := range h.bounds {
 		samples = append(samples, sample{
 			nameSuffix: "_bucket",
-			labels:     leLabels(labelStr, formatValue(bound)),
+			labels:     labelStr,
 			value:      strconv.FormatInt(bucketVals[i], 10),
+			leBound:    bound,
+			isBucket:   true,
 		})
 	}
 	samples = append(samples,
-		sample{nameSuffix: "_bucket", labels: leLabels(labelStr, "+Inf"), value: strconv.FormatInt(bucketVals[len(h.bounds)], 10)},
+		sample{nameSuffix: "_bucket", labels: labelStr, value: strconv.FormatInt(bucketVals[len(h.bounds)], 10), leBound: math.Inf(1), isBucket: true},
 		sample{nameSuffix: "_sum", labels: labelStr, value: formatValue(sum)},
 		sample{nameSuffix: "_count", labels: labelStr, value: strconv.FormatInt(count, 10)},
 	)
@@ -244,7 +287,7 @@ func appendPrometheus(b *strings.Builder, fams []metricFamily) {
 		fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s %s\n", f.name, helpEscaper.Replace(f.help), f.name, f.typ)
 		for j := range f.samples {
 			s := &f.samples[j]
-			writeSample(b, f.name+s.nameSuffix, s.labels, s.value)
+			writeSample(b, f.name+s.nameSuffix, s.leString(formatValue), s.value)
 		}
 	}
 }
@@ -271,7 +314,7 @@ func appendOpenMetrics(b *strings.Builder, fams []metricFamily) {
 		fmt.Fprintf(b, "# TYPE %s %s\n# HELP %s %s\n", headerName, f.typ, headerName, omHelpEscaper.Replace(f.help))
 		for j := range f.samples {
 			s := &f.samples[j]
-			writeSample(b, seriesBase+s.nameSuffix, s.labels, s.value)
+			writeSample(b, seriesBase+s.nameSuffix, s.leString(omLEValue), s.value)
 		}
 	}
 }

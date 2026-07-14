@@ -47,8 +47,8 @@ func TestRegistryHandler(t *testing.T) {
 		"test_tasks_total",
 		"test_events_total",
 		"test_active_connections",
-		"process_goroutines",
-		"process_heap_bytes",
+		"go_goroutines",
+		"go_memstats_heap_alloc_bytes",
 		"process_uptime_seconds",
 	} {
 		if !strings.Contains(out, want) {
@@ -268,7 +268,7 @@ func TestRegistry_ReRegistrationPanics(t *testing.T) {
 func TestRegistry_ProcessFamilyNamesAreGuarded(t *testing.T) {
 	mustPanicContaining(t, "collides", func() {
 		r := NewRegistry("")
-		r.RegisterGauge(NewGauge("process_goroutines", "user gauge colliding with the built-in process metric"))
+		r.RegisterGauge(NewGauge("go_goroutines", "user gauge colliding with the built-in process metric"))
 	})
 }
 

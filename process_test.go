@@ -58,6 +58,102 @@ func TestParseProcStatCPU(t *testing.T) {
 	}
 }
 
+func TestParseProcStatStartTime(t *testing.T) {
+	// A well-formed /proc/self/stat line: field 22 (starttime) sits at index 19
+	// of the after-comm slice. The lines below place 8000000 in that position,
+	// among realistic noise for the surrounding fields.
+	tests := []struct {
+		name string
+		in   string
+		want int64
+	}{
+		{
+			name: "simple comm",
+			//     pid  comm  st ppid pgrp sess tty tpgid flags min cmin maj cmaj ut st cut cst pri ni thr itreal START
+			in:   "1234 (cat) S 1 1 1 0 0 0 0 0 0 0 200 100 0 0 20 0 1 0 8000000",
+			want: 8000000,
+		},
+		{
+			name: "comm with spaces and parens",
+			in:   "1234 (weird (proc) name) S 1 1 1 0 0 0 0 0 0 0 200 100 0 0 20 0 1 0 42",
+			want: 42,
+		},
+		{
+			name: "too few fields",
+			in:   "1234 (cat) S 1 1 1 0 0 0 0 0 0 0 200 100",
+			want: -1,
+		},
+		{
+			name: "no closing paren",
+			in:   "1234 cat S 1 1",
+			want: -1,
+		},
+		{
+			name: "trailing paren guarded",
+			in:   "1234 (cat)",
+			want: -1,
+		},
+		{
+			name: "non-numeric starttime",
+			in:   "1234 (cat) S 1 1 1 0 0 0 0 0 0 0 200 100 0 0 20 0 1 0 abc",
+			want: -1,
+		},
+		{
+			name: "empty input",
+			in:   "",
+			want: -1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseProcStatStartTime([]byte(tc.in)); got != tc.want {
+				t.Errorf("parseProcStatStartTime(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseProcStatBtime(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want int64
+	}{
+		{
+			name: "btime among noise",
+			in:   "cpu  100 0 50 900 0 0 0\ncpu0 50 0 25 450\nintr 12345\nbtime 1700000000\nprocesses 4242\n",
+			want: 1700000000,
+		},
+		{
+			name: "btime first line",
+			in:   "btime 1600000000\n",
+			want: 1600000000,
+		},
+		{
+			name: "no btime line",
+			in:   "cpu  100 0 50 900\nprocesses 4242\n",
+			want: -1,
+		},
+		{
+			name: "malformed value",
+			in:   "btime notanumber\n",
+			want: -1,
+		},
+		{
+			name: "empty input",
+			in:   "",
+			want: -1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseProcStatBtime([]byte(tc.in)); got != tc.want {
+				t.Errorf("parseProcStatBtime(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseProcStatusRSS(t *testing.T) {
 	tests := []struct {
 		name string
@@ -107,27 +203,32 @@ func TestProcMetricsDegraded(t *testing.T) {
 		cpuSeconds float64
 		rss        int64
 		openFDs    int
+		maxFDs     int64
 		want       bool
 	}{
-		{"linux all healthy", "linux", 1.5, 4096, 12, false},
-		{"linux cpu read failed", "linux", -1, 4096, 12, true},
+		{"linux all healthy", "linux", 1.5, 4096, 12, 1024, false},
+		{"linux cpu read failed", "linux", -1, 4096, 12, 1024, true},
 		// cpuSeconds == 0 and openFDs == 0 are HEALTHY readings: the failure
 		// guards are strict (< 0), so a <= 0 mutation would wrongly degrade them.
-		{"linux cpu zero healthy", "linux", 0, 4096, 12, false},
-		{"linux rss zero", "linux", 1.5, 0, 12, true},
-		{"linux rss negative", "linux", 1.5, -1, 12, true},
-		{"linux fds read failed", "linux", 1.5, 4096, -1, true},
-		{"linux fds zero healthy", "linux", 1.5, 4096, 0, false},
-		{"linux all failed", "linux", -1, 0, -1, true},
-		{"non-linux all failed stays quiet", "darwin", -1, 0, -1, false},
-		{"non-linux healthy", "windows", 1.5, 4096, 12, false},
+		{"linux cpu zero healthy", "linux", 0, 4096, 12, 1024, false},
+		{"linux rss zero", "linux", 1.5, 0, 12, 1024, true},
+		{"linux rss negative", "linux", 1.5, -1, 12, 1024, true},
+		{"linux fds read failed", "linux", 1.5, 4096, -1, 1024, true},
+		{"linux fds zero healthy", "linux", 1.5, 4096, 0, 1024, false},
+		// maxFDs: the unlimited sentinel is a successful reading (not degraded);
+		// a non-positive maxFDs that is NOT the sentinel is a failed limits read.
+		{"linux max fds unlimited healthy", "linux", 1.5, 4096, 12, unlimitedMaxFDs, false},
+		{"linux max fds read failed", "linux", 1.5, 4096, 12, 0, true},
+		{"linux all failed", "linux", -1, 0, -1, 0, true},
+		{"non-linux all failed stays quiet", "darwin", -1, 0, -1, 0, false},
+		{"non-linux healthy", "windows", 1.5, 4096, 12, 1024, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := procMetricsDegraded(tc.goos, tc.cpuSeconds, tc.rss, tc.openFDs)
+			got := procMetricsDegraded(tc.goos, tc.cpuSeconds, tc.rss, tc.openFDs, tc.maxFDs)
 			if got != tc.want {
-				t.Errorf("procMetricsDegraded(%q, %v, %d, %d) = %v, want %v",
-					tc.goos, tc.cpuSeconds, tc.rss, tc.openFDs, got, tc.want)
+				t.Errorf("procMetricsDegraded(%q, %v, %d, %d, %d) = %v, want %v",
+					tc.goos, tc.cpuSeconds, tc.rss, tc.openFDs, tc.maxFDs, got, tc.want)
 			}
 		})
 	}
@@ -211,6 +312,11 @@ func TestProcPresencePredicates_Boundaries(t *testing.T) {
 	if !(&processMetricsData{maxFDs: 1}).hasMaxFDs() {
 		t.Error("hasMaxFDs(maxFDs=1) = false, want true")
 	}
+	// The unlimited sentinel (-1) is a present, successful reading despite being
+	// non-positive, so hasMaxFDs must accept it via the sentinel branch.
+	if !(&processMetricsData{maxFDs: unlimitedMaxFDs}).hasMaxFDs() {
+		t.Error("hasMaxFDs(maxFDs=unlimitedMaxFDs) = false, want true (sentinel branch)")
+	}
 }
 
 // A single leading ')' makes strings.LastIndex return 0; the guard is `idx < 0`,
@@ -269,11 +375,38 @@ func TestParseProcLimitsMaxFDs(t *testing.T) {
 		{"single field", "Max open files 4096\n", 4096},
 		{"label only", "Max open files\n", 0},
 		{"absent", "Max locked memory         0                    0                    bytes\n", 0},
+		// "unlimited" is a valid, successful reading, mapped to the sentinel.
+		{"unlimited soft", "Max open files            unlimited            unlimited            files\n", unlimitedMaxFDs},
+		{"unlimited mixed case", "Max open files Unlimited\n", unlimitedMaxFDs},
+		// A malformed (non-numeric, non-"unlimited") value is a failed read.
+		{"malformed value", "Max open files notanumber\n", 0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := parseProcLimitsMaxFDs([]byte(tc.in)); got != tc.want {
 				t.Errorf("parseProcLimitsMaxFDs(%q) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFormatMaxFDs pins the exposition rendering: the unlimited sentinel becomes
+// float64(math.MaxUint64) ("1.8446744073709552e+19", what client_golang emits
+// for an unlimited limit); every other value is decimal.
+func TestFormatMaxFDs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int64
+		want string
+	}{
+		{"unlimited sentinel", unlimitedMaxFDs, "1.8446744073709552e+19"},
+		{"finite limit", 1024, "1024"},
+		{"zero", 0, "0"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatMaxFDs(tc.in); got != tc.want {
+				t.Errorf("formatMaxFDs(%d) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -326,8 +459,8 @@ func TestWriteProcessMetrics(t *testing.T) {
 	WriteProcessMetrics(&b)
 	out := b.String()
 	for _, want := range []string{
-		"process_goroutines",
-		"process_heap_bytes",
+		"go_goroutines",
+		"go_memstats_heap_alloc_bytes",
 		"process_gc_pause_seconds_total",
 		"process_uptime_seconds",
 		"process_start_time_seconds",
@@ -339,9 +472,9 @@ func TestWriteProcessMetrics(t *testing.T) {
 }
 
 func TestWriteProcessMetrics_uptimeAndStartTimeReconcile(t *testing.T) {
-	// process_uptime_seconds and process_start_time_seconds derive from a single
-	// anchor (package-init processStartTime), so start + uptime must reconcile
-	// with now.
+	// process_uptime_seconds is derived as now - process_start_time_seconds (the
+	// start time coming from the kernel on Linux, or the package-init fallback
+	// otherwise), so start + uptime must reconcile with now regardless of source.
 	var b strings.Builder
 	WriteProcessMetrics(&b)
 	out := b.String()
@@ -368,5 +501,47 @@ func TestWriteProcessMetrics_uptimeAndStartTimeReconcile(t *testing.T) {
 	if diff := now - (start + uptime); diff < -2 || diff > 2 {
 		t.Errorf("start(%.0f) + uptime(%.3f) = %.3f, want ~= now(%.0f); diff=%.3f",
 			start, uptime, start+uptime, now, diff)
+	}
+}
+
+// TestWriteProcessMetrics_LinuxFDsEmitted pins the Linux-only fd emit wiring in
+// processFamilies: when /proc/self/fd and /proc/self/limits are readable,
+// WriteProcessMetrics emits process_open_fds and process_max_fds, the latter
+// rendered through formatMaxFDs (a positive integer, or the
+// float64(math.MaxUint64) sentinel for an unlimited soft limit). The
+// always-present-metric assertions in TestWriteProcessMetrics
+// never check these two series, so the hasOpenFDs/hasMaxFDs emit composition and
+// the formatMaxFDs call site are otherwise unexercised end-to-end.
+func TestWriteProcessMetrics_LinuxFDsEmitted(t *testing.T) {
+	if runtime.GOOS != goosLinux {
+		t.Skip("process fd metrics are Linux-only (/proc/self/fd, /proc/self/limits)")
+	}
+	var b strings.Builder
+	WriteProcessMetrics(&b)
+
+	var openVal, maxVal string
+	var gotOpen, gotMax bool
+	for line := range strings.SplitSeq(b.String(), "\n") {
+		if v, ok := strings.CutPrefix(line, "process_open_fds "); ok {
+			openVal, gotOpen = v, true
+		}
+		if v, ok := strings.CutPrefix(line, "process_max_fds "); ok {
+			maxVal, gotMax = v, true
+		}
+	}
+	if !gotOpen {
+		t.Fatal("missing process_open_fds line")
+	}
+	if n, err := strconv.Atoi(openVal); err != nil || n < 0 {
+		t.Errorf("process_open_fds = %q, want a non-negative integer", openVal)
+	}
+	if !gotMax {
+		t.Fatal("missing process_max_fds line")
+	}
+	// process_max_fds is either a positive integer (a finite limit) or the
+	// unlimited sentinel rendered as float64(math.MaxUint64)
+	// ("1.8446744073709552e+19"), so parse it as a float rather than an int.
+	if n, err := strconv.ParseFloat(maxVal, 64); err != nil || n <= 0 {
+		t.Errorf("process_max_fds = %q, want a positive number", maxVal)
 	}
 }

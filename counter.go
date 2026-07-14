@@ -64,7 +64,7 @@ type LabeledCounter struct {
 // stay consistent (OpenMetrics always appends `_total` to the sample name).
 func NewLabeledCounter(name, help string, labels []string) *LabeledCounter {
 	validateMetricName(name)
-	validateLabelNames(labels)
+	labels = validateLabelNames(labels)
 	if len(labels) > 4 {
 		panic("metrics: LabeledCounter supports at most 4 labels")
 	}
@@ -130,6 +130,7 @@ func loadOrStore[V any](mu *sync.RWMutex, m map[labelKey]V, key labelKey, makeV 
 	if v, loaded = m[key]; loaded {
 		return v, true
 	}
+	validateLabelValues(key)
 	v = makeV()
 	m[key] = v
 	return v, false
