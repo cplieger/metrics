@@ -1,8 +1,10 @@
 package metrics
 
 import (
+	"encoding/binary"
 	"log/slog"
 	"math"
+	"math/bits"
 	"os"
 	"runtime"
 	"strconv"
@@ -15,7 +17,7 @@ import (
 // processStartTime is captured at package init as the fallback anchor for
 // process_start_time_seconds (and, via it, process_uptime_seconds) when the
 // kernel-derived start time cannot be read. On Linux the true start time comes
-// from /proc (btime + starttime/linuxUserHZ, see readProcStartTime); on other
+// from /proc (btime + starttime/USER_HZ, see readProcStartTime); on other
 // platforms or on any /proc parse failure this package-init instant is used
 // instead. Uptime is always reconciled as now - start so the documented
 // "start + uptime == now" invariant holds regardless of which source wins.
@@ -25,22 +27,68 @@ var processStartTime = time.Now()
 // /proc-based process metrics are expected to succeed.
 const goosLinux = "linux"
 
-// linuxUserHZ is the assumed value of sysconf(_SC_CLK_TCK), the unit in which
-// the Linux kernel reports per-process CPU time in /proc/self/stat (utime and
-// stime are counted in "clock ticks" of 1/USER_HZ seconds). USER_HZ is a
-// fixed kernel-to-userspace ABI constant of 100 on all modern Linux
-// architectures, independent of the kernel's internal CONFIG_HZ, so
-// process_cpu_seconds_total is computed as (utime+stime)/linuxUserHZ.
-//
-// This is deliberately a hardcoded constant rather than a runtime lookup:
-// reading the real sysconf(_SC_CLK_TCK) requires either cgo or
-// golang.org/x/sys/unix, and BOTH would violate this library's core "zero
-// runtime dependencies, standard library only" contract (go.mod has no
-// require). There is no pure-stdlib way to read _SC_CLK_TCK. The only
-// observable consequence of the assumption is that process_cpu_seconds_total is
-// scaled incorrectly on a legacy architecture whose USER_HZ is not 100 (e.g.
-// old alpha/ia64 ports); every other metric is unaffected.
-const linuxUserHZ = 100.0
+// defaultUserHZ is the USER_HZ fallback used when the auxiliary vector cannot
+// be read: 100 is the fixed kernel-to-userspace ABI value on all modern Linux
+// architectures, independent of the kernel's internal CONFIG_HZ.
+const defaultUserHZ = 100.0
+
+// auxvClkTckTag is the ELF auxiliary-vector tag for AT_CLKTCK: the value of
+// sysconf(_SC_CLK_TCK), i.e. USER_HZ, the unit in which the Linux kernel
+// reports per-process CPU time in /proc/self/stat.
+const auxvClkTckTag = 17
+
+// userHZ returns the kernel's USER_HZ — the clock-tick unit for utime/stime in
+// /proc/self/stat and starttime scaling — read once from the process's ELF
+// auxiliary vector (AT_CLKTCK in /proc/self/auxv, pure stdlib) and memoized.
+// When the auxiliary vector is absent or unreadable (non-Linux platforms, a
+// restricted /proc) it falls back to defaultUserHZ, preserving the historical
+// assumption that is correct on every modern Linux architecture.
+var userHZ = sync.OnceValue(func() float64 {
+	if hz := auxvClkTck("/proc/self/auxv"); hz > 0 {
+		return float64(hz)
+	}
+	return defaultUserHZ
+})
+
+// auxvClkTck reads the AT_CLKTCK entry from the ELF auxiliary vector at path.
+// Returns -1 when the file is unreadable or carries no usable entry.
+func auxvClkTck(path string) int64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return -1
+	}
+	return parseAuxvClkTck(data, bits.UintSize/8)
+}
+
+// parseAuxvClkTck scans an ELF auxiliary vector — a sequence of (tag, value)
+// pairs of native-endian unsigned words of wordSize bytes, terminated by an
+// AT_NULL (0) tag — for the AT_CLKTCK entry. Returns the clock-tick value, or
+// -1 when the entry is absent, zero, or the vector is malformed. wordSize must
+// be 4 or 8 (the two Linux ABI word sizes).
+func parseAuxvClkTck(data []byte, wordSize int) int64 {
+	if wordSize != 4 && wordSize != 8 {
+		return -1
+	}
+	word := func(b []byte) uint64 {
+		if wordSize == 8 {
+			return binary.NativeEndian.Uint64(b)
+		}
+		return uint64(binary.NativeEndian.Uint32(b))
+	}
+	for i := 0; i+2*wordSize <= len(data); i += 2 * wordSize {
+		tag, val := word(data[i:]), word(data[i+wordSize:])
+		switch tag {
+		case 0: // AT_NULL terminates the vector
+			return -1
+		case auxvClkTckTag:
+			if val == 0 || val > math.MaxInt64 {
+				return -1
+			}
+			return int64(val)
+		}
+	}
+	return -1
+}
 
 // unlimitedMaxFDs is the sentinel stored in processMetricsData.maxFDs when
 // /proc/self/limits reports the soft "Max open files" limit as the literal
@@ -87,8 +135,7 @@ type processMetricsData struct {
 }
 
 // Series-presence predicates used by processFamilies when materialising the
-// process-metric IR. Gating them in one place keeps both exposition formats
-// (encodePrometheus / encodeOpenMetrics) emitting the same optional series set.
+// process-metric IR, gating the optional series set in one place.
 func (d *processMetricsData) hasCPU() bool     { return d.cpuSeconds >= 0 }
 func (d *processMetricsData) hasRSS() bool     { return d.rss > 0 }
 func (d *processMetricsData) hasOpenFDs() bool { return d.openFDs >= 0 }
@@ -163,13 +210,8 @@ func collectProcessMetrics(d *processMetricsData) {
 // process_start_time_seconds are emitted on every platform.
 // process_cpu_seconds_total, process_resident_memory_bytes,
 // process_open_fds and process_max_fds are sourced from /proc and are
-// Linux-only; on other platforms they are silently omitted. CPU time is divided
-// by linuxUserHZ (see process_cpu_seconds_total's caveat).
-//
-// The two process counters (GC pause, CPU) carry their _total-suffixed names
-// verbatim, so the Prometheus encoder emits them unchanged while the
-// OpenMetrics encoder derives the _total-stripped base for the family lines —
-// the same dual rendering user counters get.
+// Linux-only; on other platforms they are silently omitted. CPU time is
+// divided by USER_HZ (see userHZ).
 func processFamilies() []metricFamily {
 	var d processMetricsData
 	collectProcessMetrics(&d)
@@ -221,11 +263,12 @@ func readProcCPUSeconds() float64 {
 		}
 		return -1
 	}
-	return parseProcStatCPU(data)
+	return parseProcStatCPU(data, userHZ())
 }
 
-// parseProcStatCPU parses /proc/self/stat content for utime+stime in seconds. Returns -1 on failure.
-func parseProcStatCPU(data []byte) float64 {
+// parseProcStatCPU parses /proc/self/stat content for utime+stime in seconds,
+// scaled by the given USER_HZ. Returns -1 on failure.
+func parseProcStatCPU(data []byte, hz float64) float64 {
 	// Fields after the comm (which may contain spaces/parens): find last ')'
 	s := string(data)
 	idx := strings.LastIndex(s, ")")
@@ -242,7 +285,7 @@ func parseProcStatCPU(data []byte) float64 {
 	if err1 != nil || err2 != nil {
 		return -1
 	}
-	return float64(utime+stime) / linuxUserHZ
+	return float64(utime+stime) / hz
 }
 
 // resolvedProcStartTime memoizes the kernel-derived process start time. Because
@@ -266,7 +309,7 @@ func resolvedProcStartTime() float64 {
 // readProcStartTime returns the true process start time in seconds since the
 // Unix epoch, derived from the kernel: the system boot time (btime, from
 // /proc/stat) plus the process starttime (field 22 of /proc/self/stat, in clock
-// ticks after boot) divided by linuxUserHZ. This matches how client_golang and
+// ticks after boot) divided by USER_HZ. This matches how client_golang and
 // procfs compute process_start_time_seconds. Returns -1 on any read or parse
 // failure (including non-Linux platforms, where the /proc files are absent) so
 // the caller can fall back to the package-init anchor.
@@ -293,7 +336,7 @@ func readProcStartTime() float64 {
 	if btime < 0 {
 		return -1
 	}
-	return float64(btime) + float64(ticks)/linuxUserHZ
+	return float64(btime) + float64(ticks)/userHZ()
 }
 
 // parseProcStatStartTime parses /proc/self/stat content for the process
@@ -428,8 +471,8 @@ func parseProcLimitsMaxFDs(data []byte) int64 {
 	return 0
 }
 
-// formatMaxFDs renders the soft "Max open files" limit as an
-// OpenMetrics/Prometheus gauge value. The unlimitedMaxFDs sentinel renders as
+// formatMaxFDs renders the soft "Max open files" limit as a Prometheus gauge
+// value. The unlimitedMaxFDs sentinel renders as
 // float64(math.MaxUint64) (the token "1.8446744073709552e+19"), matching what
 // client_golang emits for an unlimited limit; every other value is its decimal
 // form.

@@ -17,7 +17,7 @@ func FuzzParseProcStatCPU_CommRobustness(f *testing.F) {
 	f.Add("new\nline")
 	f.Fuzz(func(t *testing.T, comm string) {
 		stat := []byte("1234 (" + comm + ") S 0 0 0 0 0 0 0 0 0 0 200 100")
-		if got := parseProcStatCPU(stat); got != 3.0 {
+		if got := parseProcStatCPU(stat, 100); got != 3.0 {
 			t.Errorf("parseProcStatCPU with comm %q = %v, want 3.0", comm, got)
 		}
 	})

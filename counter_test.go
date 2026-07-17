@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"math"
 	"reflect"
 	"strings"
 	"sync"
@@ -25,19 +26,28 @@ func TestCounterAdd(t *testing.T) {
 	}
 }
 
-func TestNewCounter_TotalOnlyNameRejected(t *testing.T) {
-	// A counter named exactly "_total" has an empty base name, so its
-	// OpenMetrics encoding cannot be conformant (the sample name would equal
-	// the family name). Construction rejects it fail-fast.
-	mustPanicContaining(t, "empty base name", func() { NewCounter("_total", "h") })
-	mustPanicContaining(t, "empty base name", func() { NewLabeledCounter("_total", "h", []string{"k"}) })
-	// The guard is scoped to the exact name "_total": a normally suffixed
-	// counter still constructs fine.
-	if c := NewCounter("requests_total", "h"); c == nil {
-		t.Fatal("NewCounter(\"requests_total\") returned nil")
+func TestCounterSaturatesAtMaxInt64(t *testing.T) {
+	// A counter pushed past MaxInt64 pins to MaxInt64 instead of wrapping to a
+	// negative value, preserving the monotonic contract in the exposed series.
+	c := NewCounter("test_counter_saturate_total", "test")
+	c.Add(math.MaxInt64)
+	c.Add(math.MaxInt64) // would wrap negative without saturation
+	if got := c.val.Load(); got != math.MaxInt64 {
+		t.Errorf("Counter saturation: got %d, want MaxInt64", got)
 	}
-	if lc := NewLabeledCounter("api_requests_total", "h", []string{"k"}); lc == nil {
-		t.Fatal("NewLabeledCounter(\"api_requests_total\") returned nil")
+	c.Inc() // stays pinned
+	if got := c.val.Load(); got != math.MaxInt64 {
+		t.Errorf("Counter saturation after Inc: got %d, want MaxInt64", got)
+	}
+
+	lc := NewLabeledCounter("test_lcounter_saturate_total", "test", []string{"k"})
+	lc.Add(math.MaxInt64, "v")
+	lc.Add(math.MaxInt64, "v")
+	lc.mu.RLock()
+	v := lc.vals[labelKey{"v"}]
+	lc.mu.RUnlock()
+	if got := v.Load(); got != math.MaxInt64 {
+		t.Errorf("LabeledCounter saturation: got %d, want MaxInt64", got)
 	}
 }
 
@@ -94,19 +104,19 @@ func TestLabeledCounterArityPanic(t *testing.T) {
 func TestLabeledCounterTooManyLabelsPanic(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
-			t.Error("expected panic for >4 labels")
+			t.Error("expected panic for >8 labels")
 		}
 	}()
-	NewLabeledCounter("test_lc_many", "test", []string{"a", "b", "c", "d", "e"})
+	NewLabeledCounter("test_lc_many", "test", []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"})
 }
 
-// TestNewLabeledCounter_ExactlyFourLabelsAllowed pins the arity guard at its
-// inclusive maximum: four labels is the legal maximum (the guard is > 4).
-func TestNewLabeledCounter_ExactlyFourLabelsAllowed(t *testing.T) {
-	lc := NewLabeledCounter("mk_lc4_total", "test", []string{"a", "b", "c", "d"})
-	lc.Inc("1", "2", "3", "4") // must not panic with four labels
-	if got := lc.vals[labelKey{"1", "2", "3", "4"}].Load(); got != 1 {
-		t.Errorf("LabeledCounter[4 labels] = %d, want 1", got)
+// TestNewLabeledCounter_ExactlyMaxLabelsAllowed pins the arity guard at its
+// inclusive maximum: eight labels is the legal maximum (the guard is > 8).
+func TestNewLabeledCounter_ExactlyMaxLabelsAllowed(t *testing.T) {
+	lc := NewLabeledCounter("mk_lc8_total", "test", []string{"a", "b", "c", "d", "e", "f", "g", "h"})
+	lc.Inc("1", "2", "3", "4", "5", "6", "7", "8") // must not panic with eight labels
+	if got := lc.vals[labelKey{"1", "2", "3", "4", "5", "6", "7", "8"}].Load(); got != 1 {
+		t.Errorf("LabeledCounter[8 labels] = %d, want 1", got)
 	}
 }
 
@@ -470,7 +480,7 @@ func TestStoreNewSeries_doubleCheckLoadsExistingWithoutWarn(t *testing.T) {
 	name := "double_check_total"
 
 	made := false
-	v, loaded, w := storeNewSeries(&mu, m, &name, key, func() *int {
+	v, loaded, w := storeNewSeries(&mu, m, &name, &key, func() *int {
 		made = true
 		return new(int)
 	})

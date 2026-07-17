@@ -106,9 +106,8 @@ func FuzzRegistryFullExposition(f *testing.F) {
 }
 
 // FuzzLabeledExposition_balanced asserts that for any label value, the labeled
-// counter and gauge exposition (both Prometheus and OpenMetrics) keep braces
-// and quotes balanced — i.e. the label-value escaping can never break the line
-// structure.
+// counter and gauge exposition keep braces and quotes balanced — i.e. the
+// label-value escaping can never break the line structure.
 func FuzzLabeledExposition_balanced(f *testing.F) {
 	f.Add("simple", 1.0)
 	f.Add("with\"quote", 0.0)
@@ -138,12 +137,6 @@ func FuzzLabeledExposition_balanced(f *testing.F) {
 
 		b.Reset()
 		WriteLabeledGauge(&b, lg)
-		assertExpositionLabelsBalanced(t, b.String())
-
-		b.Reset()
-		if fam, famOK := lg.family(); famOK {
-			appendOpenMetrics(&b, []metricFamily{fam})
-		}
 		assertExpositionLabelsBalanced(t, b.String())
 	})
 }

@@ -10,18 +10,17 @@ import (
 )
 
 // goldenFixtureRegistry builds a deterministic registry exercising every metric
-// type (labeled + unlabeled) plus the escaping edge cases that differ between
-// the Prometheus 0.0.4 and OpenMetrics 1.0.0 formats. Process metrics are added
-// by the handlers automatically. The fixture is fully deterministic so the
-// user-metric portion of the exposition can be byte-compared against committed
-// golden files; process-metric VALUES are non-deterministic and are masked
-// before comparison (see maskProcessValues).
+// type (labeled + unlabeled) plus the Prometheus 0.0.4 escaping edge cases.
+// Process metrics are added by the handlers automatically. The fixture is fully
+// deterministic so the user-metric portion of the exposition can be
+// byte-compared against committed golden files; process-metric VALUES are
+// non-deterministic and are masked before comparison (see maskProcessValues).
 func goldenFixtureRegistry() *Registry {
 	r := NewRegistry("")
 
 	// Labeled counter, including a _total-suffixed name (the common convention)
 	// and a label value containing backslash, quote, and newline to lock label
-	// escaping (identical across both formats).
+	// escaping.
 	lc := NewLabeledCounter("http_requests_total", "Total HTTP requests", []string{"method", "path", "status"})
 	r.RegisterLabeledCounter(lc)
 	lc.Add(3, "GET", "/api", "200")
@@ -33,8 +32,8 @@ func goldenFixtureRegistry() *Registry {
 	r.RegisterCounter(tasks)
 	tasks.Add(42)
 
-	// Unlabeled counter WITHOUT _total suffix — exercises the OM _total append
-	// vs the Prometheus raw-name rendering (the dual family-name reservation).
+	// Unlabeled counter WITHOUT _total suffix — locks the raw-name rendering
+	// (no suffix is appended or stripped).
 	events := NewCounter("events", "Total events")
 	r.RegisterCounter(events)
 	events.Add(5)
@@ -56,8 +55,8 @@ func goldenFixtureRegistry() *Registry {
 	conns.Set(8)
 
 	// Unlabeled histogram with HELP text containing backslash, newline, and a
-	// double-quote — the quote is escaped in OpenMetrics HELP but NOT in
-	// Prometheus HELP, which is the key per-format escaping difference.
+	// double-quote — locks the HELP escaping rule (backslash and newline
+	// escaped, the double-quote left raw).
 	hist := NewHistogram("request_duration_seconds", "Request latency in \"seconds\"\nline2\\end", WithBuckets([]float64{0.1, 0.5, 1}))
 	r.RegisterHistogram(hist)
 	hist.Observe(0.05)
@@ -76,14 +75,14 @@ func goldenFixtureRegistry() *Registry {
 }
 
 // maskProcessValues normalises non-deterministic process-metric sample VALUES
-// so the exposition format (family ordering, TYPE/HELP lines and their order,
-// counter _total handling, sample series names, the # EOF trailer) can be
-// locked in a golden file while the volatile numeric values are ignored. Sample
-// lines whose series name begins with "process_" or "go_" (the built-in Go
-// runtime / process families, e.g. go_goroutines and
-// go_memstats_heap_alloc_bytes) are masked; comment lines (# HELP / # TYPE /
-// # EOF) are deterministic and pass through untouched. The fixture registers no
-// user metric under those prefixes, so the mask targets only the built-ins.
+// so the exposition format (family ordering, HELP/TYPE lines and their order,
+// sample series names) can be locked in a golden file while the volatile
+// numeric values are ignored. Sample lines whose series name begins with
+// "process_" or "go_" (the built-in Go runtime / process families, e.g.
+// go_goroutines and go_memstats_heap_alloc_bytes) are masked; comment lines
+// (# HELP / # TYPE) are deterministic and pass through untouched. The fixture
+// registers no user metric under those prefixes, so the mask targets only the
+// built-ins.
 func maskProcessValues(exposition string) string {
 	lines := strings.Split(exposition, "\n")
 	for i, line := range lines {
@@ -140,27 +139,14 @@ func TestGolden_PrometheusExposition(t *testing.T) {
 	assertGolden(t, "prometheus.golden", got)
 }
 
-// TestGolden_OpenMetricsExposition locks the OpenMetrics 1.0.0 exposition bytes.
-func TestGolden_OpenMetricsExposition(t *testing.T) {
-	r := goldenFixtureRegistry()
-	got := maskProcessValues(serve(t, r.OpenMetricsHandler()))
-	assertGolden(t, "openmetrics.golden", got)
-}
-
-// TestGolden_ContentTypes locks the per-format content types, which are part of
-// the exposition contract the IR encoders must preserve.
-func TestGolden_ContentTypes(t *testing.T) {
+// TestGolden_ContentType locks the exposition content type, which is part of
+// the contract the encoder must preserve.
+func TestGolden_ContentType(t *testing.T) {
 	r := goldenFixtureRegistry()
 
 	rec := httptest.NewRecorder()
 	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; version=0.0.4; charset=utf-8" {
 		t.Errorf("prometheus Content-Type = %q", ct)
-	}
-
-	rec = httptest.NewRecorder()
-	r.OpenMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	if ct := rec.Header().Get("Content-Type"); ct != OpenMetricsContentType {
-		t.Errorf("openmetrics Content-Type = %q", ct)
 	}
 }

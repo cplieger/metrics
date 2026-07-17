@@ -72,8 +72,8 @@ func NewLabeledGauge(name, help string, labels []string) *LabeledGauge {
 	validateMetricName(name)
 	help = sanitizeHelp(name, help)
 	labels = validateLabelNames(labels)
-	if len(labels) > 4 {
-		panic("metrics: LabeledGauge supports at most 4 labels")
+	if len(labels) > maxLabels {
+		panic("metrics: LabeledGauge supports at most 8 labels")
 	}
 	return &LabeledGauge{
 		name:   name,
@@ -86,7 +86,7 @@ func NewLabeledGauge(name, help string, labels []string) *LabeledGauge {
 // Set sets the gauge for the given label values.
 func (lg *LabeledGauge) Set(v float64, labelVals ...string) {
 	key := labelKeyFor(lg.labels, labelVals)
-	if ptr, loaded := loadOrStore(&lg.mu, lg.vals, &lg.name, key,
+	if ptr, loaded := loadOrStore(&lg.mu, lg.vals, &lg.name, &key,
 		func() *atomic.Uint64 { u := &atomic.Uint64{}; u.Store(math.Float64bits(v)); return u }); loaded {
 		ptr.Store(math.Float64bits(v))
 	}

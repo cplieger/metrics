@@ -11,15 +11,15 @@ import (
 
 func TestNewHistogram_defaultBuckets(t *testing.T) {
 	h := NewHistogram("default_hist", "test")
-	if !slices.Equal(h.bounds, DefaultBuckets) {
-		t.Errorf("NewHistogram no-opts bounds = %v, want DefaultBuckets %v", h.bounds, DefaultBuckets)
+	if !slices.Equal(h.bounds, DefaultBuckets()) {
+		t.Errorf("NewHistogram no-opts bounds = %v, want DefaultBuckets %v", h.bounds, DefaultBuckets())
 	}
 }
 
 func TestNewLabeledHistogram_defaultBuckets(t *testing.T) {
 	lh := NewLabeledHistogram("default_lh", "test", []string{"k"})
-	if !slices.Equal(lh.bounds, DefaultBuckets) {
-		t.Errorf("NewLabeledHistogram no-opts bounds = %v, want DefaultBuckets %v", lh.bounds, DefaultBuckets)
+	if !slices.Equal(lh.bounds, DefaultBuckets()) {
+		t.Errorf("NewLabeledHistogram no-opts bounds = %v, want DefaultBuckets %v", lh.bounds, DefaultBuckets())
 	}
 }
 
@@ -65,14 +65,14 @@ func TestNewHistogram_nilOptions(t *testing.T) {
 		if h.count.Load() != 1 {
 			t.Errorf("count = %d, want 1", h.count.Load())
 		}
-		if len(h.bounds) != len(DefaultBuckets) {
-			t.Errorf("bounds len = %d, want %d", len(h.bounds), len(DefaultBuckets))
+		if len(h.bounds) != len(DefaultBuckets()) {
+			t.Errorf("bounds len = %d, want %d", len(h.bounds), len(DefaultBuckets()))
 		}
 	})
 	t.Run("multiple nils use defaults", func(t *testing.T) {
 		h := NewHistogram("multi_nil_h", "test", nil, nil, nil)
-		if len(h.bounds) != len(DefaultBuckets) {
-			t.Errorf("bounds len = %d, want %d", len(h.bounds), len(DefaultBuckets))
+		if len(h.bounds) != len(DefaultBuckets()) {
+			t.Errorf("bounds len = %d, want %d", len(h.bounds), len(DefaultBuckets()))
 		}
 	})
 	t.Run("nil between real options, last wins", func(t *testing.T) {
@@ -494,22 +494,22 @@ func TestLabeledHistogram_ObserveArityPanic(t *testing.T) {
 func TestNewLabeledHistogram_TooManyLabelsPanics(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
-			t.Error("expected panic for >4 labels")
+			t.Error("expected panic for >8 labels")
 		}
 	}()
-	NewLabeledHistogram("lh_many", "test", []string{"a", "b", "c", "d", "e"})
+	NewLabeledHistogram("lh_many", "test", []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"})
 }
 
-// TestNewLabeledHistogram_ExactlyFourLabelsAllowed pins the arity guard at its
-// inclusive maximum: four labels is the legal maximum (the guard is > 4).
-func TestNewLabeledHistogram_ExactlyFourLabelsAllowed(t *testing.T) {
-	lh := NewLabeledHistogram("mk_lh4", "test", []string{"a", "b", "c", "d"})
-	lh.Observe(0.5, "1", "2", "3", "4") // must not panic with four labels
+// TestNewLabeledHistogram_ExactlyMaxLabelsAllowed pins the arity guard at its
+// inclusive maximum: eight labels is the legal maximum (the guard is > 8).
+func TestNewLabeledHistogram_ExactlyMaxLabelsAllowed(t *testing.T) {
+	lh := NewLabeledHistogram("mk_lh8", "test", []string{"a", "b", "c", "d", "e", "f", "g", "h"})
+	lh.Observe(0.5, "1", "2", "3", "4", "5", "6", "7", "8") // must not panic with eight labels
 
 	var b strings.Builder
 	WriteLabeledHistogram(&b, lh)
-	if out := b.String(); !strings.Contains(out, `a="1",b="2",c="3",d="4"`) {
-		t.Errorf("four-label histogram not exposed correctly:\n%s", out)
+	if out := b.String(); !strings.Contains(out, `a="1",b="2",c="3",d="4",e="5",f="6",g="7",h="8"`) {
+		t.Errorf("eight-label histogram not exposed correctly:\n%s", out)
 	}
 }
 
@@ -623,8 +623,24 @@ func TestLabeledHistogramNewTimer_ArityMismatchPanicsAtConstruction(t *testing.T
 }
 
 func TestAPIBucketsWide(t *testing.T) {
-	if APIBuckets[len(APIBuckets)-1] < 10 {
-		t.Errorf("APIBuckets should extend well past 1s for slow calls, got %v", APIBuckets)
+	buckets := APIBuckets()
+	if buckets[len(buckets)-1] < 10 {
+		t.Errorf("APIBuckets should extend well past 1s for slow calls, got %v", buckets)
+	}
+}
+
+// TestBucketAccessorsReturnFreshSlices verifies a caller mutating a returned
+// bucket slice cannot alter the boundaries later callers receive.
+func TestBucketAccessorsReturnFreshSlices(t *testing.T) {
+	d := DefaultBuckets()
+	d[0] = 99
+	if got := DefaultBuckets(); got[0] == 99 {
+		t.Error("DefaultBuckets: mutation of a returned slice leaked into later calls")
+	}
+	a := APIBuckets()
+	a[0] = 99
+	if got := APIBuckets(); got[0] == 99 {
+		t.Error("APIBuckets: mutation of a returned slice leaked into later calls")
 	}
 }
 

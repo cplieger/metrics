@@ -3,7 +3,7 @@ package metrics_test
 import (
 	"net/http"
 
-	"github.com/cplieger/metrics/v2"
+	"github.com/cplieger/metrics/v3"
 )
 
 func Example() {

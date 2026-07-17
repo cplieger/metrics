@@ -1,9 +1,7 @@
 // Package metrics provides a hand-rolled Prometheus text-format exposition library.
 // It requires only the Go standard library.
 //
-// Both Prometheus text format (0.0.4) and OpenMetrics text format (1.0.0) are supported.
-// Use Handler() for Prometheus format, OpenMetricsHandler() for OpenMetrics, or
-// NegotiateHandler() for automatic content negotiation based on the Accept header.
+// Metrics are exposed in Prometheus text format 0.0.4 via Handler().
 //
 // Registration order: complete all Register* calls before serving a custom
 // handler built on the low-level Write* functions. Write* reads the metric
@@ -14,7 +12,10 @@
 //
 // Unsupported by design (SKIP list):
 //   - Summary metric type: Prometheus best practices recommend histograms
-//   - Exemplars (OpenMetrics): niche; requires tracing integration
+//   - OpenMetrics exposition format and content negotiation: removed in v3; no
+//     consumer ever negotiated it, and Prometheus text is the scrape default
+//   - Exemplars: niche; requires tracing integration and OpenMetrics or
+//     protobuf exposition
 //   - Push / remote-write: all consumers are pull-based
 //   - Protobuf exposition format: text format is default in Prometheus 3.0
 //   - Native histograms (exponential buckets): requires protobuf format
@@ -39,37 +40,33 @@ import (
 var helpEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`)
 
 // Process metric family names, defined once so the reservation list
-// (processFamilyNames) and the process-metric IR builder (processFamilies,
-// rendered by both encoders) reference a single source and cannot drift.
+// (processFamilyNames) and the process-metric IR builder (processFamilies)
+// reference a single source and cannot drift.
 const (
 	pmGoroutines     = "go_goroutines"
 	pmHeapAllocBytes = "go_memstats_heap_alloc_bytes"
-	pmGCPause        = "process_gc_pause_seconds"
 	pmGCPauseTotal   = "process_gc_pause_seconds_total"
 	pmUptime         = "process_uptime_seconds"
 	pmStartTime      = "process_start_time_seconds"
-	pmCPU            = "process_cpu_seconds"
 	pmCPUTotal       = "process_cpu_seconds_total"
 	pmResidentBytes  = "process_resident_memory_bytes"
 	pmOpenFDs        = "process_open_fds"
 	pmMaxFDs         = "process_max_fds"
 )
 
-// processFamilyNames are the family names processFamilies emits
-// unconditionally. Reserved at creation so a user metric colliding with one fails fast like any
-// other duplicate instead of silently producing a duplicate "# TYPE" line that breaks the scrape.
-// Both the OM counter base and the Prometheus _total TYPE form are listed for the two process
-// counters, because a user counter normalizes to the base while a user gauge/histogram reserves
-// its name verbatim.
+// processFamilyNames are the family names processFamilies emits. Reserved at
+// creation so a user metric colliding with one fails fast like any other
+// duplicate instead of silently producing a duplicate "# TYPE" line that
+// breaks the scrape.
 var processFamilyNames = []string{
 	pmGoroutines, pmHeapAllocBytes,
-	pmGCPause, pmGCPauseTotal,
+	pmGCPauseTotal,
 	pmUptime, pmStartTime,
-	pmCPU, pmCPUTotal,
+	pmCPUTotal,
 	pmResidentBytes, pmOpenFDs, pmMaxFDs,
 }
 
-// Process metric HELP text, single-sourced so the Prometheus and OpenMetrics
+// Process metric HELP text, single-sourced so the reservation list and the
 // writers cannot expose divergent descriptions for the same family.
 const (
 	helpGoroutines = "Number of goroutines that currently exist."
@@ -122,13 +119,12 @@ func (r *Registry) prefixed(name string) string {
 
 // reserveName records the exposition family name a metric occupies and panics
 // if another metric already claims it. The family name is the identifier that
-// appears in the "# TYPE" line: counters normalize on their _total-stripped
-// base (so foo and foo_total are one family), every other type uses its name
+// appears in the "# TYPE" line; every metric type uses its registered name
 // verbatim. Family names must be unique across the whole registry and across
-// types, because a duplicate "# TYPE" line makes both Prometheus and
-// OpenMetrics parsers reject the entire scrape. Registration is fail-fast: a
-// collision is a programming error, like the panics in validateMetricName and
-// the label-arity guards. Callers must hold r.mu.
+// types, because a duplicate "# TYPE" line makes Prometheus parsers reject the
+// entire scrape. Registration is fail-fast: a collision is a programming
+// error, like the panics in validateMetricName and the label-arity guards.
+// Callers must hold r.mu.
 func (r *Registry) reserveName(family, kind string) {
 	if existing, ok := r.names[family]; ok {
 		panic(fmt.Sprintf("metrics: %s %q collides with already-registered %s; "+
@@ -147,17 +143,6 @@ func (r *Registry) reserveHistogramFamily(name, kind string) {
 	r.reserveName(name+"_count", kind)
 }
 
-// reserveCounterFamily reserves the OpenMetrics base name plus the _total
-// sample-series name a counter emits across both formats, mirroring
-// reserveHistogramFamily. Callers must hold r.mu.
-func (r *Registry) reserveCounterFamily(name, kind string) {
-	base := omCounterBaseName(name)
-	r.reserveName(base, kind)
-	if sample := omCounterSampleName(name); sample != base {
-		r.reserveName(sample, kind)
-	}
-}
-
 // RegisterCounter adds a counter to the registry.
 func (r *Registry) RegisterCounter(c *Counter) {
 	r.mu.Lock()
@@ -166,7 +151,7 @@ func (r *Registry) RegisterCounter(c *Counter) {
 		panic("metrics: counter already registered")
 	}
 	c.name = r.prefixed(c.name)
-	r.reserveCounterFamily(c.name, "counter")
+	r.reserveName(c.name, "counter")
 	r.counters = append(r.counters, c)
 }
 
@@ -192,7 +177,7 @@ func (r *Registry) RegisterLabeledCounter(lc *LabeledCounter) {
 	lc.mu.Lock()
 	lc.name = r.prefixed(lc.name)
 	lc.mu.Unlock()
-	r.reserveCounterFamily(lc.name, "labeled counter")
+	r.reserveName(lc.name, "labeled counter")
 	r.labeledCounters = append(r.labeledCounters, lc)
 }
 
@@ -247,16 +232,12 @@ func (r *Registry) Handler() http.HandlerFunc {
 	}
 }
 
-// formatValue renders a float64 metric value in the canonical form shared by
-// the Prometheus 0.0.4 and OpenMetrics 1.0.0 writers, so a given value is
-// exposed identically regardless of format. Non-finite values use the spec
-// tokens "+Inf"/"-Inf"/"NaN" (accepted case-insensitively by both formats per
-// the OpenMetrics ABNF). A finite value that is exactly integral and within the
-// int64-exact range renders as a bare integer (e.g. "42", "1718193600"); the
-// OpenMetrics ABNF's realnumber accepts a bare integer, so no ".0" is needed.
-// Everything else uses the shortest round-trippable form (strconv 'g'), which
-// preserves full precision and never floors a small magnitude to zero the way
-// the fixed-precision %.6f the Prometheus writers previously used did.
+// formatValue renders a float64 metric value in its canonical exposition form.
+// Non-finite values use the spec tokens "+Inf"/"-Inf"/"NaN". A finite value
+// that is exactly integral and within the int64-exact range renders as a bare
+// integer (e.g. "42", "1718193600"). Everything else uses the shortest
+// round-trippable form (strconv 'g'), which preserves full precision and never
+// floors a small magnitude to zero the way a fixed-precision %.6f would.
 func formatValue(v float64) string {
 	switch {
 	case math.IsInf(v, 1):

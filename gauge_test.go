@@ -116,22 +116,22 @@ func TestLabeledGauge_SetArityPanic(t *testing.T) {
 func TestNewLabeledGauge_TooManyLabelsPanics(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
-			t.Error("expected panic for >4 labels")
+			t.Error("expected panic for >8 labels")
 		}
 	}()
-	NewLabeledGauge("lg_many", "test", []string{"a", "b", "c", "d", "e"})
+	NewLabeledGauge("lg_many", "test", []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"})
 }
 
-// TestNewLabeledGauge_ExactlyFourLabelsAllowed pins the arity guard at its
-// inclusive maximum: four labels is the legal maximum (the guard is > 4).
-func TestNewLabeledGauge_ExactlyFourLabelsAllowed(t *testing.T) {
-	lg := NewLabeledGauge("mk_lg4", "test", []string{"a", "b", "c", "d"})
-	lg.Set(9, "1", "2", "3", "4") // must not panic with four labels
+// TestNewLabeledGauge_ExactlyMaxLabelsAllowed pins the arity guard at its
+// inclusive maximum: eight labels is the legal maximum (the guard is > 8).
+func TestNewLabeledGauge_ExactlyMaxLabelsAllowed(t *testing.T) {
+	lg := NewLabeledGauge("mk_lg8", "test", []string{"a", "b", "c", "d", "e", "f", "g", "h"})
+	lg.Set(9, "1", "2", "3", "4", "5", "6", "7", "8") // must not panic with eight labels
 
 	var b strings.Builder
 	WriteLabeledGauge(&b, lg)
-	if out := b.String(); !strings.Contains(out, `a="1",b="2",c="3",d="4"`) {
-		t.Errorf("four-label gauge not exposed correctly:\n%s", out)
+	if out := b.String(); !strings.Contains(out, `a="1",b="2",c="3",d="4",e="5",f="6",g="7",h="8"`) {
+		t.Errorf("eight-label gauge not exposed correctly:\n%s", out)
 	}
 }
 
@@ -157,7 +157,7 @@ func TestWriteGaugeFormat(t *testing.T) {
 }
 
 // TestGauge_specialValues checks the spec tokens for non-finite and signed-zero
-// gauge values render identically in Prometheus and OpenMetrics formats.
+// gauge values.
 func TestGauge_specialValues(t *testing.T) {
 	posInf := "+" + "Inf"
 	negInf := "-" + "Inf"
@@ -165,14 +165,13 @@ func TestGauge_specialValues(t *testing.T) {
 	tests := []struct {
 		name string
 		prom string
-		om   string
 		val  float64
 	}{
-		{name: "pos_inf", val: math.Inf(1), prom: posInf, om: posInf},
-		{name: "neg_inf", val: math.Inf(-1), prom: negInf, om: negInf},
-		{name: "nan", val: math.NaN(), prom: nanStr, om: nanStr},
-		{name: "zero", val: 0, prom: "0", om: "0"},
-		{name: "neg_zero", val: math.Copysign(0, -1), prom: "0", om: "0"},
+		{name: "pos_inf", val: math.Inf(1), prom: posInf},
+		{name: "neg_inf", val: math.Inf(-1), prom: negInf},
+		{name: "nan", val: math.NaN(), prom: nanStr},
+		{name: "zero", val: 0, prom: "0"},
+		{name: "neg_zero", val: math.Copysign(0, -1), prom: "0"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -184,13 +183,6 @@ func TestGauge_specialValues(t *testing.T) {
 			out := b.String()
 			if !strings.Contains(out, "rt6_special_"+tt.name+" "+tt.prom) {
 				t.Errorf("Prometheus: expected %q in:\n%s", tt.prom, out)
-			}
-
-			b.Reset()
-			appendOpenMetrics(&b, []metricFamily{g.family()})
-			omOut := b.String()
-			if !strings.Contains(omOut, "rt6_special_"+tt.name+" "+tt.om) {
-				t.Errorf("OpenMetrics: expected %q in:\n%s", tt.om, omOut)
 			}
 		})
 	}
@@ -347,24 +339,16 @@ func TestLabeledGauge_SetResetDelete_ConcurrentScrape(t *testing.T) {
 	wg.Wait()
 }
 
-// TestGauge_reservedSuffixNamesRenderVerbatim verifies the counter-only _total
-// handling never leaks to other metric types: a gauge whose name ends in _total
-// or _bucket is exposed under its exact name in both formats (no stripping, no
-// derived series).
+// TestGauge_reservedSuffixNamesRenderVerbatim verifies suffix conventions
+// never mangle other metric types: a gauge whose name ends in _total or
+// _bucket is exposed under its exact name (no stripping, no derived series).
 func TestGauge_reservedSuffixNamesRenderVerbatim(t *testing.T) {
 	gt := NewGauge("weird_total", "a gauge whose name ends in _total")
 	gt.Set(7)
 	var b strings.Builder
 	WriteGauge(&b, gt)
 	if out := b.String(); !strings.Contains(out, "# TYPE weird_total gauge") || !strings.Contains(out, "weird_total 7") {
-		t.Errorf("gauge named _total mangled (Prometheus):\n%s", out)
-	}
-	b.Reset()
-	appendOpenMetrics(&b, []metricFamily{gt.family()})
-	// The OM _total stripping is gated on the counter type; a gauge keeps its
-	// name verbatim in the TYPE line and the sample.
-	if out := b.String(); !strings.Contains(out, "# TYPE weird_total gauge") || !strings.Contains(out, "weird_total 7") {
-		t.Errorf("gauge named _total mangled (OpenMetrics):\n%s", out)
+		t.Errorf("gauge named _total mangled:\n%s", out)
 	}
 
 	gb := NewGauge("my_bucket", "a gauge whose name ends in _bucket")

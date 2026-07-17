@@ -10,25 +10,37 @@ import (
 	"time"
 )
 
-// DefaultBuckets are the default histogram bucket boundaries (HTTP latency).
-var DefaultBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0}
+// DefaultBuckets returns the default histogram bucket boundaries (HTTP
+// latency). Each call returns a fresh slice, so callers cannot mutate the
+// defaults process-wide.
+func DefaultBuckets() []float64 {
+	return []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0}
+}
 
-// APIBuckets are coarse latency buckets (seconds) for outbound API calls and
-// slow collect/scan cycles, where DefaultBuckets (max 1.0s) saturates at +Inf.
-var APIBuckets = []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
+// APIBuckets returns coarse latency buckets (seconds) for outbound API calls
+// and slow collect/scan cycles, where DefaultBuckets (max 1.0s) saturates at
+// +Inf. Each call returns a fresh slice, so callers cannot mutate the
+// boundaries process-wide.
+func APIBuckets() []float64 {
+	return []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
+}
 
 // histogramCfg holds optional configuration for histogram construction.
 type histogramCfg struct {
-	buckets []float64
+	buckets    []float64
+	bucketsSet bool
 }
 
 // Option configures optional histogram parameters.
 type Option func(*histogramCfg)
 
-// WithBuckets returns an Option that sets custom bucket boundaries for a histogram.
+// WithBuckets returns an Option that sets custom bucket boundaries for a
+// histogram. An empty (or nil) slice yields a histogram with only the implicit
+// +Inf bucket.
 func WithBuckets(buckets []float64) Option {
 	return func(cfg *histogramCfg) {
 		cfg.buckets = buckets
+		cfg.bucketsSet = true
 	}
 }
 
@@ -36,9 +48,9 @@ func WithBuckets(buckets []float64) Option {
 // strictly increasing sequence of finite values. The writers append the
 // implicit le="+Inf" bucket, so callers must not include +Inf (nor any other
 // non-finite value), and duplicate or out-of-order bounds would emit duplicate
-// or non-monotonic le series that Prometheus and OpenMetrics parsers reject,
-// dropping the whole scrape. Bucket bounds are fixed at construction by the
-// programmer, so a violation is a programmer error and panics, consistent with
+// or non-monotonic le series that Prometheus parsers reject, dropping the
+// whole scrape. Bucket bounds are fixed at construction by the programmer, so
+// a violation is a programmer error and panics, consistent with
 // validateMetricName. The empty bound set is valid: it yields a histogram with
 // only the implicit +Inf bucket.
 func validateBuckets(bounds []float64) {
@@ -52,26 +64,23 @@ func validateBuckets(bounds []float64) {
 	}
 }
 
-// resolveBuckets applies the histogram options over DefaultBuckets, validates the
+// resolveBuckets applies the histogram options, falling back to
+// DefaultBuckets when no WithBuckets option was supplied, validates the
 // resulting bounds, and returns an owned clone. Shared by NewHistogram and
-// NewLabeledHistogram so the default-seed and nil-option-skip invariant is single-sourced.
+// NewLabeledHistogram so the default-seed and nil-option-skip invariant is
+// single-sourced.
 func resolveBuckets(opts []Option) []float64 {
-	cfg := histogramCfg{buckets: DefaultBuckets}
+	var cfg histogramCfg
 	for _, o := range opts {
 		if o != nil {
 			o(&cfg)
 		}
 	}
+	if !cfg.bucketsSet {
+		cfg.buckets = DefaultBuckets()
+	}
 	validateBuckets(cfg.buckets)
 	return slices.Clone(cfg.buckets)
-}
-
-// hasNegativeBounds reports whether a validated bound set contains a negative
-// bucket threshold. Bounds are strictly increasing (validateBuckets), so
-// checking the first element suffices. Shared by NewHistogram and
-// NewLabeledHistogram to seed negBounds.
-func hasNegativeBounds(bounds []float64) bool {
-	return len(bounds) > 0 && bounds[0] < 0
 }
 
 // Histogram tracks a distribution using cumulative buckets and atomic CAS for sum.
@@ -83,13 +92,6 @@ type Histogram struct {
 	sumBits    atomic.Uint64
 	count      atomic.Int64
 	registered atomic.Bool
-	// negBounds records at construction whether bounds contains a negative
-	// threshold. It drives the OpenMetrics-only omission of the _sum and
-	// _count samples per the OpenMetrics 1.0 negative-threshold rule
-	// ("Negative threshold buckets MAY be used, but then the Histogram
-	// MetricPoint MUST NOT contain a sum value", and _count is emitted if and
-	// only if _sum is). Prometheus text format is unaffected.
-	negBounds bool
 	// mu is used with inverted RWMutex semantics: Observe holds RLock (writers
 	// mutate sum/count/buckets via atomics, so they run concurrently), while
 	// snapshot holds the exclusive Lock to read a consistent view with no
@@ -104,14 +106,12 @@ func NewHistogram(name, help string, opts ...Option) *Histogram {
 	validateMetricName(name)
 	help = sanitizeHelp(name, help)
 	bounds := resolveBuckets(opts)
-	h := &Histogram{
-		name:      name,
-		help:      help,
-		bounds:    bounds,
-		buckets:   make([]atomic.Int64, len(bounds)+1),
-		negBounds: hasNegativeBounds(bounds),
+	return &Histogram{
+		name:    name,
+		help:    help,
+		bounds:  bounds,
+		buckets: make([]atomic.Int64, len(bounds)+1),
 	}
-	return h
 }
 
 // Observe records a value in the histogram.
@@ -132,7 +132,7 @@ func (h *Histogram) Observe(seconds float64) {
 }
 
 // snapshot atomically reads sum, count, and per-bucket counts under the
-// histogram lock. Shared by the four Prometheus/OpenMetrics histogram emitters.
+// histogram lock. Shared by the histogram family builders and writers.
 func (h *Histogram) snapshot() (sum float64, count int64, bucketVals []int64) {
 	h.mu.Lock()
 	sum = math.Float64frombits(h.sumBits.Load())
@@ -152,15 +152,11 @@ func WriteHistogram(b *strings.Builder, h *Histogram) {
 
 // LabeledHistogram tracks histograms per label combination.
 type LabeledHistogram struct {
-	vals   map[labelKey]*Histogram
-	name   string
-	help   string
-	bounds []float64
-	labels []string
-	// negBounds mirrors Histogram.negBounds for the shared bound set: it
-	// drives the OpenMetrics-only _sum/_count omission per the OpenMetrics
-	// negative-threshold rule. Prometheus text format is unaffected.
-	negBounds  bool
+	vals       map[labelKey]*Histogram
+	name       string
+	help       string
+	bounds     []float64
+	labels     []string
 	registered atomic.Bool
 	mu         sync.RWMutex
 }
@@ -176,30 +172,27 @@ func NewLabeledHistogram(name, help string, labels []string, opts ...Option) *La
 			panic(`metrics: LabeledHistogram label name "le" is reserved for the bucket bound`)
 		}
 	}
-	if len(labels) > 4 {
-		panic("metrics: LabeledHistogram supports at most 4 labels")
+	if len(labels) > maxLabels {
+		panic("metrics: LabeledHistogram supports at most 8 labels")
 	}
-	bounds := resolveBuckets(opts)
 	return &LabeledHistogram{
-		name:      name,
-		help:      help,
-		labels:    labels,
-		bounds:    bounds,
-		negBounds: hasNegativeBounds(bounds),
-		vals:      make(map[labelKey]*Histogram),
+		name:   name,
+		help:   help,
+		labels: labels,
+		bounds: resolveBuckets(opts),
+		vals:   make(map[labelKey]*Histogram),
 	}
 }
 
 // Observe records a value for the given label values.
 func (lh *LabeledHistogram) Observe(seconds float64, labelVals ...string) {
 	key := labelKeyFor(lh.labels, labelVals)
-	h, _ := loadOrStore(&lh.mu, lh.vals, &lh.name, key, func() *Histogram {
+	h, _ := loadOrStore(&lh.mu, lh.vals, &lh.name, &key, func() *Histogram {
 		return &Histogram{
-			name:      lh.name,
-			help:      lh.help,
-			bounds:    lh.bounds,
-			buckets:   make([]atomic.Int64, len(lh.bounds)+1),
-			negBounds: lh.negBounds,
+			name:    lh.name,
+			help:    lh.help,
+			bounds:  lh.bounds,
+			buckets: make([]atomic.Int64, len(lh.bounds)+1),
 		}
 	})
 	h.Observe(seconds)
