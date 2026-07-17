@@ -136,7 +136,7 @@ Numeric values render through a single canonical formatter: whole values as bare
 | Feature                                     | Reason                                                                                                                                              |
 | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Summary metric type**                     | Prometheus best practices recommend histograms; complex windowed-quantile implementation for no consumer benefit                                    |
-| **OpenMetrics exposition + negotiation**    | Removed in v3: no consumer ever negotiated it, and Prometheus text is the scrape default. The v2 line retains it                                     |
+| **OpenMetrics exposition + negotiation**    | Removed in v3: no consumer ever negotiated it, and Prometheus text is the scrape default. The v2 line retains it                                    |
 | **Exemplars**                               | Niche; requires tracing integration and OpenMetrics or protobuf exposition                                                                          |
 | **Push / remote-write**                     | All consumers are pull-based                                                                                                                        |
 | **Protobuf exposition format**              | Text format is default in Prometheus 3.0; protobuf requires code generation                                                                         |
