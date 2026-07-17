@@ -5,53 +5,45 @@ conventions), see the linked policies at the bottom.
 
 ## What this library is
 
-A hand-rolled Prometheus / OpenMetrics text-exposition library with **zero
-dependencies** — standard library only (`go.mod` declares no `require` block).
-Keep it that way: a new third-party import is a design change, not a routine
-addition. The package is flat (one Go package at the repo root); there are no
-subpackages or `cmd/` binaries.
+A hand-rolled Prometheus text-exposition library with **zero dependencies** —
+standard library only (`go.mod` declares no `require` block). Keep it that
+way: a new third-party import is a design change, not a routine addition. The
+package is flat (one Go package at the repo root); there are no subpackages or
+`cmd/` binaries.
 
 ## Architecture you need to know before editing
 
 The public surface is documented in `README.md`; the load-bearing internals are
 not, and they are easy to break:
 
-- **One neutral IR, two thin per-format encoders.** A scrape is materialised
-  once into a format-neutral intermediate representation — `[]metricFamily`,
-  each family carrying its name, type, HELP, and a slice of `sample`s
-  (`exposition.go`). Every metric type has a `family()` snapshot method
-  (`exposition.go`) that reuses the shared model (`Histogram.snapshot`,
-  `sortedLabelKeys`, `buildLabelString`, `collectProcessMetrics`); the registry
-  walks its six metric slices plus process metrics once in `Registry.collect`.
-  Two thin encoders then render that IR: `encodePrometheus` (text `0.0.4`) and
-  `encodeOpenMetrics` (`1.0.0`), each owning ONLY the genuinely format-specific
-  bits — HELP/TYPE line order (OpenMetrics emits `# TYPE` before `# HELP`), HELP
-  escaping (`omHelpEscaper` also escapes `"`, `helpEscaper` does not), the
-  counter `_total` suffix (`omCounterBaseName`/`omCounterSampleName` — base name
-  on the family lines, `_total` on the sample series), and the mandatory
-  trailing `# EOF` (OpenMetrics only). Because values and label strings are
-  pre-rendered in the IR by the shared `formatValue` (`metrics.go`) and
-  `buildLabelString`, both formats render numbers and labels identically:
-  whole finite values as bare integers (e.g. `42`, no `.0`), others in shortest
-  round-trippable form, `+Inf`/`-Inf`/`NaN` for non-finite. A per-format float
-  formatter is a bug, not a feature — keep value rendering single-sourced.
-  Exposition output is byte-locked by golden fixtures (`testdata/*.golden`,
-  `golden_test.go`); regenerate them with `UPDATE_GOLDEN=1 go test` only after a
-  deliberate, reviewed format change. The exported `Write*` functions
-  (`counter.go`, `gauge.go`, `histogram.go`, `process.go`) remain as thin shims
-  over the IR + encoders because they are public API; unexported test-only
-  wrappers are not kept — tests call the encoder
-  (`appendOpenMetrics`) directly.
-- **Label storage is a fixed-size key.** `labelKey` is `[4]string`, so a metric
-  supports **at most 4 labels** — constructors panic past that. Label values
+- **One neutral IR, one thin encoder.** A scrape is materialised once into an
+  intermediate representation — `[]metricFamily`, each family carrying its
+  name, type, HELP, and a slice of `sample`s (`exposition.go`). Every metric
+  type has a `family()` snapshot method (`exposition.go`) that reuses the
+  shared model (`Histogram.snapshot`, `sortedLabelKeys`, `buildLabelString`,
+  `collectProcessMetrics`); the registry walks its six metric slices plus
+  process metrics once in `Registry.collect`. `encodePrometheus` (text
+  `0.0.4`) then renders that IR. Values and label strings are pre-rendered in
+  the IR by the shared `formatValue` (`metrics.go`) and `buildLabelString`:
+  whole finite values as bare integers (e.g. `42`, no `.0`), others in
+  shortest round-trippable form, `+Inf`/`-Inf`/`NaN` for non-finite. Keep
+  value rendering single-sourced. Exposition output is byte-locked by a golden
+  fixture (`testdata/prometheus.golden`, `golden_test.go`); regenerate it with
+  `UPDATE_GOLDEN=1 go test` only after a deliberate, reviewed format change.
+  The exported `Write*` functions (`counter.go`, `gauge.go`, `histogram.go`,
+  `process.go`) remain as thin shims over the IR + encoder because they are
+  public API.
+- **Label storage is a fixed-size key.** `labelKey` is `[8]string`, so a metric
+  supports **at most 8 labels** — constructors panic past that. Label values
   are copied into the array and the rendered label string is always sorted by
   label name (`buildLabelString`) for deterministic output.
 - **Name, arity, and bucket validation are fail-fast panics, by design.**
   Metric/label names are validated at construction (`validate.go`);
   `Inc`/`Observe`/`Set` panic on label-arity mismatch; `Counter.Add` panics on
-  a negative delta; registering two metrics whose exposition family names
-  collide panics (`reserveName`, including the pre-seeded `process_*` family
-  names); histogram bucket bounds panic unless strictly increasing and finite.
+  a negative delta (and saturates at `math.MaxInt64` instead of wrapping);
+  registering two metrics whose exposition family names collide panics
+  (`reserveName`, including the pre-seeded `process_*` family names);
+  histogram bucket bounds panic unless strictly increasing and finite.
   Tests assert these panics — don't soften them to error returns. Invalid
   UTF-8 is deliberately NOT in that set: label values and help text are
   sanitized with the Unicode replacement character (U+FFFD) by the shared
@@ -91,10 +83,9 @@ go vet ./...
 ```
 
 Tests live beside the code they cover (standard Go layout), including
-conformance tests (`openmetrics_test.go`), golden-file exposition locks
-(`golden_test.go` + `testdata/*.golden`), and an executable README example
-(`example_test.go`). Run a fuzz target directly when touching parsing,
-validation, or escaping:
+golden-file exposition locks (`golden_test.go` + `testdata/prometheus.golden`)
+and an executable README example (`example_test.go`). Run a fuzz target
+directly when touching parsing, validation, or escaping:
 
 ```sh
 go test -run '^$' -fuzz FuzzLabeledExposition_balanced -fuzztime 30s
@@ -102,12 +93,10 @@ go test -run '^$' -fuzz FuzzLabeledExposition_balanced -fuzztime 30s
 
 Available fuzz targets include `FuzzMetricNameValidation`,
 `FuzzLabelNameValidation`, `FuzzLabelValueValidation`,
-`FuzzPrometheusHelpExposition`, `FuzzOpenMetricsHelpExposition`,
-`FuzzOpenMetricsLabelExposition`, `FuzzLabeledExposition_balanced`,
+`FuzzPrometheusHelpExposition`, `FuzzLabeledExposition_balanced`,
 `FuzzRegistryFullExposition`, `FuzzHistogramObserve`,
-`FuzzHistogram_BucketPlacementInvariant`, `FuzzFormatValueRoundTrip`,
-`FuzzAcceptsOpenMetrics`, and the `/proc` parser targets in
-`process_fuzz_test.go`.
+`FuzzHistogram_BucketPlacementInvariant`, `FuzzFormatValueRoundTrip`, and the
+`/proc` parser targets in `process_fuzz_test.go`.
 
 ## Linting and formatting
 
@@ -136,9 +125,7 @@ from `cplieger/ci` and carry `DO NOT EDIT` headers. Change them upstream in
 
 Branch from `main`, keep changes focused with tests, and open a PR. Commits
 follow [Conventional Commits](https://www.conventionalcommits.org/) (parsed by
-git-cliff for releases): `feat:`, `fix:`, `sec:`, `docs:`, etc. Because the two
-write paths mirror each other, a single logical change often touches both
-`*.go` and `openmetrics.go` — keep them in one commit.
+git-cliff for releases): `feat:`, `fix:`, `sec:`, `docs:`, etc.
 
 ## Conduct & security
 

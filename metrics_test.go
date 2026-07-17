@@ -142,25 +142,13 @@ func TestRegistry_DuplicateRegistrationPanics(t *testing.T) {
 			r.RegisterCounter(NewCounter("dup_total", "first"))
 			r.RegisterCounter(NewCounter("dup_total", "second"))
 		}},
-		{name: "counter base-name collision (reqs vs reqs_total)", register: func(r *Registry) {
-			r.RegisterCounter(NewCounter("reqs", "first"))
-			r.RegisterCounter(NewCounter("reqs_total", "second"))
+		{name: "counter vs labeled counter, identical name", register: func(r *Registry) {
+			r.RegisterCounter(NewCounter("hits_total", "first"))
+			r.RegisterLabeledCounter(NewLabeledCounter("hits_total", "second", []string{"x"}))
 		}},
 		{name: "counter vs gauge, same family", register: func(r *Registry) {
 			r.RegisterCounter(NewCounter("widgets", "first"))
 			r.RegisterGauge(NewGauge("widgets", "second"))
-		}},
-		{name: "counter vs labeled counter, same base", register: func(r *Registry) {
-			r.RegisterCounter(NewCounter("hits_total", "first"))
-			r.RegisterLabeledCounter(NewLabeledCounter("hits", "second", []string{"x"}))
-		}},
-		{name: "counter _total base collides with plain gauge", register: func(r *Registry) {
-			r.RegisterCounter(NewCounter("http_total", "first"))
-			r.RegisterGauge(NewGauge("http", "second"))
-		}},
-		{name: "plain gauge collides with later counter _total base", register: func(r *Registry) {
-			r.RegisterGauge(NewGauge("http", "first"))
-			r.RegisterCounter(NewCounter("http_total", "second"))
 		}},
 		{name: "gauge vs histogram, same name", register: func(r *Registry) {
 			r.RegisterGauge(NewGauge("latency", "first"))
@@ -205,12 +193,12 @@ func TestRegistry_PrefixScopesFamilyNames(t *testing.T) {
 	a.RegisterCounter(NewCounter("reqs", "x"))
 	b.RegisterCounter(NewCounter("reqs", "x"))
 
-	// Within a single prefixed registry, a base-name collision still panics:
-	// app_reqs (from "reqs") vs app_reqs (the base of "reqs_total").
+	// Within a single prefixed registry, an identical prefixed name still
+	// panics: app_reqs vs app_reqs.
 	mustPanicContaining(t, "collides", func() {
 		r := NewRegistry("app")
 		r.RegisterCounter(NewCounter("reqs", "x"))
-		r.RegisterCounter(NewCounter("reqs_total", "y"))
+		r.RegisterCounter(NewCounter("reqs", "y"))
 	})
 }
 
@@ -272,23 +260,18 @@ func TestRegistry_ProcessFamilyNamesAreGuarded(t *testing.T) {
 	})
 }
 
-// TestRegisterCounter_ReservesDerivedTotalSeries verifies a counter NOT named
-// with _total reserves both its base name and the derived _total sample series,
-// so a later metric colliding with that series fails fast.
-func TestRegisterCounter_ReservesDerivedTotalSeries(t *testing.T) {
+// TestRegisterCounter_VerbatimNameReservation locks the v3 semantics: a
+// counter reserves ONLY its registered name (no derived _total normalization),
+// so a base name and its _total-suffixed sibling are distinct families across
+// all metric types.
+func TestRegisterCounter_VerbatimNameReservation(t *testing.T) {
 	r := NewRegistry("")
-	r.RegisterCounter(NewCounter("mk_events", "events")) // reserves mk_events AND mk_events_total
-	mustPanicContaining(t, "collides", func() {
-		r.RegisterGauge(NewGauge("mk_events_total", "collides with the counter's _total series"))
-	})
-}
-
-func TestRegisterLabeledCounter_ReservesDerivedTotalSeries(t *testing.T) {
-	r := NewRegistry("")
+	r.RegisterCounter(NewCounter("mk_events", "events"))
+	r.RegisterGauge(NewGauge("mk_events_total", "a distinct family in Prometheus text format"))
+	r.RegisterCounter(NewCounter("mk_reqs", "first"))
+	r.RegisterCounter(NewCounter("mk_reqs_total", "a second, distinct counter family"))
 	r.RegisterLabeledCounter(NewLabeledCounter("mk_hits", "hits", []string{"m"}))
-	mustPanicContaining(t, "collides", func() {
-		r.RegisterGauge(NewGauge("mk_hits_total", "collides with the labeled counter's _total series"))
-	})
+	r.RegisterGauge(NewGauge("mk_hits_total", "also distinct"))
 }
 
 // TestHandler_logsOnWriteError verifies a failed Prometheus exposition write is
@@ -354,7 +337,6 @@ func TestRegistry_FullHandler_ResetDelete_Concurrent(t *testing.T) {
 	})
 
 	handler := r.Handler()
-	omHandler := r.OpenMetricsHandler()
 	wg.Go(func() {
 		for {
 			select {
@@ -373,7 +355,7 @@ func TestRegistry_FullHandler_ResetDelete_Concurrent(t *testing.T) {
 				return
 			default:
 				rec := httptest.NewRecorder()
-				omHandler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+				handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 			}
 		}
 	})

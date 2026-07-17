@@ -1,6 +1,6 @@
 # metrics
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/metrics/v2.svg)](https://pkg.go.dev/github.com/cplieger/metrics/v2)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/metrics/v3.svg)](https://pkg.go.dev/github.com/cplieger/metrics/v3)
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/metrics)](https://github.com/cplieger/metrics/blob/main/go.mod)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/metrics/badges/coverage.json)](https://github.com/cplieger/metrics/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/metrics/badges/mutation.json)](https://github.com/cplieger/metrics/issues?q=label%3Agremlins-tracker)
@@ -9,12 +9,12 @@
 
 > Hand-rolled Prometheus text-format exposition library for Go
 
-A lightweight, zero-dependency metrics library that exposes counters, gauges, labeled counters, histograms, and process metrics in Prometheus text format (with optional OpenMetrics negotiation). Standard library only.
+A lightweight, zero-dependency metrics library that exposes counters, gauges, labeled counters, histograms, and process metrics in Prometheus text format. Standard library only.
 
 ## Install
 
 ```sh
-go get github.com/cplieger/metrics/v2
+go get github.com/cplieger/metrics/v3
 ```
 
 ## Usage
@@ -27,7 +27,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cplieger/metrics/v2"
+	"github.com/cplieger/metrics/v3"
 )
 
 func main() {
@@ -72,18 +72,17 @@ func main() {
 
 ## API
 
-### Constants & Variables
+### Bucket presets
 
-- `DefaultBuckets []float64` — HTTP-latency buckets (`0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0`).
-- `APIBuckets []float64` — coarse buckets for outbound API calls and slow collect/scan cycles (`0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30`); use when DefaultBuckets would saturate everything in `+Inf`.
-- `OpenMetricsContentType string` — `application/openmetrics-text; version=1.0.0; charset=utf-8`.
+- `DefaultBuckets() []float64` — HTTP-latency buckets (`0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0`). Returns a fresh slice on every call.
+- `APIBuckets() []float64` — coarse buckets for outbound API calls and slow collect/scan cycles (`0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30`); use when DefaultBuckets would saturate everything in `+Inf`. Returns a fresh slice on every call.
 
 ### Counters
 
-- `NewCounter(name, help) *Counter` — monotonic counter; `Inc()`, `Add(n int64)`.
+- `NewCounter(name, help) *Counter` — monotonic counter; `Inc()`, `Add(n int64)`. Saturates at `math.MaxInt64` instead of wrapping negative.
 - `NewLabeledCounter(name, help, labels) *LabeledCounter` — `Inc(vals...)`, `Add(int64, vals...)`, `Delete(vals...)`, `Reset()`; panics on label-arity mismatch.
 
-Counter names must not be exactly `_total` (rejected at construction; the OpenMetrics base name would be empty).
+Per Prometheus convention, counter names should end in `_total`. Labeled metrics support at most 8 label names (a documented product limit; construction panics beyond it).
 
 ### Gauges
 
@@ -108,21 +107,19 @@ Counter names must not be exactly `_total` (rejected at construction; the OpenMe
 
 `RecordHTTP` is the metrics-side hook: pair it with middleware that captures the response status — [webhttp](https://github.com/cplieger/webhttp) (its `StatusRecorder` plus `Logging`'s `WithRecordMetric`), or any middleware of your own that knows the final status — and call `RecordHTTP` from there with caller-owned labels.
 
-Label values are caller-owned and should be valid UTF-8 (Prometheus/OpenMetrics require it). The library never panics on invalid UTF-8: a label value that is not valid UTF-8 is sanitized at record time with the Unicode replacement character (U+FFFD, `�`) and a warning naming the metric is logged when the sanitized series is first created (repeat records of an already-seen value do not re-warn). Two consequences of sanitizing: distinct raw values that sanitize to the same string merge into one series, and records carrying invalid UTF-8 always take the slower series-creation path — so template or validate values derived from untrusted input (raw request paths, header contents) before use. Label values from untrusted input are also a cardinality risk: every distinct label combination allocates a series that is retained until `Delete`/`Reset`, so labeling by raw request path or header content lets a client grow memory and scrape size without bound — template paths to a fixed route set before use.
+Label values are caller-owned and should be valid UTF-8 (the Prometheus exposition format requires it). The library never panics on invalid UTF-8: a label value that is not valid UTF-8 is sanitized at record time with the Unicode replacement character (U+FFFD, `�`) and a warning naming the metric is logged when the sanitized series is first created (repeat records of an already-seen value do not re-warn). Two consequences of sanitizing: distinct raw values that sanitize to the same string merge into one series, and records carrying invalid UTF-8 always take the slower series-creation path — so template or validate values derived from untrusted input (raw request paths, header contents) before use. Label values from untrusted input are also a cardinality risk: every distinct label combination allocates a series that is retained until `Delete`/`Reset`, so labeling by raw request path or header content lets a client grow memory and scrape size without bound — template paths to a fixed route set before use.
 
 ### Registry
 
 - `NewRegistry(prefix) *Registry` — every registered metric name is prefixed with `<prefix>_` (process metrics excepted). Pass `""` for no prefix.
 - `Register{Counter,Gauge,LabeledCounter,LabeledGauge,Histogram,LabeledHistogram}`.
 - `Handler()` — Prometheus text format 0.0.4.
-- `OpenMetricsHandler()` — OpenMetrics 1.0.0.
-- `NegotiateHandler()` — responds with OpenMetrics when the `Accept` header requests it, otherwise Prometheus text.
 
 ### Process metrics (emitted automatically)
 
 - `go_goroutines`, `go_memstats_heap_alloc_bytes`, `process_gc_pause_seconds_total`, `process_uptime_seconds`, `process_start_time_seconds` (the goroutine and heap-alloc names match `client_golang`).
 - Linux only: `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds`, `process_max_fds`.
-  - Caveat: `process_cpu_seconds_total` assumes `USER_HZ` (`sysconf(_SC_CLK_TCK)`) = 100. `USER_HZ` is a fixed kernel ABI constant of 100 on all modern Linux architectures (independent of the kernel's internal `CONFIG_HZ`); only legacy ports (e.g. alpha/ia64) differ, where the value would be scaled by a constant factor. Reading the real value would require cgo or `golang.org/x/sys`, which the zero-dependency contract excludes.
+  - `USER_HZ` (`sysconf(_SC_CLK_TCK)`), the unit for CPU-time and start-time scaling, is read once from the process's ELF auxiliary vector (`AT_CLKTCK` in `/proc/self/auxv` — pure standard library). When the auxiliary vector is unavailable, the library falls back to 100, the fixed kernel ABI value on all modern Linux architectures.
 
 ### Low-level writers
 
@@ -132,16 +129,15 @@ Label values are caller-owned and should be valid UTF-8 (Prometheus/OpenMetrics 
 
 Valid Prometheus text exposition format 0.0.4: label values escape only `\`, `"`, and `\n` (as `\\`, `\"`, `\n`); HELP text escapes `\` and `\n`; metric/label names are validated at creation (panic on invalid); label arity is enforced (panic on mismatch); label values are always exposed as valid UTF-8 (invalid input is sanitized with U+FFFD and warned when the degraded series is first created); HELP text is also exposed as valid UTF-8 (invalid input is sanitized with U+FFFD and warned at construction); neither path panics; duplicate metric family names panic at registration (fail-fast, including the reserved `process_*` names); histogram bucket bounds are validated at creation (panic unless strictly increasing and finite); histograms always include a `+Inf` bucket equal to `_count`.
 
-OpenMetrics 1.0.0 support: content-type `application/openmetrics-text; version=1.0.0; charset=utf-8`, mandatory trailing `# EOF`, TYPE before HELP, counter samples use the `_total` suffix. Numeric values render through a single canonical formatter shared by both formats, so a given value is exposed identically: whole values as bare integers (e.g. `42`), other values in shortest round-trippable form, and `+Inf`/`-Inf`/`NaN` for non-finite. Use `NegotiateHandler()` for content negotiation, `OpenMetricsHandler()` for direct OpenMetrics output.
-
-Histograms constructed with negative bucket bounds omit their `_sum` and `_count` samples from OpenMetrics exposition, per the spec's negative-threshold rule ("Negative threshold buckets MAY be used, but then the Histogram MetricPoint MUST NOT contain a sum value", with `_count` emitted if and only if `_sum` is). The observation count remains available as the `le="+Inf"` bucket value; Prometheus text format is unaffected and exposes both samples. Declare negative bounds if you observe negative values — as with client_golang, observations outside your declared bucket range remain the caller's conformance responsibility.
+Numeric values render through a single canonical formatter: whole values as bare integers (e.g. `42`), other values in shortest round-trippable form, and `+Inf`/`-Inf`/`NaN` for non-finite.
 
 ## Unsupported by design (SKIP list)
 
 | Feature                                     | Reason                                                                                                                                              |
 | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Summary metric type**                     | Prometheus best practices recommend histograms; complex windowed-quantile implementation for no consumer benefit                                    |
-| **Exemplars (OpenMetrics)**                 | Niche; requires tracing integration                                                                                                                 |
+| **OpenMetrics exposition + negotiation**    | Removed in v3: no consumer ever negotiated it, and Prometheus text is the scrape default. The v2 line retains it                                     |
+| **Exemplars**                               | Niche; requires tracing integration and OpenMetrics or protobuf exposition                                                                          |
 | **Push / remote-write**                     | All consumers are pull-based                                                                                                                        |
 | **Protobuf exposition format**              | Text format is default in Prometheus 3.0; protobuf requires code generation                                                                         |
 | **Native histograms (exponential buckets)** | Requires protobuf format; large specialized implementation                                                                                          |

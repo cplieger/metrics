@@ -1,7 +1,10 @@
 package metrics
 
 import (
+	"encoding/binary"
+	"fmt"
 	"math"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -50,7 +53,7 @@ func TestParseProcStatCPU(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := parseProcStatCPU([]byte(tc.in))
+			got := parseProcStatCPU([]byte(tc.in), 100)
 			if got != tc.want {
 				t.Errorf("parseProcStatCPU(%q) = %v, want %v", tc.in, got, tc.want)
 			}
@@ -327,7 +330,7 @@ func TestProcPresencePredicates_Boundaries(t *testing.T) {
 // so idx == 0 must still parse.
 func TestParseProcStatCPU_LeadingParenIdxZero(t *testing.T) {
 	in := []byte(") 0 0 0 0 0 0 0 0 0 0 0 200 100")
-	if got := parseProcStatCPU(in); got != 3.0 {
+	if got := parseProcStatCPU(in, 100); got != 3.0 {
 		t.Errorf("parseProcStatCPU(%q) = %v, want 3.0 (idx == 0 must parse)", in, got)
 	}
 }
@@ -336,31 +339,105 @@ func TestParseProcStatCPU_LeadingParenIdxZero(t *testing.T) {
 // rather than slicing out of range.
 func TestParseProcStatCPU_TrailingParenGuarded(t *testing.T) {
 	in := []byte("1234 (cat)")
-	if got := parseProcStatCPU(in); got != -1 {
+	if got := parseProcStatCPU(in, 100); got != -1 {
 		t.Errorf("parseProcStatCPU(%q) = %v, want -1 (trailing ')' guarded)", in, got)
 	}
 }
 
-func TestLinuxUserHZ_Value(t *testing.T) {
-	if linuxUserHZ != 100.0 {
-		t.Errorf("linuxUserHZ = %v, want 100 (the near-universal Linux _SC_CLK_TCK)", linuxUserHZ)
+func TestUserHZ_Value(t *testing.T) {
+	if defaultUserHZ != 100.0 {
+		t.Errorf("defaultUserHZ = %v, want 100 (the near-universal Linux _SC_CLK_TCK)", defaultUserHZ)
+	}
+	// On any modern Linux CI/dev machine the auxv-derived value must agree
+	// with the ABI constant; elsewhere the fallback yields the same 100.
+	if got := userHZ(); got != 100.0 {
+		t.Errorf("userHZ() = %v, want 100", got)
 	}
 }
 
-// TestParseProcStatCPU_DivisorIsLinuxUserHZ verifies parseProcStatCPU scales
-// utime+stime by the linuxUserHZ constant: the result equals
-// (utime+stime)/linuxUserHZ exactly.
-func TestParseProcStatCPU_DivisorIsLinuxUserHZ(t *testing.T) {
+// buildAuxv assembles a synthetic ELF auxiliary vector from (tag, value) pairs
+// in native endianness at the given word size.
+func buildAuxv(wordSize int, pairs ...[2]uint64) []byte {
+	buf := make([]byte, 0, len(pairs)*2*wordSize)
+	for _, p := range pairs {
+		for _, w := range p {
+			if wordSize == 8 {
+				buf = binary.NativeEndian.AppendUint64(buf, w)
+			} else {
+				buf = binary.NativeEndian.AppendUint32(buf, uint32(w))
+			}
+		}
+	}
+	return buf
+}
+
+func TestParseAuxvClkTck(t *testing.T) {
+	for _, ws := range []int{4, 8} {
+		t.Run(fmt.Sprintf("wordsize_%d", ws), func(t *testing.T) {
+			tests := []struct {
+				name string
+				data []byte
+				want int64
+			}{
+				{"clktck_present", buildAuxv(ws, [2]uint64{6, 4096}, [2]uint64{auxvClkTckTag, 100}, [2]uint64{0, 0}), 100},
+				{"clktck_first", buildAuxv(ws, [2]uint64{auxvClkTckTag, 250}, [2]uint64{0, 0}), 250},
+				{"terminated_before_clktck", buildAuxv(ws, [2]uint64{6, 4096}, [2]uint64{0, 0}, [2]uint64{auxvClkTckTag, 100}), -1},
+				{"absent", buildAuxv(ws, [2]uint64{6, 4096}, [2]uint64{0, 0}), -1},
+				{"zero_value_rejected", buildAuxv(ws, [2]uint64{auxvClkTckTag, 0}, [2]uint64{0, 0}), -1},
+				{"empty", nil, -1},
+				{"truncated_pair", buildAuxv(ws, [2]uint64{6, 4096})[:ws+1], -1},
+			}
+			for _, tc := range tests {
+				t.Run(tc.name, func(t *testing.T) {
+					if got := parseAuxvClkTck(tc.data, ws); got != tc.want {
+						t.Errorf("parseAuxvClkTck(%s, %d) = %d, want %d", tc.name, ws, got, tc.want)
+					}
+				})
+			}
+		})
+	}
+	if got := parseAuxvClkTck(buildAuxv(8, [2]uint64{auxvClkTckTag, 100}), 5); got != -1 {
+		t.Errorf("parseAuxvClkTck with unsupported word size = %d, want -1", got)
+	}
+}
+
+// TestAuxvClkTck_RealFile reads the live /proc/self/auxv on Linux and expects
+// the kernel's AT_CLKTCK (100 on every modern architecture); elsewhere the
+// reader must return -1.
+func TestAuxvClkTck_RealFile(t *testing.T) {
+	got := auxvClkTck("/proc/self/auxv")
+	if runtime.GOOS == goosLinux {
+		if got != 100 {
+			t.Errorf("auxvClkTck(/proc/self/auxv) = %d, want 100", got)
+		}
+	} else if got != -1 {
+		t.Errorf("auxvClkTck on non-Linux = %d, want -1", got)
+	}
+}
+
+func TestAuxvClkTck_MissingFile(t *testing.T) {
+	if got := auxvClkTck(filepath.Join(t.TempDir(), "absent")); got != -1 {
+		t.Errorf("auxvClkTck(absent) = %d, want -1", got)
+	}
+}
+
+// TestParseProcStatCPU_DivisorIsUserHZ verifies parseProcStatCPU scales
+// utime+stime by the supplied USER_HZ: the result equals (utime+stime)/hz
+// exactly.
+func TestParseProcStatCPU_DivisorIsUserHZ(t *testing.T) {
 	const utime, stime = 200, 100
 	stat := []byte("1 (test proc) S 0 0 0 0 0 0 0 0 0 0 200 100")
 
-	got := parseProcStatCPU(stat)
-	want := float64(utime+stime) / linuxUserHZ
+	got := parseProcStatCPU(stat, 100)
+	want := float64(utime+stime) / 100
 	if math.Abs(got-want) > 1e-12 {
-		t.Errorf("parseProcStatCPU = %v, want (utime+stime)/linuxUserHZ = %v", got, want)
+		t.Errorf("parseProcStatCPU = %v, want (utime+stime)/hz = %v", got, want)
 	}
 	if math.Abs(got-3.0) > 1e-12 {
 		t.Errorf("parseProcStatCPU = %v, want 3.0 (300 ticks / 100)", got)
+	}
+	if got := parseProcStatCPU(stat, 250); math.Abs(got-1.2) > 1e-12 {
+		t.Errorf("parseProcStatCPU at hz=250 = %v, want 1.2 (300 ticks / 250)", got)
 	}
 }
 

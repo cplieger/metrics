@@ -1,7 +1,6 @@
 package metrics
 
 import (
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -53,7 +52,7 @@ func TestLabeledHistogramFamily_skipsConcurrentlyDeletedKey(t *testing.T) {
 	if !ok {
 		t.Fatal("family() ok = false, want true (a live key remains)")
 	}
-	wantSamples := len(DefaultBuckets) + 3 // finite buckets + +Inf + _sum + _count
+	wantSamples := len(DefaultBuckets()) + 3 // finite buckets + +Inf + _sum + _count
 	if len(fam.samples) != wantSamples {
 		t.Fatalf("family() emitted %d samples, want %d (nil-valued key must be skipped)", len(fam.samples), wantSamples)
 	}
@@ -187,9 +186,8 @@ func TestCollect_capacityGauges(t *testing.T) {
 	}
 }
 
-// TestEncoders_bothFormats_allTypes verifies every metric type appears in both
-// exposition formats and that the format-specific trailer differs: OpenMetrics
-// ends with "# EOF", Prometheus does not.
+// TestEncoders_bothFormats_allTypes verifies every metric type appears in the
+// exposition and that no OpenMetrics-style "# EOF" trailer is emitted.
 func TestEncoders_bothFormats_allTypes(t *testing.T) {
 	r := NewRegistry("")
 	c := NewCounter("parity_counter", "A counter")
@@ -218,31 +216,20 @@ func TestEncoders_bothFormats_allTypes(t *testing.T) {
 	r.Handler().ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	prom := rec1.Body.String()
 
-	rec2 := httptest.NewRecorder()
-	r.OpenMetricsHandler().ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	om := rec2.Body.String()
-
 	for _, name := range []string{"parity_counter", "parity_gauge", "parity_hist", "parity_lc", "parity_lg", "parity_lh"} {
 		if !strings.Contains(prom, name) {
 			t.Errorf("Prometheus missing %s", name)
 		}
-		if !strings.Contains(om, name) {
-			t.Errorf("OpenMetrics missing %s", name)
-		}
 	}
 
-	if !strings.HasSuffix(om, "# EOF\n") {
-		t.Error("OpenMetrics missing EOF")
-	}
 	if strings.Contains(prom, "# EOF") {
 		t.Error("Prometheus should not have EOF")
 	}
 }
 
-// TestHelpEscaping_PrometheusVsOpenMetrics locks the one HELP-escaping
-// difference between the formats: Prometheus escapes backslash and newline but
-// leaves the double-quote raw, while OpenMetrics also escapes the double-quote.
-func TestHelpEscaping_PrometheusVsOpenMetrics(t *testing.T) {
+// TestHelpEscaping_Prometheus locks the HELP-escaping contract: Prometheus
+// escapes backslash and newline but leaves the double-quote raw.
+func TestHelpEscaping_Prometheus(t *testing.T) {
 	help := "line1\\line2\nline3\"quoted\""
 	c := NewCounter("help_esc", help)
 	c.Inc()
@@ -251,35 +238,5 @@ func TestHelpEscaping_PrometheusVsOpenMetrics(t *testing.T) {
 	WriteCounter(&b, c)
 	if out := b.String(); !strings.Contains(out, `# HELP help_esc line1\\line2\nline3"quoted"`) {
 		t.Errorf("Prometheus HELP escaping wrong:\n%s", out)
-	}
-
-	b.Reset()
-	appendOpenMetrics(&b, []metricFamily{c.family()})
-	if omOut := b.String(); !strings.Contains(omOut, `# HELP help_esc line1\\line2\nline3\"quoted\"`) {
-		t.Errorf("OpenMetrics HELP escaping wrong:\n%s", omOut)
-	}
-}
-
-// TestOMLEValue_canonicalNumbers pins the OpenMetrics Canonical Numbers le
-// formatter directly: whole bounds (positive, zero, negative) gain ".0",
-// fractional and exponent-form bounds pass through, +Inf keeps the spec token.
-func TestOMLEValue_canonicalNumbers(t *testing.T) {
-	tests := []struct {
-		want  string
-		bound float64
-	}{
-		{want: "1.0", bound: 1},
-		{want: "10.0", bound: 10},
-		{want: "0.0", bound: 0},
-		{want: "-10.0", bound: -10},
-		{want: "0.5", bound: 0.5},
-		{want: "0.005", bound: 0.005},
-		{want: "1e+16", bound: 1e16},
-		{want: "+Inf", bound: math.Inf(1)},
-	}
-	for _, tt := range tests {
-		if got := omLEValue(tt.bound); got != tt.want {
-			t.Errorf("omLEValue(%v) = %q, want %q", tt.bound, got, tt.want)
-		}
 	}
 }

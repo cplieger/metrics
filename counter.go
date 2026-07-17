@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -23,41 +24,48 @@ type Counter struct {
 	registered atomic.Bool
 }
 
-// NewCounter creates a named counter. Per Prometheus/OpenMetrics convention the name
-// should end in `_total` (e.g. "http_requests_total"). OpenMetrics output always appends
-// `_total` to the sample name, so a counter NOT named with `_total` is exposed under a
-// different series name in Prometheus format (raw name) than in OpenMetrics format
-// (name+"_total"). Naming counters with `_total` keeps both formats consistent.
+// NewCounter creates a named counter. Per Prometheus convention the name
+// should end in `_total` (e.g. "http_requests_total").
 func NewCounter(name, help string) *Counter {
 	validateMetricName(name)
-	rejectTotalOnlyCounterName(name)
 	help = sanitizeHelp(name, help)
 	return &Counter{name: name, help: help}
 }
 
-// rejectTotalOnlyCounterName panics when a counter is named exactly "_total".
-// Stripping the conventional suffix leaves an empty base name, so the
-// OpenMetrics encoding cannot be conformant (the sample name would equal the
-// family name). Counters are the only metric type with this restriction.
-func rejectTotalOnlyCounterName(name string) {
-	if name == "_total" {
-		panic(`metrics: counter name "_total" has an empty base name; OpenMetrics cannot encode it`)
-	}
-}
+// Inc increments the counter by 1. The counter saturates at math.MaxInt64
+// instead of wrapping negative.
+func (c *Counter) Inc() { addSaturating(&c.val, 1) }
 
-// Inc increments the counter by 1.
-func (c *Counter) Inc() { c.val.Add(1) }
-
-// Add increments the counter by n. Panics if n < 0.
+// Add increments the counter by n. Panics if n < 0. The counter saturates at
+// math.MaxInt64 instead of wrapping negative.
 func (c *Counter) Add(n int64) {
 	if n < 0 {
 		panic("metrics: Counter.Add called with negative value")
 	}
-	c.val.Add(n)
+	addSaturating(&c.val, n)
 }
 
+// addSaturating adds n (>= 0) to v, clamping at math.MaxInt64 on overflow.
+// Counters are monotonic and start at zero, so a negative result after adding
+// a non-negative n can only mean two's-complement wraparound; the value is
+// pinned to MaxInt64 so the exposed series never violates the monotonic
+// contract. The correction is a plain Store: every competing writer that
+// observes the wrap stores the same MaxInt64, and once pinned there the
+// counter stays pinned (MaxInt64 + n wraps negative again and is re-pinned).
+func addSaturating(v *atomic.Int64, n int64) {
+	if v.Add(n) < 0 {
+		v.Store(math.MaxInt64)
+	}
+}
+
+// maxLabels is the per-metric label-name cap. labelKey is a fixed-size array
+// so series lookups stay allocation-free and the map key stays comparable;
+// the cap is a documented product limit (Prometheus best practice keeps label
+// counts far below it).
+const maxLabels = 8
+
 // labelKey is a fixed-size struct key for labeled metrics.
-type labelKey [4]string
+type labelKey [maxLabels]string
 
 // labelKeyFor validates arity and packs label values into a fixed-size key.
 func labelKeyFor(labels, labelVals []string) labelKey {
@@ -79,16 +87,14 @@ type LabeledCounter struct {
 	mu         sync.RWMutex
 }
 
-// NewLabeledCounter creates a labeled counter with the given label names. As with
-// NewCounter, name should end in `_total` so the Prometheus and OpenMetrics series names
-// stay consistent (OpenMetrics always appends `_total` to the sample name).
+// NewLabeledCounter creates a labeled counter with the given label names. As
+// with NewCounter, the name should end in `_total` per Prometheus convention.
 func NewLabeledCounter(name, help string, labels []string) *LabeledCounter {
 	validateMetricName(name)
-	rejectTotalOnlyCounterName(name)
 	help = sanitizeHelp(name, help)
 	labels = validateLabelNames(labels)
-	if len(labels) > 4 {
-		panic("metrics: LabeledCounter supports at most 4 labels")
+	if len(labels) > maxLabels {
+		panic("metrics: LabeledCounter supports at most 8 labels")
 	}
 	return &LabeledCounter{
 		name:   name,
@@ -104,14 +110,15 @@ func (lc *LabeledCounter) Inc(labelVals ...string) {
 }
 
 // Add increments the counter for the given label values by n. Panics if n < 0.
+// Each series saturates at math.MaxInt64 instead of wrapping negative.
 func (lc *LabeledCounter) Add(n int64, labelVals ...string) {
 	if n < 0 {
 		panic("metrics: LabeledCounter.Add called with negative value")
 	}
 	key := labelKeyFor(lc.labels, labelVals)
-	if v, loaded := loadOrStore(&lc.mu, lc.vals, &lc.name, key,
+	if v, loaded := loadOrStore(&lc.mu, lc.vals, &lc.name, &key,
 		func() *atomic.Int64 { a := &atomic.Int64{}; a.Store(n); return a }); loaded {
-		v.Add(n)
+		addSaturating(v, n)
 	}
 }
 
@@ -151,9 +158,9 @@ func WriteCounter(b *strings.Builder, c *Counter) {
 // each event and the name read is synchronized with the mutex-guarded rename
 // in Register*; the warnings themselves are emitted AFTER the write lock is
 // released so arbitrary slog handler code never runs under the metric lock.
-func loadOrStore[V any](mu *sync.RWMutex, m map[labelKey]V, name *string, key labelKey, makeV func() V) (v V, loaded bool) {
+func loadOrStore[V any](mu *sync.RWMutex, m map[labelKey]V, name *string, key *labelKey, makeV func() V) (v V, loaded bool) {
 	mu.RLock()
-	v, loaded = m[key]
+	v, loaded = m[*key]
 	mu.RUnlock()
 	if loaded {
 		return v, true
@@ -181,12 +188,10 @@ type seriesWarnings struct {
 	card     bool   // this insert pushed the map exactly to cardinalityWarnThreshold
 }
 
-// sanitizeLabelKey runs sanitizeUTF8 over each of key's values. It returns the
-// sanitized key, one representative sanitized value (truncated via
-// maxLogValueLen for logging), and whether any value changed.
-func sanitizeLabelKey(key labelKey) (labelKey, string, bool) {
-	var rep string
-	changed := false
+// sanitizeLabelKey runs sanitizeUTF8 over each of key's values, rewriting them
+// in place. It returns one representative sanitized value (truncated via
+// maxLogValueLen for logging) and whether any value changed.
+func sanitizeLabelKey(key *labelKey) (rep string, changed bool) {
 	for i, v := range key {
 		san, ch := sanitizeUTF8(v)
 		if !ch {
@@ -198,11 +203,12 @@ func sanitizeLabelKey(key labelKey) (labelKey, string, bool) {
 		}
 		changed = true
 	}
-	return key, rep, changed
+	return rep, changed
 }
 
-// storeNewSeries sanitizes key's label values to valid UTF-8 and inserts the
-// sanitized key under the write lock (double-checked). The raw key is never
+// storeNewSeries sanitizes key's label values to valid UTF-8 (in place, so the
+// caller's key holds the sanitized values afterwards) and inserts the sanitized
+// key under the write lock (double-checked). A raw invalid-UTF-8 key is never
 // stored, so records carrying invalid UTF-8 always miss loadOrStore's RLock
 // fast path and re-take this slow path, landing on the same sanitized series —
 // deliberate: degraded input gets the slow path. Distinct raw values may merge
@@ -212,15 +218,15 @@ func sanitizeLabelKey(key labelKey) (labelKey, string, bool) {
 // actually CREATED a new series (the double-check-found path never warns), and
 // w.card fires when this insert pushed the map exactly to
 // cardinalityWarnThreshold. The defer keeps the unlock on a makeV panic path.
-func storeNewSeries[V any](mu *sync.RWMutex, m map[labelKey]V, name *string, key labelKey, makeV func() V) (v V, loaded bool, w seriesWarnings) {
-	sanKey, sanValue, sanitized := sanitizeLabelKey(key)
+func storeNewSeries[V any](mu *sync.RWMutex, m map[labelKey]V, name *string, key *labelKey, makeV func() V) (v V, loaded bool, w seriesWarnings) {
+	sanValue, sanitized := sanitizeLabelKey(key)
 	mu.Lock()
 	defer mu.Unlock()
-	if v, loaded = m[sanKey]; loaded {
+	if v, loaded = m[*key]; loaded {
 		return v, true, seriesWarnings{}
 	}
 	v = makeV()
-	m[sanKey] = v
+	m[*key] = v
 	if sanitized {
 		w.san = true
 		w.sanValue = sanValue
@@ -240,7 +246,7 @@ func storeNewSeries[V any](mu *sync.RWMutex, m map[labelKey]V, name *string, key
 // the series recording created. Shared by the three labeled Delete methods.
 func deleteSeries[V any](mu *sync.RWMutex, m map[labelKey]V, labels, labelVals []string) {
 	key := labelKeyFor(labels, labelVals)
-	key, _, _ = sanitizeLabelKey(key)
+	sanitizeLabelKey(&key)
 	mu.Lock()
 	delete(m, key)
 	mu.Unlock()
@@ -265,7 +271,7 @@ func sortedLabelKeys[V any](mu *sync.RWMutex, vals map[labelKey]V) []labelKey {
 }
 
 // buildLabelString builds a sorted, spec-escaped label string from labels and key.
-func buildLabelString(labels []string, key labelKey) string {
+func buildLabelString(labels []string, key *labelKey) string {
 	type lp struct{ k, v string }
 	pairs := make([]lp, len(labels))
 	for i, l := range labels {

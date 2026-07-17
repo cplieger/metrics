@@ -7,31 +7,14 @@ import (
 	"strings"
 )
 
-// This file defines the neutral metric-family intermediate representation (IR)
-// and the two per-format encoders that materialise a scrape.
+// This file defines the metric-family intermediate representation (IR) and the
+// Prometheus text-format encoder that materialises a scrape.
 //
 // The scrape pipeline is: collect the registry's metrics into a flat
-// []metricFamily once (Registry.collect), then hand that slice to exactly one
-// encoder — encodePrometheus for text format 0.0.4 or encodeOpenMetrics for
-// OpenMetrics 1.0.0. The IR is format-neutral: every value and label string is
-// pre-rendered in its canonical, format-independent form (formatValue for
-// floats, %d for integers, buildLabelString for labels — all identical across
-// both formats), so the encoders only differ in the genuinely format-specific
-// bits:
-//
-//   - HELP/TYPE line ORDER (Prometheus: HELP then TYPE; OpenMetrics: TYPE then HELP)
-//   - HELP escaping (Prometheus does not escape the double-quote; OpenMetrics does)
-//   - counter naming (OpenMetrics strips _total for the TYPE/HELP family name and
-//     ensures _total on the sample series; Prometheus uses the registered name verbatim)
-//   - histogram _sum/_count omission for negative bucket bounds (OpenMetrics only,
-//     via metricFamily.omitOMSumCount): the OpenMetrics 1.0 spec forbids a sum
-//     value when negative threshold buckets are used, and _count is emitted if
-//     and only if _sum is; Prometheus text format has no such rule and emits both
-//   - the trailing "# EOF\n" (OpenMetrics only)
-//
-// Counters carry their registered name verbatim in metricFamily.name (the
-// _total-suffixed form for the two process counters); the OpenMetrics encoder
-// derives the base/sample names from it via omCounterBaseName/omCounterSampleName.
+// []metricFamily once (Registry.collect), then hand that slice to
+// encodePrometheus (text format 0.0.4). Every value and label string in the IR
+// is pre-rendered in its canonical form (formatValue for floats, %d for
+// integers, buildLabelString for labels), so the encoder only assembles lines.
 
 // Metric type discriminators used in the "# TYPE" line.
 const (
@@ -41,68 +24,25 @@ const (
 )
 
 // metricFamily is one "# TYPE"/"# HELP" block: a metric name, its type, its
-// HELP text (raw, escaped per-format by the encoder), and the samples it emits.
+// HELP text (raw, escaped by the encoder), and the samples it emits.
 type metricFamily struct {
 	name    string
 	typ     string
 	help    string
 	samples []sample
-	// omitOMSumCount marks a histogram family constructed with negative bucket
-	// bounds: the OpenMetrics encoder skips its _sum and _count samples per the
-	// spec's negative-threshold rule (see the package comment above), while the
-	// Prometheus encoder emits them unchanged. Always false for non-histograms.
-	omitOMSumCount bool
 }
 
 // sample is a single exposition line within a family. nameSuffix is appended to
 // the family's series base name ("" for counters and gauges; "_bucket"/"_sum"/
-// "_count" for histograms). labels is the pre-rendered, spec-escaped USER label
-// content WITHOUT the surrounding braces and WITHOUT the implicit le label ("" when
-// the sample has no user labels). value is the pre-rendered value token
-// (formatValue output or a base-10 integer), identical across both exposition
-// formats.
-//
-// Histogram bucket samples set isBucket and carry the numeric bucket bound in
-// leBound; the implicit le label is NOT pre-rendered into labels but formatted
-// per-format by the encoder (leString): Prometheus text uses formatValue (a
-// bare integer bound stays le="1"), while OpenMetrics applies the Canonical
-// Numbers rule (an integer bound becomes le="1.0"). All other samples leave
-// isBucket false and leBound unused.
+// "_count" for histograms). labels is the pre-rendered, spec-escaped label
+// content WITHOUT the surrounding braces — for histogram bucket samples it
+// already includes the implicit le label ("" when the sample has no labels).
+// value is the pre-rendered value token (formatValue output or a base-10
+// integer).
 type sample struct {
 	nameSuffix string
 	labels     string
 	value      string
-	leBound    float64
-	isBucket   bool
-}
-
-// leString returns the sample's full label content (user labels plus the
-// implicit le label) for a bucket sample, formatting the le bound with the
-// given per-format formatter; for a non-bucket sample it returns the user
-// labels unchanged.
-func (s *sample) leString(leFmt func(float64) string) string {
-	if !s.isBucket {
-		return s.labels
-	}
-	return leLabels(s.labels, leFmt(s.leBound))
-}
-
-// omLEValue formats a histogram le bucket bound per the OpenMetrics Canonical
-// Numbers rule, matching client_golang's writeOpenMetricsFloat: the value uses
-// the library's shared shortest-round-trip form (formatValue), and a trailing
-// ".0" is appended when that rendering has neither a decimal point nor an
-// exponent, so a whole bound like 1 becomes "1.0" and 10 becomes "10.0".
-// Non-finite bounds (the implicit +Inf bucket) and bounds that already carry a
-// fractional part or exponent (0.5, 0.005, 1e+16) are returned unchanged.
-func omLEValue(bound float64) string {
-	s := formatValue(bound)
-	if math.IsInf(bound, 0) || math.IsNaN(bound) {
-		return s
-	}
-	if !strings.ContainsAny(s, ".eE") {
-		return s + ".0"
-	}
-	return s
 }
 
 // family materialises an unlabeled counter into the IR. An unlabeled counter is
@@ -125,9 +65,10 @@ func (lc *LabeledCounter) family() (fam metricFamily, ok bool) {
 		return metricFamily{}, false
 	}
 	samples := make([]sample, 0, len(keys))
-	for _, key := range keys {
+	for i := range keys {
+		key := &keys[i]
 		lc.mu.RLock()
-		v := lc.vals[key]
+		v := lc.vals[*key]
 		lc.mu.RUnlock()
 		if v == nil {
 			continue
@@ -158,9 +99,10 @@ func (lg *LabeledGauge) family() (fam metricFamily, ok bool) {
 		return metricFamily{}, false
 	}
 	samples := make([]sample, 0, len(keys))
-	for _, key := range keys {
+	for i := range keys {
+		key := &keys[i]
 		lg.mu.RLock()
-		ptr := lg.vals[key]
+		ptr := lg.vals[*key]
 		lg.mu.RUnlock()
 		if ptr == nil {
 			continue
@@ -177,11 +119,10 @@ func (lg *LabeledGauge) family() (fam metricFamily, ok bool) {
 // emitted.
 func (h *Histogram) family() metricFamily {
 	return metricFamily{
-		name:           h.name,
-		typ:            typeHistogram,
-		help:           h.help,
-		samples:        histogramSamples(h, ""),
-		omitOMSumCount: h.negBounds,
+		name:    h.name,
+		typ:     typeHistogram,
+		help:    h.help,
+		samples: histogramSamples(h, ""),
 	}
 }
 
@@ -193,39 +134,37 @@ func (lh *LabeledHistogram) family() (fam metricFamily, ok bool) {
 		return metricFamily{}, false
 	}
 	samples := make([]sample, 0, len(keys)*(len(lh.bounds)+3))
-	for _, key := range keys {
+	for i := range keys {
+		key := &keys[i]
 		lh.mu.RLock()
-		h := lh.vals[key]
+		h := lh.vals[*key]
 		lh.mu.RUnlock()
 		if h == nil {
 			continue
 		}
 		samples = append(samples, histogramSamples(h, buildLabelString(lh.labels, key))...)
 	}
-	return metricFamily{name: lh.name, typ: typeHistogram, help: lh.help, samples: samples, omitOMSumCount: lh.negBounds}, len(samples) > 0
+	return metricFamily{name: lh.name, typ: typeHistogram, help: lh.help, samples: samples}, len(samples) > 0
 }
 
 // histogramSamples expands one histogram into its cumulative bucket, sum, and
 // count samples. labelStr is the pre-rendered user-label content (empty for an
-// unlabeled histogram); each bucket carries its numeric bound in leBound so the
-// implicit le label can be formatted per-format by the encoder (Prometheus
-// bare, OpenMetrics canonical). The ordering — every finite bucket, then the
-// +Inf bucket, then _sum, then _count — matches the writers and both exposition
-// formats.
+// unlabeled histogram); each bucket sample's labels carry the implicit le label
+// rendered with formatValue (a bare integer bound stays le="1"). The ordering —
+// every finite bucket, then the +Inf bucket, then _sum, then _count — matches
+// the writers and the exposition format.
 func histogramSamples(h *Histogram, labelStr string) []sample {
 	sum, count, bucketVals := h.snapshot()
 	samples := make([]sample, 0, len(h.bounds)+3)
 	for i, bound := range h.bounds {
 		samples = append(samples, sample{
 			nameSuffix: "_bucket",
-			labels:     labelStr,
+			labels:     leLabels(labelStr, formatValue(bound)),
 			value:      strconv.FormatInt(bucketVals[i], 10),
-			leBound:    bound,
-			isBucket:   true,
 		})
 	}
 	samples = append(samples,
-		sample{nameSuffix: "_bucket", labels: labelStr, value: strconv.FormatInt(bucketVals[len(h.bounds)], 10), leBound: math.Inf(1), isBucket: true},
+		sample{nameSuffix: "_bucket", labels: leLabels(labelStr, "+Inf"), value: strconv.FormatInt(bucketVals[len(h.bounds)], 10)},
 		sample{nameSuffix: "_sum", labels: labelStr, value: formatValue(sum)},
 		sample{nameSuffix: "_count", labels: labelStr, value: strconv.FormatInt(count, 10)},
 	)
@@ -282,9 +221,8 @@ func (r *Registry) collect() []metricFamily {
 }
 
 // encodePrometheus renders the IR in Prometheus text format 0.0.4: HELP before
-// TYPE, HELP escaped without the double-quote, the registered name used
-// verbatim for both the family lines and the sample series, and no trailing
-// "# EOF".
+// TYPE, HELP escaped without the double-quote, and the registered name used
+// verbatim for both the family lines and the sample series.
 func encodePrometheus(fams []metricFamily) string {
 	var b strings.Builder
 	appendPrometheus(&b, fams)
@@ -297,37 +235,7 @@ func appendPrometheus(b *strings.Builder, fams []metricFamily) {
 		fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s %s\n", f.name, helpEscaper.Replace(f.help), f.name, f.typ)
 		for j := range f.samples {
 			s := &f.samples[j]
-			writeSample(b, f.name+s.nameSuffix, s.leString(formatValue), s.value)
-		}
-	}
-}
-
-// encodeOpenMetrics renders the IR in OpenMetrics text format 1.0.0: TYPE before
-// HELP, HELP escaped including the double-quote, counter family lines using the
-// _total-stripped base name while the sample series keeps _total, and the
-// mandatory trailing "# EOF".
-func encodeOpenMetrics(fams []metricFamily) string {
-	var b strings.Builder
-	appendOpenMetrics(&b, fams)
-	b.WriteString("# EOF\n")
-	return b.String()
-}
-
-func appendOpenMetrics(b *strings.Builder, fams []metricFamily) {
-	for i := range fams {
-		f := &fams[i]
-		headerName, seriesBase := f.name, f.name
-		if f.typ == typeCounter {
-			headerName = omCounterBaseName(f.name)
-			seriesBase = omCounterSampleName(f.name)
-		}
-		fmt.Fprintf(b, "# TYPE %s %s\n# HELP %s %s\n", headerName, f.typ, headerName, omHelpEscaper.Replace(f.help))
-		for j := range f.samples {
-			s := &f.samples[j]
-			if f.omitOMSumCount && (s.nameSuffix == "_sum" || s.nameSuffix == "_count") {
-				continue
-			}
-			writeSample(b, seriesBase+s.nameSuffix, s.leString(omLEValue), s.value)
+			writeSample(b, f.name+s.nameSuffix, s.labels, s.value)
 		}
 	}
 }

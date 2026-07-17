@@ -37,7 +37,7 @@ func body(t *testing.T, r *Registry) string {
 }
 
 // failWriter is an http.ResponseWriter whose Write always fails, used to drive
-// the write-error logging branches of the Prometheus and OpenMetrics handlers.
+// the write-error logging branch of the Prometheus handler.
 type failWriter struct {
 	hdr http.Header
 }
