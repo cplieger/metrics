@@ -19,18 +19,33 @@ var labelEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
 const maxLogValueLen = 256
 
 // truncateForLog bounds an attacker-influenceable value for embedding in a log
-// attribute, appending a "...(truncated)" marker when the value was cut.
+// attribute, appending the fleet's "..." truncation marker OUTSIDE the cap
+// (output is at most maxLogValueLen+3 bytes) when the value was cut; a
+// within-cap value is returned untouched.
+//
+// It is the truncation half of the fleet reference implementation,
+// github.com/cplieger/runesafe's SanitizeSingleLineBounded preset — the
+// rune-boundary backoff matches runesafe.CapBytes byte for byte and the
+// marker convention matches the preset; compare against that package when
+// changing this helper. Deliberately kept local and NARROWER than the
+// preset rather than importing it: metrics is a zero-dependency library
+// (runesafe would become a runtime edge on every consumer), and the
+// preset's C1/bidi/control sanitization is the recorded 2026-07 decline —
+// UTF-8 validity is the narrower concern this library owns (every value
+// logged here already passed sanitizeUTF8, and slog's handlers escape
+// control bytes in quoted text output).
 func truncateForLog(s string) string {
 	if len(s) <= maxLogValueLen {
 		return s
 	}
 	// Back off to the previous rune boundary so the truncated prefix of a
-	// just-sanitized (valid UTF-8) value cannot itself carry a split rune.
+	// just-sanitized (valid UTF-8) value cannot itself carry a split rune
+	// (runesafe.CapBytes semantics).
 	cut := maxLogValueLen
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
-	return s[:cut] + "...(truncated)"
+	return s[:cut] + "..."
 }
 
 // sanitizeUTF8 is the shared UTF-8 sanitization engine for record-time label
