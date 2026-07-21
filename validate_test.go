@@ -270,8 +270,8 @@ func TestSanitizeLabelValues_NoPanicAllTypes(t *testing.T) {
 // TestSanitizeLabelValues_LongInvalidUTF8LogTruncated pins the maxLogValueLen
 // truncation: a hostile multi-hundred-byte invalid label value sanitizes
 // without panicking, and the warning's value attribute retains a bounded
-// prefix with the "...(truncated)" marker while dropping the
-// attacker-controlled tail. Serial: it captures slog.Default.
+// prefix with the fleet's "..." truncation marker (the runesafe convention)
+// while dropping the attacker-controlled tail. Serial: it captures slog.Default.
 func TestSanitizeLabelValues_LongInvalidUTF8LogTruncated(t *testing.T) {
 	buf := captureDebugLogs(t)
 	longInvalid := strings.Repeat("a", maxLogValueLen) + "\xff" + strings.Repeat("b", 64)
@@ -282,8 +282,8 @@ func TestSanitizeLabelValues_LongInvalidUTF8LogTruncated(t *testing.T) {
 	if !strings.Contains(logs, "label value contained invalid UTF-8") {
 		t.Fatalf("logs = %q, want sanitize warning", logs)
 	}
-	if !strings.Contains(logs, "...(truncated)") {
-		t.Errorf("logs = %q, want truncation marker", logs)
+	if !strings.Contains(logs, "a...") {
+		t.Errorf("logs = %q, want the \"...\" marker at the cut joint", logs)
 	}
 	if !strings.Contains(logs, strings.Repeat("a", 32)) {
 		t.Errorf("logs = %q, want retained prefix", logs)
@@ -407,8 +407,8 @@ func TestValidateLabelValues_ValidSucceeds(t *testing.T) {
 // TestSanitizeHelp_LongInvalidUTF8LogTruncated pins the maxLogValueLen
 // truncation on the help-text warning path: constructing a metric with
 // hostile multi-hundred-byte invalid help sanitizes without panicking, and
-// the warning's help attribute retains a bounded prefix with the
-// "...(truncated)" marker while dropping the tail -- the same bound the
+// the warning's help attribute retains a bounded prefix with the fleet's
+// "..." truncation marker while dropping the tail -- the same bound the
 // label-value warning already enforces. Serial: it captures slog.Default.
 func TestSanitizeHelp_LongInvalidUTF8LogTruncated(t *testing.T) {
 	buf := captureDebugLogs(t)
@@ -420,8 +420,8 @@ func TestSanitizeHelp_LongInvalidUTF8LogTruncated(t *testing.T) {
 	if !strings.Contains(logs, "help text contained invalid UTF-8") {
 		t.Fatalf("logs = %q, want help sanitize warning", logs)
 	}
-	if !strings.Contains(logs, "...(truncated)") {
-		t.Errorf("logs = %q, want truncation marker on help attribute", logs)
+	if !strings.Contains(logs, "a...") {
+		t.Errorf("logs = %q, want the \"...\" marker at the help attribute's cut joint", logs)
 	}
 	if strings.Contains(logs, strings.Repeat("b", 16)) {
 		t.Errorf("logs = %q, want hostile help tail truncated", logs)
