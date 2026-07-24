@@ -5,7 +5,7 @@ conventions), see the linked policies at the bottom.
 
 ## What this library is
 
-A hand-rolled Prometheus text-exposition library with **zero dependencies** —
+A hand-rolled Prometheus text-exposition library with **zero dependencies**:
 standard library only (`go.mod` declares no `require` block). Keep it that
 way: a new third-party import is a design change, not a routine addition. The
 package is flat (one Go package at the repo root); there are no subpackages or
@@ -17,7 +17,7 @@ The public surface is documented in `README.md`; the load-bearing internals are
 not, and they are easy to break:
 
 - **One neutral IR, one thin encoder.** A scrape is materialised once into an
-  intermediate representation — `[]metricFamily`, each family carrying its
+  intermediate representation: `[]metricFamily`, each family carrying its
   name, type, HELP, and a slice of `sample`s (`exposition.go`). Every metric
   type has a `family()` snapshot method (`exposition.go`) that reuses the
   shared model (`Histogram.snapshot`, `sortedLabelKeys`, `buildLabelString`,
@@ -34,7 +34,7 @@ not, and they are easy to break:
   `process.go`) remain as thin shims over the IR + encoder because they are
   public API.
 - **Label storage is a fixed-size key.** `labelKey` is `[8]string`, so a metric
-  supports **at most 8 labels** — constructors panic past that. Label values
+  supports **at most 8 labels**; constructors panic past that. Label values
   are copied into the array and the rendered label string is always sorted by
   label name (`buildLabelString`) for deterministic output.
 - **Name, arity, and bucket validation are fail-fast panics, by design.**
@@ -44,7 +44,7 @@ not, and they are easy to break:
   registering two metrics whose exposition family names collide panics
   (`reserveName`, including the pre-seeded `process_*` family names);
   histogram bucket bounds panic unless strictly increasing and finite.
-  Tests assert these panics — don't soften them to error returns. Invalid
+  Tests assert these panics; don't soften them to error returns. Invalid
   UTF-8 is deliberately NOT in that set: label values and help text are
   sanitized with the Unicode replacement character (U+FFFD) by the shared
   `sanitizeUTF8` engine (`validate.go`), with a one-time `slog` warning per
@@ -53,11 +53,11 @@ not, and they are easy to break:
   re-warn. The library never panics on invalid UTF-8.
 - **Spec-exact escaping is non-negotiable.** `labelEscaper` escapes only `\`,
   `"`, and `\n`; `helpEscaper` escapes only `\` and `\n`. The fuzz and red-team
-  tests pin this exactly — widening or narrowing the set will fail them.
+  tests pin this exactly; widening or narrowing the set will fail them.
 - **Histogram internals.** Buckets are cumulative, the `+Inf` bucket always
   equals `_count`, and the running sum is stored as float bits updated via an
   atomic compare-and-swap loop (`Histogram.Observe`). Bounds are validated at
-  construction — they must be a strictly increasing sequence of finite values,
+  construction: they must be a strictly increasing sequence of finite values,
   and non-finite, duplicate, or out-of-order bounds panic (no silent sorting).
   Labeled counters and histograms expose `Delete(vals...)`/`Reset()` for series
   removal, matching labeled gauges; the exposition writers nil-guard a key that
@@ -109,7 +109,7 @@ golangci-lint fmt          # applies gofumpt (extra-rules) + gci import grouping
 ```
 
 `gofumpt` runs with `extra-rules` (groups adjacent same-type params, forbids
-naked returns) and `gci` orders imports as standard then third-party — match
+naked returns) and `gci` orders imports as standard then third-party; match
 the existing files rather than fighting the formatter.
 
 Mutation testing is configured (`.gremlins.yaml`, run via `gremlins unleash`)
@@ -119,7 +119,7 @@ but is a non-blocking weekly signal, not a PR gate.
 
 `.golangci.yaml`, `.gremlins.yaml`, and `.github/workflows/*.yaml` are synced
 from `cplieger/ci` and carry `DO NOT EDIT` headers. Change them upstream in
-`cplieger/ci`, not here — local edits get overwritten on the next sync.
+`cplieger/ci`, not here; local edits get overwritten on the next sync.
 
 ## Commits and PRs
 
@@ -132,5 +132,5 @@ git-cliff for releases): `feat:`, `fix:`, `sec:`, `docs:`, etc.
 By participating you agree to the
 [Code of Conduct](https://github.com/cplieger/.github/blob/main/CODE_OF_CONDUCT.md).
 Report vulnerabilities via the
-[security policy](https://github.com/cplieger/.github/blob/main/SECURITY.md) —
+[security policy](https://github.com/cplieger/.github/blob/main/SECURITY.md),
 never in a public issue.
