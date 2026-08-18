@@ -9,9 +9,10 @@ import (
 	"testing"
 )
 
-// mustPanicContaining runs fn and fails unless it panics with a string value
-// containing want. Used to assert the package's fail-fast guards (registry
-// collisions, invalid names, bad bucket bounds).
+// mustPanicContaining runs fn and fails unless it panics with a string or
+// error value containing want. Used to assert the package's fail-fast guards
+// (invalid registry prefix, label arity, negative Counter.Add) and the
+// MustRegister door, which panics with the registration error.
 func mustPanicContaining(t *testing.T, want string, fn func()) {
 	t.Helper()
 	defer func() {
@@ -19,12 +20,34 @@ func mustPanicContaining(t *testing.T, want string, fn func()) {
 		if r == nil {
 			t.Fatalf("expected panic containing %q, got none", want)
 		}
-		msg, ok := r.(string)
-		if !ok || !strings.Contains(msg, want) {
-			t.Fatalf("panic = %v, want a string containing %q", r, want)
+		var msg string
+		switch v := r.(type) {
+		case string:
+			msg = v
+		case error:
+			msg = v.Error()
+		default:
+			t.Fatalf("panic = %v, want a string or error containing %q", r, want)
+		}
+		if !strings.Contains(msg, want) {
+			t.Fatalf("panic = %v, want it to contain %q", r, want)
 		}
 	}()
 	fn()
+}
+
+// mustRegisterError registers m and fails unless Register returns an error
+// containing want — the v4 shape of the old panic-at-construction and
+// panic-at-registration assertions.
+func mustRegisterError(t *testing.T, r *Registry, m Metric, want string) {
+	t.Helper()
+	err := r.Register(m)
+	if err == nil {
+		t.Fatalf("Register = nil, want error containing %q", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("Register error = %q, want it to contain %q", err, want)
+	}
 }
 
 // body serves r's Prometheus handler against a throwaway request and returns

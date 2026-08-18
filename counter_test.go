@@ -101,13 +101,11 @@ func TestLabeledCounterArityPanic(t *testing.T) {
 	lc.Inc("GET") // wrong arity
 }
 
-func TestLabeledCounterTooManyLabelsPanic(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expected panic for >8 labels")
-		}
-	}()
-	NewLabeledCounter("test_lc_many", "test", []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"})
+// TestNewLabeledCounter_TooManyLabelsErrorsAtRegister pins the maxLabels cap:
+// a ninth label is captured at construction and surfaces at registration.
+func TestNewLabeledCounter_TooManyLabelsErrorsAtRegister(t *testing.T) {
+	lc := NewLabeledCounter("test_lc_many", "test", []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"})
+	mustRegisterError(t, NewRegistry(""), lc, `LabeledCounter "test_lc_many" supports at most 8 labels`)
 }
 
 // TestNewLabeledCounter_ExactlyMaxLabelsAllowed pins the arity guard at its

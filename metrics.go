@@ -3,12 +3,23 @@
 //
 // Metrics are exposed in Prometheus text format 0.0.4 via Handler().
 //
-// Registration order: complete all Register* calls before serving a custom
-// handler built on the low-level Write* functions. Write* reads the metric
-// name without the registry lock, so it is not synchronized with a concurrent
-// Register* rename of the same metric. The Registry handlers (guarded by the
-// registry lock) and the record paths (Inc/Add/Set/Observe, guarded by the
-// metric lock) are safe to run concurrently with registration.
+// Construction validates metric names, label names, and histogram buckets,
+// but does not panic on a violation: the error is captured into the metric
+// value (the client_golang Desc.err shape) and surfaces at registration:
+// (*Registry).Register returns it, (*Registry).MustRegister panics on it.
+// The record path diverges from client_golang (whose metrics keep recording
+// and surface the error at scrape time): here a metric carrying a
+// construction error records nothing — its Inc/Add/Set/Observe methods are
+// no-ops that log one warning on the first dropped record — and the
+// low-level Write* functions emit nothing for it. Label-arity mismatches on
+// the record paths and a negative Counter.Add remain fail-fast panics.
+//
+// Registration order: complete all Register/MustRegister calls before serving
+// a custom handler built on the low-level Write* functions. Write* reads the
+// metric name without the registry lock, so it is not synchronized with a
+// concurrent registration rename of the same metric. The Registry handlers
+// (guarded by the registry lock) and the record paths (Inc/Add/Set/Observe,
+// guarded by the metric lock) are safe to run concurrently with registration.
 //
 // Unsupported by design (SKIP list):
 //   - Summary metric type: Prometheus best practices recommend histograms
@@ -20,12 +31,16 @@
 //   - Protobuf exposition format: text format is default in Prometheus 3.0
 //   - Native histograms (exponential buckets): requires protobuf format
 //   - Unregister / dynamic metric lifecycle: all consumers have static metric sets
+//   - Third-party collectors: the Metric interface is sealed; registration
+//     accepts exactly the six built-in types, unlike client_golang's open
+//     Collector contract
 //   - Float64 counter: integer counters are sufficient
 //   - Gzip response compression: use standard HTTP middleware
 //   - Gauge.SetToCurrentTime(): trivial one-liner
 package metrics
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -34,6 +49,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // helpEscaper escapes backslashes and newlines in HELP text per Prometheus exposition format.
@@ -93,10 +109,16 @@ type Registry struct {
 	mu                sync.RWMutex
 }
 
-// NewRegistry creates a new metrics registry.
+// NewRegistry creates a new metrics registry. Construction through
+// NewRegistry is mandatory: the zero Registry has a nil name table and
+// panics on the first registration. An invalid prefix (not matching the
+// metric-name grammar) panics — the registry is itself the reporting door
+// for metric errors, so a malformed registry has nowhere to surface one.
 func NewRegistry(prefix string) *Registry {
 	if prefix != "" {
-		validateMetricName(prefix)
+		if err := checkMetricName(prefix); err != nil {
+			panic("metrics: invalid registry prefix: " + prefix)
+		}
 	}
 	r := &Registry{
 		prefix: prefix,
@@ -117,108 +139,183 @@ func (r *Registry) prefixed(name string) string {
 	return r.prefix + "_" + name
 }
 
-// reserveName records the exposition family name a metric occupies and panics
-// if another metric already claims it. The family name is the identifier that
-// appears in the "# TYPE" line; every metric type uses its registered name
-// verbatim. Family names must be unique across the whole registry and across
-// types, because a duplicate "# TYPE" line makes Prometheus parsers reject the
-// entire scrape. Registration is fail-fast: a collision is a programming
-// error, like the panics in validateMetricName and the label-arity guards.
+// reserveName records the exposition family name a metric occupies and
+// returns an error if another metric already claims it. The family name is
+// the identifier that appears in the "# TYPE" line; every metric type uses
+// its registered name verbatim. Family names must be unique across the whole
+// registry and across types, because a duplicate "# TYPE" line makes
+// Prometheus parsers reject the entire scrape. The collision surfaces through
+// the registration doors: Register returns it, MustRegister panics.
 // Callers must hold r.mu.
-func (r *Registry) reserveName(family, kind string) {
+func (r *Registry) reserveName(family, kind string) error {
 	if existing, ok := r.names[family]; ok {
-		panic(fmt.Sprintf("metrics: %s %q collides with already-registered %s; "+
-			"metric family names must be unique across the registry", kind, family, existing))
+		return fmt.Errorf("metrics: %s %q collides with already-registered %s; "+
+			"metric family names must be unique across the registry", kind, family, existing)
 	}
 	r.names[family] = kind
+	return nil
 }
 
 // reserveHistogramFamily reserves the histogram base name plus the derived
-// _bucket/_sum/_count series names a histogram emits in both writers.
-// Callers must hold r.mu.
-func (r *Registry) reserveHistogramFamily(name, kind string) {
-	r.reserveName(name, kind)
-	r.reserveName(name+"_bucket", kind)
-	r.reserveName(name+"_sum", kind)
-	r.reserveName(name+"_count", kind)
+// _bucket/_sum/_count series names a histogram emits in both writers. The
+// reservation is transactional: on a collision, the names already claimed by
+// this call are released, so a failed registration leaves the registry's
+// name table exactly as it was. Callers must hold r.mu.
+func (r *Registry) reserveHistogramFamily(name, kind string) error {
+	families := [4]string{name, name + "_bucket", name + "_sum", name + "_count"}
+	for i, f := range families {
+		if err := r.reserveName(f, kind); err != nil {
+			for _, claimed := range families[:i] {
+				delete(r.names, claimed)
+			}
+			return err
+		}
+	}
+	return nil
 }
 
-// RegisterCounter adds a counter to the registry.
-func (r *Registry) RegisterCounter(c *Counter) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !c.registered.CompareAndSwap(false, true) {
-		panic("metrics: counter already registered")
-	}
-	c.name = r.prefixed(c.name)
-	r.reserveName(c.name, "counter")
-	r.counters = append(r.counters, c)
+// Metric is implemented by every metric type in this package: *Counter,
+// *Gauge, *LabeledCounter, *LabeledGauge, *Histogram, and *LabeledHistogram.
+// The interface is sealed (its method is unexported), so those six are the
+// only implementations: third-party collectors in the client_golang style are
+// out of scope by design, like the rest of the README's "Unsupported by
+// Design" list.
+type Metric interface {
+	// registerInto validates and attaches the metric to r. Callers hold r.mu.
+	registerInto(r *Registry) error
 }
 
-// RegisterGauge adds a gauge to the registry.
-func (r *Registry) RegisterGauge(g *Gauge) {
+// errNilMetric is the error Register returns (and MustRegister panics with)
+// when handed a nil Metric — either a nil interface value or a typed-nil
+// pointer such as (*Counter)(nil). Guarded explicitly so the error-returning
+// door reports the bad argument instead of dereferencing it.
+var errNilMetric = errors.New("metrics: Register called with nil metric")
+
+// Register adds a metric to the registry. It returns the error the metric
+// captured at construction (invalid metric name, invalid/reserved/duplicate
+// label name, more than 8 labels, bad histogram buckets), an error when the
+// metric is already registered, an error when the metric's exposition
+// family name collides with an already-registered one, or an error when m is
+// nil. On error the metric is not attached and the registry is unchanged.
+// After a family-name collision the metric itself is left unregistered and
+// intact, so it can still be registered with a different registry (or with
+// this one once the colliding name is freed); a construction error is
+// immutable, so such a metric cannot be repaired, only rebuilt with a valid
+// name, label set, or buckets. MustRegister is the panicking sibling for
+// callers that cannot handle an error.
+func (r *Registry) Register(m Metric) error {
+	if m == nil {
+		return errNilMetric
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !g.registered.CompareAndSwap(false, true) {
-		panic("metrics: gauge already registered")
-	}
-	g.name = r.prefixed(g.name)
-	r.reserveName(g.name, "gauge")
-	r.gauges = append(r.gauges, g)
+	return m.registerInto(r)
 }
 
-// RegisterLabeledCounter adds a labeled counter to the registry.
-func (r *Registry) RegisterLabeledCounter(lc *LabeledCounter) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !lc.registered.CompareAndSwap(false, true) {
-		panic("metrics: labeled counter already registered")
+// MustRegister registers each metric in turn and panics on the first error
+// (the client_golang shape). It is the door for package-level var metric
+// sets, whose init-time registration has no caller to hand an error to.
+func (r *Registry) MustRegister(ms ...Metric) {
+	for _, m := range ms {
+		if err := r.Register(m); err != nil {
+			panic(err)
+		}
 	}
-	lc.mu.Lock()
-	lc.name = r.prefixed(lc.name)
-	lc.mu.Unlock()
-	r.reserveName(lc.name, "labeled counter")
-	r.labeledCounters = append(r.labeledCounters, lc)
 }
 
-// RegisterLabeledGauge adds a labeled gauge to the registry.
-func (r *Registry) RegisterLabeledGauge(lg *LabeledGauge) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !lg.registered.CompareAndSwap(false, true) {
-		panic("metrics: labeled gauge already registered")
+// register runs the shared registration flow: reject a metric that captured a
+// construction error, claim the metric's registered flag, resolve the
+// metric's name via base, reserve the prefixed family name(s) via reserve,
+// and hand the final name to attach, which links the metric into the
+// registry. base runs only AFTER the CAS is won: the winner's attach renames
+// the metric, and nothing but the CAS orders a concurrent cross-registry
+// registration of the same value (the registries' locks are independent), so
+// only the CAS winner may read or write the name field. For the same reason
+// the loser's already-registered error cannot include the metric name. On a
+// reservation failure the registered flag is rolled back, so a metric refused
+// for a name collision stays registrable elsewhere. Callers must hold r.mu.
+func (r *Registry) register(mErr error, registered *atomic.Bool, kind string, base func() string,
+	reserve func(name, kind string) error, attach func(name string),
+) error {
+	if mErr != nil {
+		return mErr
 	}
-	lg.mu.Lock()
-	lg.name = r.prefixed(lg.name)
-	lg.mu.Unlock()
-	r.reserveName(lg.name, "labeled gauge")
-	r.labeledGauges = append(r.labeledGauges, lg)
+	if !registered.CompareAndSwap(false, true) {
+		return errors.New("metrics: " + kind + " already registered")
+	}
+	name := r.prefixed(base())
+	if err := reserve(name, kind); err != nil {
+		registered.Store(false)
+		return err
+	}
+	attach(name)
+	return nil
 }
 
-// RegisterHistogram adds a histogram to the registry.
-func (r *Registry) RegisterHistogram(h *Histogram) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !h.registered.CompareAndSwap(false, true) {
-		panic("metrics: histogram already registered")
+func (c *Counter) registerInto(r *Registry) error {
+	if c == nil {
+		return errNilMetric
 	}
-	h.name = r.prefixed(h.name)
-	r.reserveHistogramFamily(h.name, "histogram")
-	r.histograms = append(r.histograms, h)
+	return r.register(c.err, &c.registered, "counter", func() string { return c.name }, r.reserveName, func(name string) {
+		c.name = name
+		r.counters = append(r.counters, c)
+	})
 }
 
-// RegisterLabeledHistogram adds a labeled histogram to the registry.
-func (r *Registry) RegisterLabeledHistogram(lh *LabeledHistogram) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !lh.registered.CompareAndSwap(false, true) {
-		panic("metrics: labeled histogram already registered")
+func (g *Gauge) registerInto(r *Registry) error {
+	if g == nil {
+		return errNilMetric
 	}
-	lh.mu.Lock()
-	lh.name = r.prefixed(lh.name)
-	lh.mu.Unlock()
-	r.reserveHistogramFamily(lh.name, "labeled histogram")
-	r.labeledHistograms = append(r.labeledHistograms, lh)
+	return r.register(g.err, &g.registered, "gauge", func() string { return g.name }, r.reserveName, func(name string) {
+		g.name = name
+		r.gauges = append(r.gauges, g)
+	})
+}
+
+func (lc *LabeledCounter) registerInto(r *Registry) error {
+	if lc == nil {
+		return errNilMetric
+	}
+	return r.register(lc.err, &lc.registered, "labeled counter", func() string { return lc.name }, r.reserveName, func(name string) {
+		lc.mu.Lock()
+		lc.name = name
+		lc.mu.Unlock()
+		r.labeledCounters = append(r.labeledCounters, lc)
+	})
+}
+
+func (lg *LabeledGauge) registerInto(r *Registry) error {
+	if lg == nil {
+		return errNilMetric
+	}
+	return r.register(lg.err, &lg.registered, "labeled gauge", func() string { return lg.name }, r.reserveName, func(name string) {
+		lg.mu.Lock()
+		lg.name = name
+		lg.mu.Unlock()
+		r.labeledGauges = append(r.labeledGauges, lg)
+	})
+}
+
+func (h *Histogram) registerInto(r *Registry) error {
+	if h == nil {
+		return errNilMetric
+	}
+	return r.register(h.err, &h.registered, "histogram", func() string { return h.name }, r.reserveHistogramFamily, func(name string) {
+		h.name = name
+		r.histograms = append(r.histograms, h)
+	})
+}
+
+func (lh *LabeledHistogram) registerInto(r *Registry) error {
+	if lh == nil {
+		return errNilMetric
+	}
+	return r.register(lh.err, &lh.registered, "labeled histogram", func() string { return lh.name }, r.reserveHistogramFamily, func(name string) {
+		lh.mu.Lock()
+		lh.name = name
+		lh.mu.Unlock()
+		r.labeledHistograms = append(r.labeledHistograms, lh)
+	})
 }
 
 // Handler returns an HTTP handler serving Prometheus text format.

@@ -3,15 +3,16 @@ package metrics_test
 import (
 	"net/http"
 
-	"github.com/cplieger/metrics/v3"
+	"github.com/cplieger/metrics/v4"
 )
 
 func Example() {
 	r := metrics.NewRegistry("myapp") // prefixes every registered metric name with "myapp_"
 	reqs := metrics.NewLabeledCounter("http_requests_total", "Total HTTP requests", []string{"method", "status"})
 	dur := metrics.NewHistogram("http_duration_seconds", "Request latency", metrics.WithBuckets([]float64{0.01, 0.05, 0.1, 0.5, 1, 5}))
-	r.RegisterLabeledCounter(reqs) // exposed as myapp_http_requests_total
-	r.RegisterHistogram(dur)       // exposed as myapp_http_duration_seconds
+	// Exposed as myapp_http_requests_total and myapp_http_duration_seconds.
+	// MustRegister panics on a bad metric; Register returns the error instead.
+	r.MustRegister(reqs, dur)
 
 	reqs.Inc("GET", "200")
 	timer := metrics.NewTimer(dur)

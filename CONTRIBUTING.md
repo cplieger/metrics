@@ -37,19 +37,36 @@ not, and they are easy to break:
   supports **at most 8 labels**; constructors panic past that. Label values
   are copied into the array and the rendered label string is always sorted by
   label name (`buildLabelString`) for deterministic output.
-- **Name, arity, and bucket validation are fail-fast panics, by design.**
-  Metric/label names are validated at construction (`validate.go`);
-  `Inc`/`Observe`/`Set` panic on label-arity mismatch; `Counter.Add` panics on
-  a negative delta (and saturates at `math.MaxInt64` instead of wrapping);
-  registering two metrics whose exposition family names collide panics
-  (`reserveName`, including the pre-seeded `process_*` family names);
-  histogram bucket bounds panic unless strictly increasing and finite.
-  Tests assert these panics; don't soften them to error returns. Invalid
-  UTF-8 is deliberately NOT in that set: label values and help text are
-  sanitized with the Unicode replacement character (U+FFFD) by the shared
-  `sanitizeUTF8` engine (`validate.go`), with a one-time `slog` warning per
-  newly created sanitized series (label path) and per constructor (help
-  text); repeated records sanitizing onto an existing series do not
+- **Validation is captured at construction and surfaces at registration; the
+  record-path guards stay panics.** Metric/label names and histogram bucket
+  bounds are validated at construction (`validate.go`, `checkBuckets`), but a
+  violation does not panic: it is captured into the metric's unexported `err`
+  field (the `client_golang` `Desc.err` shape), and every captured error names
+  the metric, so a `MustRegister` panic over a package-level block identifies
+  which declaration failed. The record path is this library's own divergence
+  from `client_golang` (upstream keeps recording and surfaces the error at
+  scrape time): an errored metric records nothing — `Inc`/`Add`/`Set`/`Observe`
+  no-op, emitting one `slog` warning via `warnInertOnce` (`counter.go`) on the
+  first dropped record so a constructed-but-never-registered metric is not
+  silently dead — and the `Write*` shims emit nothing for it. The error
+  surfaces through the registration doors — `(*Registry).Register(m) error`
+  returns it, `MustRegister(m ...)` panics on the first error. Name collisions
+  (`reserveName`, including the pre-seeded `process_*` family names) and
+  re-registration are registration errors on the same doors; a metric refused
+  for a name collision rolls back and stays registrable elsewhere. Only the
+  registration CAS winner may read or write a metric's `name` field
+  (`register` resolves the name through a closure after the CAS): argument
+  evaluation before the CAS races the winner's rename when one value is
+  registered into two registries concurrently. STILL fail-fast panics, by
+  design: `Inc`/`Observe`/`Set` on label-arity mismatch, `Counter.Add` on a
+  negative delta (it also saturates at `math.MaxInt64` instead of wrapping),
+  and `NewRegistry` on an invalid prefix. Tests assert both halves; don't
+  soften the panics to error returns, and don't let an errored metric reach
+  the exposition. Invalid UTF-8 is deliberately in neither set: label values
+  and help text are sanitized with the Unicode replacement character (U+FFFD)
+  by the shared `sanitizeUTF8` engine (`validate.go`), with a one-time `slog`
+  warning per newly created sanitized series (label path) and per constructor
+  (help text); repeated records sanitizing onto an existing series do not
   re-warn. The library never panics on invalid UTF-8.
 - **Spec-exact escaping is non-negotiable.** `labelEscaper` escapes only `\`,
   `"`, and `\n`; `helpEscaper` escapes only `\` and `\n`. The fuzz and red-team
@@ -58,7 +75,8 @@ not, and they are easy to break:
   equals `_count`, and the running sum is stored as float bits updated via an
   atomic compare-and-swap loop (`Histogram.Observe`). Bounds are validated at
   construction: they must be a strictly increasing sequence of finite values,
-  and non-finite, duplicate, or out-of-order bounds panic (no silent sorting).
+  and non-finite, duplicate, or out-of-order bounds are a captured
+  construction error surfacing at registration (no silent sorting).
   Labeled counters and histograms expose `Delete(vals...)`/`Reset()` for series
   removal, matching labeled gauges; the exposition writers nil-guard a key that
   a concurrent `Delete`/`Reset` removes mid-scrape.

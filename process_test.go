@@ -514,7 +514,7 @@ func TestProcGCPauseSeconds_ScaledToSeconds(t *testing.T) {
 	runtime.GC() // guarantee PauseTotalNs > 0
 
 	var b strings.Builder
-	WriteProcessMetrics(&b)
+	WriteProcess(&b)
 
 	var val float64
 	var found bool
@@ -538,9 +538,9 @@ func TestProcGCPauseSeconds_ScaledToSeconds(t *testing.T) {
 	}
 }
 
-func TestWriteProcessMetrics(t *testing.T) {
+func TestWriteProcess(t *testing.T) {
 	var b strings.Builder
-	WriteProcessMetrics(&b)
+	WriteProcess(&b)
 	out := b.String()
 	for _, want := range []string{
 		"go_goroutines",
@@ -550,17 +550,17 @@ func TestWriteProcessMetrics(t *testing.T) {
 		"process_start_time_seconds",
 	} {
 		if !strings.Contains(out, want) {
-			t.Errorf("WriteProcessMetrics missing %q", want)
+			t.Errorf("WriteProcess missing %q", want)
 		}
 	}
 }
 
-func TestWriteProcessMetrics_uptimeAndStartTimeReconcile(t *testing.T) {
+func TestWriteProcess_uptimeAndStartTimeReconcile(t *testing.T) {
 	// process_uptime_seconds is derived as now - process_start_time_seconds (the
 	// start time coming from the kernel on Linux, or the package-init fallback
 	// otherwise), so start + uptime must reconcile with now regardless of source.
 	var b strings.Builder
-	WriteProcessMetrics(&b)
+	WriteProcess(&b)
 	out := b.String()
 
 	var uptime, start float64
@@ -588,20 +588,20 @@ func TestWriteProcessMetrics_uptimeAndStartTimeReconcile(t *testing.T) {
 	}
 }
 
-// TestWriteProcessMetrics_LinuxFDsEmitted pins the Linux-only fd emit wiring in
+// TestWriteProcess_LinuxFDsEmitted pins the Linux-only fd emit wiring in
 // processFamilies: when /proc/self/fd and /proc/self/limits are readable,
-// WriteProcessMetrics emits process_open_fds and process_max_fds, the latter
+// WriteProcess emits process_open_fds and process_max_fds, the latter
 // rendered through formatMaxFDs (a positive integer, or the
 // float64(math.MaxUint64) sentinel for an unlimited soft limit). The
-// always-present-metric assertions in TestWriteProcessMetrics
+// always-present-metric assertions in TestWriteProcess
 // never check these two series, so the hasOpenFDs/hasMaxFDs emit composition and
 // the formatMaxFDs call site are otherwise unexercised end-to-end.
-func TestWriteProcessMetrics_LinuxFDsEmitted(t *testing.T) {
+func TestWriteProcess_LinuxFDsEmitted(t *testing.T) {
 	if runtime.GOOS != goosLinux {
 		t.Skip("process fd metrics are Linux-only (/proc/self/fd, /proc/self/limits)")
 	}
 	var b strings.Builder
-	WriteProcessMetrics(&b)
+	WriteProcess(&b)
 
 	var openVal, maxVal string
 	var gotOpen, gotMax bool

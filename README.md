@@ -1,6 +1,6 @@
 # metrics
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/metrics/v3.svg)](https://pkg.go.dev/github.com/cplieger/metrics/v3)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/metrics/v4.svg)](https://pkg.go.dev/github.com/cplieger/metrics/v4)
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/metrics)](https://github.com/cplieger/metrics/blob/main/go.mod)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/metrics/badges/coverage.json)](https://github.com/cplieger/metrics/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/metrics/badges/mutation.json)](https://github.com/cplieger/metrics/issues?q=label%3Agremlins-tracker)
@@ -14,7 +14,7 @@ A zero-dependency metrics library that exposes counters, gauges, labeled counter
 ## Install
 
 ```sh
-go get github.com/cplieger/metrics/v3
+go get github.com/cplieger/metrics/v4
 ```
 
 ## Usage
@@ -27,7 +27,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cplieger/metrics/v3"
+	"github.com/cplieger/metrics/v4"
 )
 
 func main() {
@@ -41,8 +41,10 @@ func main() {
 	dur := metrics.NewHistogram(
 		"http_request_duration_seconds", "Request latency",
 	)
-	r.RegisterLabeledCounter(reqs) // exposed as myapp_http_requests_total
-	r.RegisterHistogram(dur)       // exposed as myapp_http_request_duration_seconds
+	// Exposed as myapp_http_requests_total and myapp_http_request_duration_seconds.
+	// MustRegister panics on a bad metric (the init/main fail-fast door);
+	// Register returns the error instead.
+	r.MustRegister(reqs, dur)
 
 	// HTTP instrumentation: call RecordHTTP from middleware once the
 	// response status is known. Caller owns the label set.
@@ -59,7 +61,7 @@ func main() {
 
 	// Or measure a code path with the labeled-histogram timer.
 	work := metrics.NewLabeledHistogram("op_seconds", "op", []string{"kind"})
-	r.RegisterLabeledHistogram(work)
+	r.MustRegister(work)
 	t := work.NewTimer("scan")
 	time.Sleep(50 * time.Millisecond)
 	t.ObserveDuration()
@@ -82,7 +84,7 @@ func main() {
 - `NewCounter(name, help) *Counter`: monotonic counter; `Inc()`, `Add(n int64)`. Saturates at `math.MaxInt64` instead of wrapping negative.
 - `NewLabeledCounter(name, help, labels) *LabeledCounter`: `Inc(vals...)`, `Add(int64, vals...)`, `Delete(vals...)`, `Reset()`; panics on label-arity mismatch.
 
-Labeled metrics support at most 8 label names; construction panics beyond that.
+Labeled metrics support at most 8 label names; a ninth is a construction error that surfaces at registration.
 
 ### Gauges
 
@@ -93,7 +95,7 @@ Labeled metrics support at most 8 label names; construction panics beyond that.
 
 - `NewHistogram(name, help, opts ...Option) *Histogram`: `Observe(seconds)`; uses `DefaultBuckets` unless `WithBuckets` is provided.
 - `NewLabeledHistogram(name, help, labels, opts ...Option) *LabeledHistogram`: `Observe(seconds, vals...)`, `Delete(vals...)`, `Reset()`.
-- `WithBuckets([]float64) Option`: sets custom bucket boundaries. Bounds must be a strictly increasing sequence of finite values; the implicit `le="+Inf"` bucket is appended for you, so do not include `+Inf`. Non-finite, duplicate, or out-of-order bounds panic at construction. An empty slice yields a histogram with only the `+Inf` bucket.
+- `WithBuckets([]float64) Option`: sets custom bucket boundaries. Bounds must be a strictly increasing sequence of finite values; the implicit `le="+Inf"` bucket is appended for you, so do not include `+Inf`. Non-finite, duplicate, or out-of-order bounds are a construction error that surfaces at registration. An empty slice yields a histogram with only the `+Inf` bucket.
 
 ### Timer
 
@@ -111,9 +113,12 @@ Label values are caller-owned. Invalid UTF-8 never panics: the value is sanitize
 
 ### Registry
 
-- `NewRegistry(prefix) *Registry`: every registered metric name is prefixed with `<prefix>_` (process metrics excepted). Pass `""` for no prefix.
-- `Register{Counter,Gauge,LabeledCounter,LabeledGauge,Histogram,LabeledHistogram}`.
+- `NewRegistry(prefix) *Registry`: every registered metric name is prefixed with `<prefix>_` (process metrics excepted). Pass `""` for no prefix. Construction through `NewRegistry` is mandatory; an invalid prefix panics.
+- `Register(m Metric) error`: adds a metric (any of the six metric types) and reports what is wrong with it — the error captured at construction (invalid metric/label name, reserved or duplicate label, more than 8 labels, bad histogram buckets), an already-registered metric, a family-name collision (including the reserved `process_*` names), or a nil metric. On error the metric is not attached: after a name collision it stays registrable with a different registry, while a construction error is immutable — rebuild the metric with a valid name, label set, or buckets.
+- `MustRegister(m ...Metric)`: variadic; registers in order and panics on the first error (the `client_golang` shape). Use it for package-level metric sets registered in `init`, where there is no caller to hand an error to.
 - `Handler()`: Prometheus text format 0.0.4.
+
+Constructors never panic on a bad name, label set, or bucket layout: the error is captured into the metric (the `client_golang` `Desc.err` shape) and surfaces when you register it. What happens on the record path is this library's own divergence from `client_golang`: upstream metrics keep recording regardless and the error surfaces at scrape time (promhttp answers the scrape with HTTP 500), while here a metric carrying an error records nothing — its `Inc`/`Add`/`Set`/`Observe` are no-ops that log a single warning on the first dropped record — and is never exposed.
 
 ### Process metrics (emitted automatically)
 
@@ -122,18 +127,39 @@ Label values are caller-owned. Invalid UTF-8 never panics: the value is sanitize
 
 ### Low-level writers
 
-`WriteCounter`, `WriteGauge`, `WriteLabeledCounter`, `WriteLabeledGauge`, `WriteHistogram`, `WriteLabeledHistogram`, `WriteProcessMetrics`: for callers building custom handlers.
+`WriteCounter`, `WriteGauge`, `WriteLabeledCounter`, `WriteLabeledGauge`, `WriteHistogram`, `WriteLabeledHistogram`, `WriteProcess`: for callers building custom handlers. A metric carrying a construction error writes nothing: the direct write path never emits an invalid metric.
 
 ## Spec conformance
 
 The output is valid Prometheus text exposition format 0.0.4:
 
 - Label values escape only `\`, `"`, and `\n` (as `\\`, `\"`, `\n`); HELP text escapes `\` and `\n`.
-- Metric and label names are validated at creation, label arity is enforced on every record, duplicate metric family names panic at registration (including the reserved `process_*` names), and histogram bucket bounds panic unless strictly increasing and finite. All are fail-fast panics.
+- Metric names, label names, and histogram bucket bounds are validated at creation; a violation is captured into the metric, which then records nothing and writes nothing, and the error surfaces at registration (`Register` returns it, `MustRegister` panics). Duplicate metric family names (including the reserved `process_*` names) are registration errors on the same doors. Label arity on every record path and a negative `Counter.Add` remain fail-fast panics.
 - Label values and HELP text are always exposed as valid UTF-8: invalid input is sanitized with U+FFFD and warned once (label values when the degraded series is first created, HELP text at construction). Neither path panics.
 - Histograms always include a `+Inf` bucket equal to `_count`.
 
 Numeric values render through a single canonical formatter: whole values as bare integers (e.g. `42`), other values in shortest round-trippable form, and `+Inf`/`-Inf`/`NaN` for non-finite.
+
+## Migrating v3 → v4
+
+| v3 | v4 |
+| --- | --- |
+| `r.RegisterCounter(c)`, `RegisterGauge`, `RegisterLabeledCounter`, `RegisterLabeledGauge`, `RegisterHistogram`, `RegisterLabeledHistogram` — six typed methods, panic on any problem | Two doors for all six types: `r.Register(m) error` when the caller can handle the error, `r.MustRegister(m ...)` (variadic) to keep fail-fast behavior |
+| Constructors panic on an invalid metric name, an invalid/reserved/duplicate label name, more than 8 labels, or bad histogram buckets | Constructors capture the error into the metric (the `client_golang` `Desc.err` shape). The metric records nothing and is never exposed; the error surfaces at `Register` (or as the `MustRegister` panic) |
+| Registration collisions and re-registration panic | `Register` returns the error; `MustRegister` keeps the panic |
+| `WriteProcessMetrics(b)` | `WriteProcess(b)` |
+
+Unchanged: label-arity mismatches on record paths (`Inc`/`Add`/`Set`/`Observe`/`Delete`, `NewTimer`) and a negative `Counter.Add`/`LabeledCounter.Add` still panic, matching `client_golang`; `NewRegistry` still panics on an invalid prefix.
+
+Package-level `var` metric sets (the knell / registry-stats pattern) keep their shape: constructors are safe in `var` initializers, and the `init` registration switches to `MustRegister`, which preserves v3's fail-fast behavior at process start:
+
+```go
+var tasks = metrics.NewCounter("tasks_total", "Total tasks")
+
+func init() {
+	registry.MustRegister(tasks) // panics at startup if the metric is invalid
+}
+```
 
 ## Unsupported by Design
 
@@ -146,6 +172,7 @@ Numeric values render through a single canonical formatter: whole values as bare
 | **Protobuf exposition format**              | Text format is default in Prometheus 3.0; protobuf requires code generation                                                                         |
 | **Native histograms (exponential buckets)** | Requires protobuf format; large specialized implementation                                                                                          |
 | **Unregister / dynamic metric lifecycle**   | All consumers have static metric sets                                                                                                               |
+| **Third-party collectors**                  | `Metric` is sealed (its method is unexported): registration accepts exactly the six built-in types, unlike `client_golang`'s open `Collector`       |
 | **Image metrics**                           | Prior `EnableImageMetrics` / `SetImageMetrics` / `ImageMetric` API removed in v2; consumers that need per-image gauges layer them on `LabeledGauge` |
 | **Float64 counter**                         | Integer counters are sufficient for all consumers                                                                                                   |
 | **Gzip response compression**               | Use standard HTTP middleware                                                                                                                        |

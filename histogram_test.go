@@ -30,27 +30,27 @@ func TestNewHistogram_withBucketsOverrides(t *testing.T) {
 	}
 }
 
-// TestNewHistogram_invalidBuckets_panic verifies the bucket contract is enforced
-// at construction: bounds must be strictly increasing finite values. Each case
-// pins a violation that would otherwise emit duplicate or non-monotonic le
-// series that parsers reject.
-func TestNewHistogram_invalidBuckets_panic(t *testing.T) {
+// TestNewHistogram_invalidBuckets_errorsAtRegister verifies the bucket
+// contract is validated at construction — bounds must be strictly increasing
+// finite values — with the violation captured into the histogram and surfaced
+// at registration. Each case pins a violation that would otherwise emit
+// duplicate or non-monotonic le series that parsers reject.
+func TestNewHistogram_invalidBuckets_errorsAtRegister(t *testing.T) {
 	tests := []struct {
 		name   string
 		bounds []float64
 		want   string
 	}{
-		{"duplicates", []float64{1, 1, 5, 5}, "strictly increasing"},
-		{"unsorted", []float64{2, 1}, "strictly increasing"},
-		{"nan", []float64{math.NaN(), 0.5, 1}, "finite"},
-		{"pos_inf", []float64{0.5, math.Inf(1)}, "finite"},
-		{"neg_inf", []float64{math.Inf(-1), 0, 1}, "finite"},
+		{"duplicates", []float64{1, 1, 5, 5}, `bounds for metric "inv_duplicates" must be strictly increasing`},
+		{"unsorted", []float64{2, 1}, `bounds for metric "inv_unsorted" must be strictly increasing`},
+		{"nan", []float64{math.NaN(), 0.5, 1}, `bound for metric "inv_nan" must be finite`},
+		{"pos_inf", []float64{0.5, math.Inf(1)}, `bound for metric "inv_pos_inf" must be finite`},
+		{"neg_inf", []float64{math.Inf(-1), 0, 1}, `bound for metric "inv_neg_inf" must be finite`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			mustPanicContaining(t, tc.want, func() {
-				NewHistogram("inv_"+tc.name, "test", WithBuckets(tc.bounds))
-			})
+			h := NewHistogram("inv_"+tc.name, "test", WithBuckets(tc.bounds)) // must not panic
+			mustRegisterError(t, NewRegistry(""), h, tc.want)
 		})
 	}
 }
@@ -491,13 +491,11 @@ func TestLabeledHistogram_ObserveArityPanic(t *testing.T) {
 	lh.Observe(1.0, "only_one")
 }
 
-func TestNewLabeledHistogram_TooManyLabelsPanics(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expected panic for >8 labels")
-		}
-	}()
-	NewLabeledHistogram("lh_many", "test", []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"})
+// TestNewLabeledHistogram_TooManyLabelsErrorsAtRegister pins the maxLabels
+// cap: a ninth label is captured at construction and surfaces at registration.
+func TestNewLabeledHistogram_TooManyLabelsErrorsAtRegister(t *testing.T) {
+	lh := NewLabeledHistogram("lh_many", "test", []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"})
+	mustRegisterError(t, NewRegistry(""), lh, `LabeledHistogram "lh_many" supports at most 8 labels`)
 }
 
 // TestNewLabeledHistogram_ExactlyMaxLabelsAllowed pins the arity guard at its
@@ -513,22 +511,13 @@ func TestNewLabeledHistogram_ExactlyMaxLabelsAllowed(t *testing.T) {
 	}
 }
 
-// TestNewLabeledHistogram_LabelNameLePanics pins the cycle-1 guard that reserves
-// the label name "le" for the implicit bucket bound: constructing a labeled
-// histogram with an "le" label must panic with the reserved-label message. It
-// fails with "expected panic" if the guard is removed or relaxed.
-func TestNewLabeledHistogram_LabelNameLePanics(t *testing.T) {
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal(`expected panic for reserved label name "le"`)
-		}
-		msg, _ := r.(string)
-		if !strings.Contains(msg, `label name "le" is reserved`) {
-			t.Errorf("panic message = %v, want it to contain %q", r, `label name "le" is reserved`)
-		}
-	}()
-	NewLabeledHistogram("lh_reserved_le", "test", []string{"method", "le"})
+// TestNewLabeledHistogram_LabelNameLeErrorsAtRegister pins the guard that
+// reserves the label name "le" for the implicit bucket bound: constructing a
+// labeled histogram with an "le" label captures the reserved-label error,
+// which surfaces at registration. It fails if the guard is removed or relaxed.
+func TestNewLabeledHistogram_LabelNameLeErrorsAtRegister(t *testing.T) {
+	lh := NewLabeledHistogram("lh_reserved_le", "test", []string{"method", "le"}) // must not panic
+	mustRegisterError(t, NewRegistry(""), lh, `label name "le" for metric "lh_reserved_le" is reserved`)
 }
 
 // TestLabeledHistogram_Concurrent asserts every concurrent Observe across
@@ -583,7 +572,7 @@ func TestTimer(t *testing.T) {
 func TestLabeledHistogramTimer(t *testing.T) {
 	lh := NewLabeledHistogram("op_seconds", "op", []string{"kind"})
 	r := NewRegistry("")
-	r.RegisterLabeledHistogram(lh)
+	r.MustRegister(lh)
 	tm := lh.NewTimer("scan")
 	if d := tm.ObserveDuration(); d < 0 {
 		t.Fatalf("negative duration %v", d)
@@ -600,7 +589,7 @@ func TestLabeledHistogramTimer(t *testing.T) {
 func TestLabeledHistogramTimer_CopiesLabelValuesAtConstruction(t *testing.T) {
 	lh := NewLabeledHistogram("op_seconds_copy", "op", []string{"kind"})
 	r := NewRegistry("")
-	r.RegisterLabeledHistogram(lh)
+	r.MustRegister(lh)
 	vals := []string{"scan"}
 	tm := lh.NewTimer(vals...)
 	vals[0] = "mutated"

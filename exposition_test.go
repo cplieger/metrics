@@ -116,7 +116,7 @@ func TestCollect_capacityCounters(t *testing.T) {
 	const prefix = "capctr_"
 	reg := NewRegistry("")
 	for i := range 20 {
-		reg.RegisterCounter(NewCounter(prefix+strconv.Itoa(i)+"_total", "h"))
+		reg.MustRegister(NewCounter(prefix+strconv.Itoa(i)+"_total", "h"))
 	}
 
 	fams := reg.collect()
@@ -131,7 +131,7 @@ func TestCollect_capacityLabeledGauges(t *testing.T) {
 	reg := NewRegistry("")
 	for i := range 20 {
 		lg := NewLabeledGauge(prefix+strconv.Itoa(i), "h", []string{"k"})
-		reg.RegisterLabeledGauge(lg)
+		reg.MustRegister(lg)
 		lg.Set(1, "v") // a labeled metric only emits a family once a combo is set
 	}
 
@@ -146,7 +146,7 @@ func TestCollect_capacityHistograms(t *testing.T) {
 	const prefix = "caphist_"
 	reg := NewRegistry("")
 	for i := range 20 {
-		reg.RegisterHistogram(NewHistogram(prefix+strconv.Itoa(i), "h"))
+		reg.MustRegister(NewHistogram(prefix+strconv.Itoa(i), "h"))
 	}
 
 	fams := reg.collect()
@@ -161,7 +161,7 @@ func TestCollect_capacityLabeledHistograms(t *testing.T) {
 	reg := NewRegistry("")
 	for i := range 20 {
 		lh := NewLabeledHistogram(prefix+strconv.Itoa(i), "h", []string{"k"})
-		reg.RegisterLabeledHistogram(lh)
+		reg.MustRegister(lh)
 		lh.Observe(0.1, "v")
 	}
 
@@ -176,13 +176,67 @@ func TestCollect_capacityGauges(t *testing.T) {
 	const prefix = "capg_"
 	reg := NewRegistry("")
 	for i := range 20 {
-		reg.RegisterGauge(NewGauge(prefix+strconv.Itoa(i), "h"))
+		reg.MustRegister(NewGauge(prefix+strconv.Itoa(i), "h"))
 	}
 
 	fams := reg.collect()
 
 	if got := countFamiliesWithPrefix(fams, prefix); got != 20 {
 		t.Fatalf("collect() emitted %d %q families, want 20", got, prefix)
+	}
+}
+
+// TestWrite_ErroredMetricWritesNothing pins the v4 invariant on the direct
+// write path: a metric value carrying a construction error emits NOTHING
+// through its low-level Write* function — never a # HELP/# TYPE block for a
+// family that could corrupt the scrape. One case per Write* shim, each with a
+// different captured-error class. Serial: it captures slog.Default (the
+// record calls staging each metric emit the one-time inert-record warning).
+func TestWrite_ErroredMetricWritesNothing(t *testing.T) {
+	_ = captureDebugLogs(t) // absorb the expected one-time inert-record warnings
+	cases := []struct {
+		name  string
+		write func(b *strings.Builder)
+	}{
+		{"counter, invalid name", func(b *strings.Builder) {
+			c := NewCounter("bad-name", "x")
+			c.Inc()
+			WriteCounter(b, c)
+		}},
+		{"gauge, invalid name", func(b *strings.Builder) {
+			g := NewGauge("bad-name", "x")
+			g.Set(4)
+			WriteGauge(b, g)
+		}},
+		{"labeled counter, invalid label name", func(b *strings.Builder) {
+			lc := NewLabeledCounter("wn_ok_total", "x", []string{"bad-label"})
+			lc.Inc("v")
+			WriteLabeledCounter(b, lc)
+		}},
+		{"labeled gauge, reserved label prefix", func(b *strings.Builder) {
+			lg := NewLabeledGauge("wn_ok_gauge", "x", []string{"__rsv"})
+			lg.Set(1, "v")
+			WriteLabeledGauge(b, lg)
+		}},
+		{"histogram, unordered buckets", func(b *strings.Builder) {
+			h := NewHistogram("wn_ok_hist", "x", WithBuckets([]float64{2, 1}))
+			h.Observe(0.5)
+			WriteHistogram(b, h)
+		}},
+		{"labeled histogram, reserved le label", func(b *strings.Builder) {
+			lh := NewLabeledHistogram("wn_ok_seconds", "x", []string{"le"})
+			lh.Observe(0.5, "v")
+			WriteLabeledHistogram(b, lh)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var b strings.Builder
+			tc.write(&b)
+			if b.Len() != 0 {
+				t.Errorf("Write* of a metric carrying a construction error emitted %q, want nothing", b.String())
+			}
+		})
 	}
 }
 
@@ -197,12 +251,7 @@ func TestEncoders_bothFormats_allTypes(t *testing.T) {
 	lg := NewLabeledGauge("parity_lg", "Labeled gauge", []string{"k"})
 	lh := NewLabeledHistogram("parity_lh", "Labeled histogram", []string{"k"}, WithBuckets([]float64{0.5}))
 
-	r.RegisterCounter(c)
-	r.RegisterGauge(g)
-	r.RegisterHistogram(h)
-	r.RegisterLabeledCounter(lc)
-	r.RegisterLabeledGauge(lg)
-	r.RegisterLabeledHistogram(lh)
+	r.MustRegister(c, g, h, lc, lg, lh)
 
 	c.Add(10)
 	g.Set(3.14)

@@ -113,13 +113,11 @@ func TestLabeledGauge_SetArityPanic(t *testing.T) {
 	lg.Set(1.0, "only_one")
 }
 
-func TestNewLabeledGauge_TooManyLabelsPanics(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expected panic for >8 labels")
-		}
-	}()
-	NewLabeledGauge("lg_many", "test", []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"})
+// TestNewLabeledGauge_TooManyLabelsErrorsAtRegister pins the maxLabels cap:
+// a ninth label is captured at construction and surfaces at registration.
+func TestNewLabeledGauge_TooManyLabelsErrorsAtRegister(t *testing.T) {
+	lg := NewLabeledGauge("lg_many", "test", []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"})
+	mustRegisterError(t, NewRegistry(""), lg, `LabeledGauge "lg_many" supports at most 8 labels`)
 }
 
 // TestNewLabeledGauge_ExactlyMaxLabelsAllowed pins the arity guard at its
