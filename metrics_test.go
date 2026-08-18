@@ -120,13 +120,23 @@ func TestRegistryEmptyPrefixUnchanged(t *testing.T) {
 	}
 }
 
-func TestRegistryInvalidPrefixPanics(t *testing.T) {
+// TestRegistryInvalidPrefixReportsAtMustRegister is the MustRegister half of
+// the captured-prefix contract: the panicking door still panics, so a
+// package-level registry built with a bad prefix still fails at init, but it
+// fails through the same door every other construction error uses rather than
+// through a second mechanism inside NewRegistry.
+func TestRegistryInvalidPrefixReportsAtMustRegister(t *testing.T) {
 	defer func() {
-		if recover() == nil {
-			t.Error("NewRegistry with invalid prefix should panic")
+		r := recover()
+		if r == nil {
+			t.Fatal("MustRegister on a registry with an invalid prefix did not panic")
+		}
+		err, ok := r.(error)
+		if !ok || !strings.Contains(err.Error(), "invalid registry prefix") {
+			t.Errorf("panic value = %v, want an error naming the invalid prefix", r)
 		}
 	}()
-	NewRegistry("bad-prefix!")
+	NewRegistry("bad-prefix!").MustRegister(NewCounter("widgets_total", "Widgets"))
 }
 
 func TestRegistry_DuplicateRegistrationErrors(t *testing.T) {
@@ -533,5 +543,34 @@ func BenchmarkRegistryHandler(b *testing.B) {
 	for range b.N {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
+	}
+}
+
+// TestNewRegistryCapturesAnInvalidPrefix pins the one error model: a prefix
+// that cannot make a valid metric name is captured at construction and
+// reported at the registration door, exactly like a metric's own construction
+// error. It is not a panic, because a registry whose prefix is bad produces
+// only invalid names and has a door to say so at.
+func TestNewRegistryCapturesAnInvalidPrefix(t *testing.T) {
+	r := NewRegistry("bad prefix")
+	c := NewCounter("requests", "total requests")
+
+	err := r.Register(c)
+	if err == nil {
+		t.Fatal("Register on a registry with an invalid prefix returned nil, want the captured prefix error")
+	}
+	if !strings.Contains(err.Error(), "invalid registry prefix") {
+		t.Errorf("Register err = %v, want it to name the invalid prefix", err)
+	}
+
+	// The same registry keeps reporting it: the error is a property of the
+	// registry, not a one-shot.
+	if err := r.Register(NewGauge("queue", "queue depth")); err == nil {
+		t.Error("a second Register returned nil, want the captured prefix error again")
+	}
+
+	// And a valid prefix still registers.
+	if err := NewRegistry("app").Register(NewCounter("requests", "total requests")); err != nil {
+		t.Errorf("Register on a valid prefix = %v, want nil", err)
 	}
 }

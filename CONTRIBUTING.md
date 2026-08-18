@@ -59,10 +59,13 @@ not, and they are easy to break:
   evaluation before the CAS races the winner's rename when one value is
   registered into two registries concurrently. STILL fail-fast panics, by
   design: `Inc`/`Observe`/`Set` on label-arity mismatch, `Counter.Add` on a
-  negative delta (it also saturates at `math.MaxInt64` instead of wrapping),
-  and `NewRegistry` on an invalid prefix. Tests assert both halves; don't
-  soften the panics to error returns, and don't let an errored metric reach
-  the exposition. Invalid UTF-8 is deliberately in neither set: label values
+  negative delta (it also saturates at `math.MaxInt64` instead of wrapping).
+  `NewRegistry` is NOT in that set: an invalid prefix is captured on the
+  registry and reported by every `Register`/`MustRegister`, because a prefix
+  that cannot make a valid name makes every metric under it invalid and the
+  registration door is where this package reports construction errors. Tests
+  assert both halves; don't soften the record-path panics to error returns, and
+  don't let an errored metric reach the exposition. Invalid UTF-8 is deliberately in neither set: label values
   and help text are sanitized with the Unicode replacement character (U+FFFD)
   by the shared `sanitizeUTF8` engine (`validate.go`), with a one-time `slog`
   warning per newly created sanitized series (label path) and per constructor
