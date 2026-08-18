@@ -162,7 +162,10 @@ func checkNameAndLabels(kind, name string, labels []string) ([]string, error) {
 		err = lerr
 	}
 	if err == nil && len(owned) > maxLabels {
-		err = fmt.Errorf("metrics: %s %q supports at most 8 labels", kind, name)
+		// The cap comes from the constant, not a literal: labelKey is a
+		// [maxLabels]string array, so raising the cap edits one const and this
+		// message follows it.
+		err = fmt.Errorf("metrics: %s %q supports at most %d labels", kind, name, maxLabels)
 	}
 	return owned, err
 }
