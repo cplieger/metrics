@@ -106,23 +106,34 @@ type Registry struct {
 	labeledGauges     []*LabeledGauge
 	histograms        []*Histogram
 	labeledHistograms []*LabeledHistogram
-	mu                sync.RWMutex
+	// err is a construction error captured by NewRegistry (an invalid
+	// prefix). Every registration reports it, so a registry that cannot
+	// produce a valid metric name refuses rather than emitting one.
+	err error
+	mu  sync.RWMutex
 }
 
 // NewRegistry creates a new metrics registry. Construction through
 // NewRegistry is mandatory: the zero Registry has a nil name table and
-// panics on the first registration. An invalid prefix (not matching the
-// metric-name grammar) panics — the registry is itself the reporting door
-// for metric errors, so a malformed registry has nowhere to surface one.
+// panics on the first registration.
+//
+// An invalid prefix (one that does not match the metric-name grammar) is
+// CAPTURED, not panicked, and surfaces at the first [Registry.Register] or
+// [Registry.MustRegister] — the same door every other construction error uses.
+// A prefix that cannot make a valid metric name makes every metric registered
+// through it invalid, so reporting it once at the door beats reporting it at
+// construction: it keeps this package to ONE error model with no exception,
+// and for a caller registering through MustRegister the failure still lands at
+// init, where a package-level registry is built.
 func NewRegistry(prefix string) *Registry {
-	if prefix != "" {
-		if err := checkMetricName(prefix); err != nil {
-			panic("metrics: invalid registry prefix: " + prefix)
-		}
-	}
 	r := &Registry{
 		prefix: prefix,
 		names:  make(map[string]string),
+	}
+	if prefix != "" {
+		if err := checkMetricName(prefix); err != nil {
+			r.err = fmt.Errorf("metrics: invalid registry prefix %q: %w", prefix, err)
+		}
 	}
 	for _, n := range processFamilyNames {
 		r.names[n] = "process metric"
@@ -237,6 +248,9 @@ func (r *Registry) MustRegister(ms ...Metric) {
 func (r *Registry) register(mErr error, registered *atomic.Bool, kind string, base func() string,
 	reserve func(name, kind string) error, attach func(name string),
 ) error {
+	if r.err != nil {
+		return r.err
+	}
 	if mErr != nil {
 		return mErr
 	}
