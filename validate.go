@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -54,7 +55,9 @@ func truncateForLog(s string) string {
 // by the Unicode replacement character U+FFFD and reports the change. Both
 // exposition formats require valid UTF-8, but the library never panics on
 // invalid UTF-8: degraded input is repaired and logged instead (unlike the
-// fail-fast name, arity, and bucket guards, which stay panics).
+// label-arity guard, which stays a fail-fast panic, and the name/label/bucket
+// checks, whose errors are captured into the metric and surface at
+// registration).
 func sanitizeUTF8(s string) (string, bool) {
 	if utf8.ValidString(s) {
 		return s, false
@@ -112,30 +115,54 @@ func isValidLabelName(name string) bool {
 func isLetter(b rune) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') }
 func isDigit(b rune) bool  { return b >= '0' && b <= '9' }
 
-func validateMetricName(name string) {
+// checkMetricName reports an invalid metric name as an error. Constructors
+// capture it into the metric value (client_golang's Desc.err shape) rather
+// than panicking; registration is where it surfaces.
+func checkMetricName(name string) error {
 	if !isValidMetricName(name) {
-		panic("metrics: invalid metric name: " + name)
+		return fmt.Errorf("metrics: invalid metric name %q", name)
 	}
+	return nil
 }
 
-// validateLabelNames returns an owned, fully validated copy of labels. It panics on
-// any invalid label name and on any duplicate label name, so the returned slice is
-// safe to retain: later mutation of the caller's original slice cannot alter it or
-// bypass set-level invariants (uniqueness, the reserved-name and arity guards).
-func validateLabelNames(labels []string) []string {
+// checkLabelNames returns an owned copy of labels and the first violation as
+// an error: an invalid label name, a reserved "__"-prefixed name, or a
+// duplicate. metric names the owning metric in each error, so a registration
+// failure out of a multi-metric MustRegister block identifies which
+// declaration carried the bad label. The clone is returned even on error, so
+// later mutation of the caller's original slice cannot alter the metric or
+// bypass set-level invariants (uniqueness, the reserved-name and arity
+// guards).
+func checkLabelNames(metric string, labels []string) ([]string, error) {
 	owned := slices.Clone(labels)
 	seen := make(map[string]struct{}, len(owned))
 	for _, l := range owned {
 		if !isValidLabelName(l) {
-			panic("metrics: invalid label name: " + l)
+			return owned, fmt.Errorf("metrics: invalid label name %q for metric %q", l, metric)
 		}
 		if strings.HasPrefix(l, "__") {
-			panic(`metrics: label name uses reserved "__" prefix: ` + l)
+			return owned, fmt.Errorf(`metrics: label name %q for metric %q uses the reserved "__" prefix`, l, metric)
 		}
 		if _, ok := seen[l]; ok {
-			panic("metrics: duplicate label name: " + l)
+			return owned, fmt.Errorf("metrics: duplicate label name %q for metric %q", l, metric)
 		}
 		seen[l] = struct{}{}
 	}
-	return owned
+	return owned, nil
+}
+
+// checkNameAndLabels runs the construction-time validation shared by the
+// three labeled metric types: metric name, label names, and the maxLabels
+// cap. kind names the concrete type in the label-cap error. The first
+// violation wins; the owned label clone is returned either way.
+func checkNameAndLabels(kind, name string, labels []string) ([]string, error) {
+	err := checkMetricName(name)
+	owned, lerr := checkLabelNames(name, labels)
+	if err == nil {
+		err = lerr
+	}
+	if err == nil && len(owned) > maxLabels {
+		err = fmt.Errorf("metrics: %s %q supports at most 8 labels", kind, name)
+	}
+	return owned, err
 }

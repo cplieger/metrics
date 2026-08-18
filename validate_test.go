@@ -1,13 +1,17 @@
 package metrics
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
 )
 
-func TestValidateMetricName_Panics(t *testing.T) {
+// TestNewCounter_InvalidNameErrorsAtRegister pins the v4 name-validation
+// shape: an invalid metric name no longer panics at construction — it is
+// captured into the metric and surfaces as the Register error.
+func TestNewCounter_InvalidNameErrorsAtRegister(t *testing.T) {
 	invalid := []string{
 		"",
 		"123abc",
@@ -19,17 +23,13 @@ func TestValidateMetricName_Panics(t *testing.T) {
 	}
 	for _, name := range invalid {
 		t.Run(name, func(t *testing.T) {
-			defer func() {
-				if r := recover(); r == nil {
-					t.Errorf("expected panic for name %q", name)
-				}
-			}()
-			NewCounter(name, "test")
+			c := NewCounter(name, "test") // must not panic
+			mustRegisterError(t, NewRegistry(""), c, fmt.Sprintf("invalid metric name %q", name))
 		})
 	}
 }
 
-func TestValidateMetricName_Valid(t *testing.T) {
+func TestNewCounter_ValidNameRegisters(t *testing.T) {
 	valid := []string{
 		"a",
 		"_private",
@@ -41,13 +41,14 @@ func TestValidateMetricName_Valid(t *testing.T) {
 	}
 	for _, name := range valid {
 		t.Run(name, func(t *testing.T) {
-			// Should not panic
-			NewCounter(name, "test")
+			if err := NewRegistry("").Register(NewCounter(name, "test")); err != nil {
+				t.Errorf("Register(%q) = %v, want nil", name, err)
+			}
 		})
 	}
 }
 
-func TestValidateLabelName_Panics(t *testing.T) {
+func TestNewLabeledCounter_InvalidLabelNameErrorsAtRegister(t *testing.T) {
 	invalid := []string{
 		"",
 		"123abc",
@@ -57,13 +58,150 @@ func TestValidateLabelName_Panics(t *testing.T) {
 	}
 	for _, name := range invalid {
 		t.Run(name, func(t *testing.T) {
-			defer func() {
-				if r := recover(); r == nil {
-					t.Errorf("expected panic for label %q", name)
-				}
-			}()
-			NewLabeledCounter("valid_metric", "test", []string{name})
+			lc := NewLabeledCounter("valid_metric", "test", []string{name}) // must not panic
+			mustRegisterError(t, NewRegistry(""), lc, fmt.Sprintf(`invalid label name %q for metric "valid_metric"`, name))
 		})
+	}
+}
+
+// TestErroredMetric_RecordPathsAreInert pins the no-op contract for a metric
+// carrying a construction error: every record method returns without
+// recording and without panicking — including calls that would otherwise trip
+// the label-arity or negative-delta panics, since an errored metric's label
+// set is not trustworthy enough to judge arity against and there is nothing
+// to corrupt. Serial: it captures slog.Default (the inert drops warn once per
+// metric; TestErroredMetric_FirstDropWarnsOnce pins that contract).
+func TestErroredMetric_RecordPathsAreInert(t *testing.T) {
+	_ = captureDebugLogs(t) // absorb the expected one-time inert-record warnings
+
+	c := NewCounter("bad name", "x")
+	c.Inc()
+	c.Add(-1) // would panic on a valid counter
+	if got := c.val.Load(); got != 0 {
+		t.Errorf("errored Counter value = %d, want 0", got)
+	}
+
+	g := NewGauge("bad name", "x")
+	g.Set(3)
+	g.Add(1)
+	g.Sub(1)
+	if got := g.Get(); got != 0 {
+		t.Errorf("errored Gauge value = %v, want 0", got)
+	}
+
+	lc := NewLabeledCounter("inert_total", "x", []string{"bad-label", "m"})
+	lc.Inc("wrong", "arity", "here") // would panic on a valid counter
+	lc.Add(-5)                       // negative AND wrong arity: still a no-op
+	lc.Delete("wrong")
+	lc.Reset()
+	if got := len(lc.vals); got != 0 {
+		t.Errorf("errored LabeledCounter series = %d, want 0", got)
+	}
+
+	lg := NewLabeledGauge("inert_gauge", "x", []string{"__rsv"})
+	lg.Set(1, "too", "many")
+	lg.Delete("too", "many")
+	if got := len(lg.vals); got != 0 {
+		t.Errorf("errored LabeledGauge series = %d, want 0", got)
+	}
+
+	h := NewHistogram("inert_hist", "x", WithBuckets([]float64{2, 1}))
+	h.Observe(0.5)
+	if got := h.count.Load(); got != 0 {
+		t.Errorf("errored Histogram count = %d, want 0", got)
+	}
+
+	lh := NewLabeledHistogram("inert_seconds", "x", []string{"le"})
+	lh.Observe(0.5, "too", "many")
+	tm := lh.NewTimer("wrong", "arity") // eager arity check is skipped when errored
+	tm.ObserveDuration()                // observes into the inert histogram: no-op
+	lh.Delete("v")
+	if got := len(lh.vals); got != 0 {
+		t.Errorf("errored LabeledHistogram series = %d, want 0", got)
+	}
+}
+
+// TestConstruction_FirstErrorWins pins the capture order when a constructor
+// sees several violations: the metric-name error is captured, and it is what
+// registration reports (naming the offending metric).
+func TestConstruction_FirstErrorWins(t *testing.T) {
+	lc := NewLabeledCounter("bad name", "x", []string{"also-bad"})
+	mustRegisterError(t, NewRegistry(""), lc, `invalid metric name "bad name"`)
+}
+
+// TestErroredMetric_FirstDropWarnsOnce pins the inert-record diagnostic for
+// every metric type: the first record dropped on a metric carrying a
+// construction error emits exactly one slog warning naming the metric and the
+// error (mirroring the one-time cardinality warning), and later records stay
+// silent no-ops. Registration is the reporting door, but a metric constructed
+// and never registered would otherwise die with no diagnostic at all. Serial:
+// it captures slog.Default.
+func TestErroredMetric_FirstDropWarnsOnce(t *testing.T) {
+	const warnMsg = "record dropped, metric carries a construction error"
+	cases := []struct {
+		kind   string
+		metric string
+		record func()
+	}{
+		{"Counter", "bad name", func() {
+			c := NewCounter("bad name", "x")
+			c.Inc()
+			c.Add(3)
+		}},
+		{"Gauge Set then Add", "bad gauge", func() {
+			g := NewGauge("bad gauge", "x")
+			g.Set(1)
+			g.Add(2)
+		}},
+		{"LabeledCounter", "inert_total", func() {
+			lc := NewLabeledCounter("inert_total", "x", []string{"bad-label"})
+			lc.Inc("v")
+			lc.Add(2, "v")
+		}},
+		{"LabeledGauge", "inert_gauge", func() {
+			lg := NewLabeledGauge("inert_gauge", "x", []string{"__rsv"})
+			lg.Set(1, "v")
+			lg.Set(2, "v")
+		}},
+		{"Histogram", "inert_hist", func() {
+			h := NewHistogram("inert_hist", "x", WithBuckets([]float64{2, 1}))
+			h.Observe(0.5)
+			h.Observe(0.7)
+		}},
+		{"LabeledHistogram via Timer", "inert_seconds", func() {
+			lh := NewLabeledHistogram("inert_seconds", "x", []string{"le"})
+			lh.NewTimer("v").ObserveDuration()
+			lh.Observe(0.5, "v")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.kind, func(t *testing.T) {
+			buf := captureDebugLogs(t)
+			tc.record()
+			logs := buf.String()
+			if got := strings.Count(logs, warnMsg); got != 1 {
+				t.Fatalf("inert-record warnings after two records = %d, want exactly 1\nlogs: %s", got, logs)
+			}
+			if !strings.Contains(logs, "metric="+strconv.Quote(tc.metric)) && !strings.Contains(logs, "metric="+tc.metric) {
+				t.Errorf("logs = %q, want warning naming metric %q", logs, tc.metric)
+			}
+			if !strings.Contains(logs, "error=") {
+				t.Errorf("logs = %q, want warning carrying the construction error", logs)
+			}
+		})
+	}
+}
+
+// TestValidMetric_RecordPathNeverWarns guards the fast path: a valid metric's
+// records emit no inert-record warning (the warn branch is reachable only
+// when a construction error was captured). Serial: it captures slog.Default.
+func TestValidMetric_RecordPathNeverWarns(t *testing.T) {
+	buf := captureDebugLogs(t)
+	c := NewCounter("valid_total", "x")
+	c.Inc()
+	c.Add(2)
+	if logs := buf.String(); strings.Contains(logs, "record dropped") {
+		t.Errorf("valid metric records logged an inert-record warning: %q", logs)
 	}
 }
 
@@ -103,22 +241,26 @@ func TestIsValidLabelName_digitAfterFirstChar(t *testing.T) {
 	}
 }
 
-// TestValidateLabelNames_DuplicatePanics pins the set-level uniqueness invariant:
-// constructing any labeled metric with a repeated label name is a fail-fast panic,
-// since duplicate names would otherwise emit invalid series like {a="x",a="y"}.
-func TestValidateLabelNames_DuplicatePanics(t *testing.T) {
+// TestNewLabeled_DuplicateLabelErrorsAtRegister pins the set-level uniqueness
+// invariant: constructing any labeled metric with a repeated label name
+// captures an error naming both the label and the metric, which surfaces at
+// registration, since duplicate names would otherwise emit invalid series
+// like {a="x",a="y"}.
+func TestNewLabeled_DuplicateLabelErrorsAtRegister(t *testing.T) {
 	dup := []string{"method", "method"}
 	cases := []struct {
-		name string
-		fn   func()
+		name   string
+		metric string
+		make   func() Metric
 	}{
-		{"LabeledCounter", func() { NewLabeledCounter("dup_counter_total", "test", dup) }},
-		{"LabeledGauge", func() { NewLabeledGauge("dup_gauge", "test", dup) }},
-		{"LabeledHistogram", func() { NewLabeledHistogram("dup_hist_seconds", "test", dup) }},
+		{"LabeledCounter", "dup_counter_total", func() Metric { return NewLabeledCounter("dup_counter_total", "test", dup) }},
+		{"LabeledGauge", "dup_gauge", func() Metric { return NewLabeledGauge("dup_gauge", "test", dup) }},
+		{"LabeledHistogram", "dup_hist_seconds", func() Metric { return NewLabeledHistogram("dup_hist_seconds", "test", dup) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mustPanicContaining(t, "duplicate label name: method", tc.fn)
+			mustRegisterError(t, NewRegistry(""), tc.make(),
+				fmt.Sprintf(`duplicate label name "method" for metric %q`, tc.metric))
 		})
 	}
 }
@@ -165,25 +307,28 @@ func TestNewLabeledHistogram_MutationCannotBypassLeGuard(t *testing.T) {
 	}
 }
 
-// TestValidateLabelNames_ReservedPrefixPanics pins the Prometheus data-model
+// TestNewLabeled_ReservedPrefixErrorsAtRegister pins the Prometheus data-model
 // guard: a label name beginning with the reserved "__" prefix (used for
-// internal names like __name__) is a fail-fast panic on construction of any
-// labeled metric, matching client_golang's checkLabelName.
-func TestValidateLabelNames_ReservedPrefixPanics(t *testing.T) {
+// internal names like __name__) is captured at construction of any labeled
+// metric and surfaces at registration naming both the label and the metric,
+// matching client_golang's checkLabelName rule.
+func TestNewLabeled_ReservedPrefixErrorsAtRegister(t *testing.T) {
 	reserved := []string{"__foo", "__name__", "__"}
 	for _, name := range reserved {
 		t.Run(name, func(t *testing.T) {
 			cases := []struct {
-				kind string
-				fn   func()
+				kind   string
+				metric string
+				make   func() Metric
 			}{
-				{"LabeledCounter", func() { NewLabeledCounter("rsv_counter_total", "test", []string{name}) }},
-				{"LabeledGauge", func() { NewLabeledGauge("rsv_gauge", "test", []string{name}) }},
-				{"LabeledHistogram", func() { NewLabeledHistogram("rsv_hist_seconds", "test", []string{name}) }},
+				{"LabeledCounter", "rsv_counter_total", func() Metric { return NewLabeledCounter("rsv_counter_total", "test", []string{name}) }},
+				{"LabeledGauge", "rsv_gauge", func() Metric { return NewLabeledGauge("rsv_gauge", "test", []string{name}) }},
+				{"LabeledHistogram", "rsv_hist_seconds", func() Metric { return NewLabeledHistogram("rsv_hist_seconds", "test", []string{name}) }},
 			}
 			for _, tc := range cases {
 				t.Run(tc.kind, func(t *testing.T) {
-					mustPanicContaining(t, `reserved "__" prefix`, tc.fn)
+					mustRegisterError(t, NewRegistry(""), tc.make(),
+						fmt.Sprintf(`label name %q for metric %q uses the reserved "__" prefix`, name, tc.metric))
 				})
 			}
 		})
@@ -196,15 +341,17 @@ func TestValidateLabelNames_ReservedPrefixPanics(t *testing.T) {
 func TestValidateLabelNames_SingleUnderscoreValid(t *testing.T) {
 	cases := []struct {
 		kind string
-		fn   func()
+		make func() Metric
 	}{
-		{"LabeledCounter", func() { NewLabeledCounter("us_counter_total", "test", []string{"_foo"}) }},
-		{"LabeledGauge", func() { NewLabeledGauge("us_gauge", "test", []string{"_foo"}) }},
-		{"LabeledHistogram", func() { NewLabeledHistogram("us_hist_seconds", "test", []string{"_foo"}) }},
+		{"LabeledCounter", func() Metric { return NewLabeledCounter("us_counter_total", "test", []string{"_foo"}) }},
+		{"LabeledGauge", func() Metric { return NewLabeledGauge("us_gauge", "test", []string{"_foo"}) }},
+		{"LabeledHistogram", func() Metric { return NewLabeledHistogram("us_hist_seconds", "test", []string{"_foo"}) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.kind, func(t *testing.T) {
-			tc.fn() // must not panic
+			if err := NewRegistry("").Register(tc.make()); err != nil {
+				t.Errorf("Register = %v, want nil for a single-underscore label", err)
+			}
 		})
 	}
 }

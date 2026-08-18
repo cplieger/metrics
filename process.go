@@ -246,11 +246,11 @@ func processFamilies() []metricFamily {
 	return fams
 }
 
-// WriteProcessMetrics writes Go runtime and standard process metrics in
+// WriteProcess writes Go runtime and standard process metrics in
 // Prometheus text format. It is a thin shim over the neutral IR
 // (processFamilies) and the Prometheus encoder, preserved as part of the
 // package's exported surface.
-func WriteProcessMetrics(b *strings.Builder) {
+func WriteProcess(b *strings.Builder) {
 	appendPrometheus(b, processFamilies())
 }
 

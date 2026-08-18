@@ -12,8 +12,8 @@ func TestRecordHTTPNilSafe(t *testing.T) {
 	h := NewHistogram("req_seconds", "")
 	RecordHTTP(c, h, 250*time.Millisecond, "GET", "200")
 	r := NewRegistry("")
-	r.RegisterLabeledCounter(c)
-	r.RegisterHistogram(h)
+	r.MustRegister(c)
+	r.MustRegister(h)
 	out := body(t, r)
 	if !strings.Contains(out, `req_total{method="GET",status="200"} 1`) {
 		t.Errorf("RecordHTTP did not record counter:\n%s", out)

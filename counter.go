@@ -16,29 +16,55 @@ import (
 // value) into an actionable, alertable signal before memory is exhausted.
 const cardinalityWarnThreshold = 1000
 
+// warnInertOnce emits the one-time warning for a record dropped on a metric
+// carrying a construction error, naming the metric and the error; the CAS on
+// warned keeps every later drop a silent no-op (mirroring the one-time
+// cardinality warning). Registration is the designed reporting door, but a
+// metric constructed and never registered would otherwise fail with no
+// diagnostic at all, and recording is the operation such code actually
+// performs. Called only inside a record path's err != nil branch, so the
+// valid-metric fast path stays a single nil check; name is read via pointer
+// there, which is race-free because a metric carrying a construction error is
+// unregistrable and thus never concurrently renamed by a registration.
+func warnInertOnce(err error, warned *atomic.Bool, name *string) {
+	if warned.CompareAndSwap(false, true) {
+		slog.Warn("metrics: record dropped, metric carries a construction error",
+			"metric", *name, "error", err)
+	}
+}
+
 // Counter is a monotonically increasing counter.
 type Counter struct {
+	err        error // construction-time validation error; surfaces at registration
 	name       string
 	help       string
 	val        atomic.Int64
 	registered atomic.Bool
+	warned     atomic.Bool // one-time inert-record warning emitted
 }
 
 // NewCounter creates a named counter. Per Prometheus convention the name
-// should end in `_total` (e.g. "http_requests_total").
+// should end in `_total` (e.g. "http_requests_total"). An invalid name is
+// captured into the counter rather than panicking: the counter records
+// nothing, WriteCounter emits nothing for it, and the error surfaces at
+// registration.
 func NewCounter(name, help string) *Counter {
-	validateMetricName(name)
 	help = sanitizeHelp(name, help)
-	return &Counter{name: name, help: help}
+	return &Counter{name: name, help: help, err: checkMetricName(name)}
 }
 
 // Inc increments the counter by 1. The counter saturates at math.MaxInt64
 // instead of wrapping negative.
-func (c *Counter) Inc() { addSaturating(&c.val, 1) }
+func (c *Counter) Inc() { c.Add(1) }
 
 // Add increments the counter by n. Panics if n < 0. The counter saturates at
-// math.MaxInt64 instead of wrapping negative.
+// math.MaxInt64 instead of wrapping negative. A counter carrying a
+// construction error records nothing (one warning on the first drop).
 func (c *Counter) Add(n int64) {
+	if c.err != nil {
+		warnInertOnce(c.err, &c.warned, &c.name)
+		return
+	}
 	if n < 0 {
 		panic("metrics: Counter.Add called with negative value")
 	}
@@ -82,24 +108,28 @@ type LabeledCounter struct {
 	vals       map[labelKey]*atomic.Int64
 	name       string
 	help       string
+	err        error // construction-time validation error; surfaces at registration
 	labels     []string
 	registered atomic.Bool
+	warned     atomic.Bool // one-time inert-record warning emitted
 	mu         sync.RWMutex
 }
 
 // NewLabeledCounter creates a labeled counter with the given label names. As
 // with NewCounter, the name should end in `_total` per Prometheus convention.
+// Construction through NewLabeledCounter is mandatory: the zero
+// LabeledCounter has a nil series map and panics on the first record. An
+// invalid metric name, an invalid/reserved/duplicate label name, or more than
+// 8 labels is captured into the counter rather than panicking: the counter
+// records nothing and the error surfaces at registration.
 func NewLabeledCounter(name, help string, labels []string) *LabeledCounter {
-	validateMetricName(name)
 	help = sanitizeHelp(name, help)
-	labels = validateLabelNames(labels)
-	if len(labels) > maxLabels {
-		panic("metrics: LabeledCounter supports at most 8 labels")
-	}
+	owned, err := checkNameAndLabels("LabeledCounter", name, labels)
 	return &LabeledCounter{
 		name:   name,
 		help:   help,
-		labels: labels,
+		err:    err,
+		labels: owned,
 		vals:   make(map[labelKey]*atomic.Int64),
 	}
 }
@@ -109,9 +139,16 @@ func (lc *LabeledCounter) Inc(labelVals ...string) {
 	lc.Add(1, labelVals...)
 }
 
-// Add increments the counter for the given label values by n. Panics if n < 0.
-// Each series saturates at math.MaxInt64 instead of wrapping negative.
+// Add increments the counter for the given label values by n. Panics if n < 0
+// or on a label-arity mismatch. Each series saturates at math.MaxInt64
+// instead of wrapping negative. A counter carrying a construction error
+// records nothing, with one warning on the first drop (and skips both panics:
+// its label set is not trustworthy enough to judge arity against).
 func (lc *LabeledCounter) Add(n int64, labelVals ...string) {
+	if lc.err != nil {
+		warnInertOnce(lc.err, &lc.warned, &lc.name)
+		return
+	}
 	if n < 0 {
 		panic("metrics: LabeledCounter.Add called with negative value")
 	}
@@ -133,15 +170,23 @@ func (lc *LabeledCounter) Reset() {
 // It panics if the number of label values does not match the label count.
 // Label values are sanitized to valid UTF-8 the same way recording sanitizes
 // them, so Delete called with the original raw values removes the series
-// recording created.
+// recording created. A counter carrying a construction error has no series,
+// so Delete is a no-op.
 func (lc *LabeledCounter) Delete(labelVals ...string) {
+	if lc.err != nil {
+		return
+	}
 	deleteSeries(&lc.mu, lc.vals, lc.labels, labelVals)
 }
 
 // WriteCounter writes a counter in Prometheus text format. It is a thin shim
 // over the neutral IR (Counter.family) and the Prometheus encoder, retained as
-// part of the package's exported surface.
+// part of the package's exported surface. A counter carrying a construction
+// error writes nothing: an invalid metric must never reach the exposition.
 func WriteCounter(b *strings.Builder, c *Counter) {
+	if c.err != nil {
+		return
+	}
 	appendPrometheus(b, []metricFamily{c.family()})
 }
 
@@ -291,8 +336,12 @@ func buildLabelString(labels []string, key *labelKey) string {
 	return sb.String()
 }
 
-// WriteLabeledCounter writes a labeled counter in Prometheus text format (IR shim).
+// WriteLabeledCounter writes a labeled counter in Prometheus text format (IR
+// shim). A counter carrying a construction error writes nothing.
 func WriteLabeledCounter(b *strings.Builder, lc *LabeledCounter) {
+	if lc.err != nil {
+		return
+	}
 	if f, ok := lc.family(); ok {
 		appendPrometheus(b, []metricFamily{f})
 	}
