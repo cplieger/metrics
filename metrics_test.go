@@ -539,8 +539,7 @@ func BenchmarkRegistryHandler(b *testing.B) {
 	h := r.Handler()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 	}
