@@ -96,15 +96,19 @@ func captureDebugLogs(t *testing.T) *strings.Builder {
 func assertExpositionLabelsBalanced(t *testing.T, out string) {
 	t.Helper()
 	for line := range strings.SplitSeq(out, "\n") {
-		if !strings.Contains(line, "{") {
+		// The label section runs from the FIRST '{' to the LAST '}': a label
+		// value may legitimately contain either brace. Cutting around both
+		// separators carries the "found" answer with the slice, so no index
+		// arithmetic can go one out.
+		_, afterOpen, ok := strings.Cut(line, "{")
+		if !ok {
 			continue
 		}
-		braceStart := strings.IndexByte(line, '{')
-		braceEnd := strings.LastIndexByte(line, '}')
-		if braceEnd <= braceStart {
+		inner, _, ok := strings.CutLast(afterOpen, "}")
+		if !ok {
 			t.Fatalf("unbalanced braces: %q", line)
 		}
-		checkLabelQuoting(t, line[braceStart+1:braceEnd])
+		checkLabelQuoting(t, inner)
 	}
 }
 

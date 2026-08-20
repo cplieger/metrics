@@ -26,6 +26,14 @@ func TestParseProcStatCPU(t *testing.T) {
 			want: 3.0, // (200+100)/100
 		},
 		{
+			// The comm itself ENDS in ')', so the true terminator is the last of
+			// two adjacent ones: a split around the first, or around the
+			// second-to-last, reads the state field as utime.
+			name: "comm ending in a paren",
+			in:   "1234 (proc)) S 1 1 1 0 0 0 0 0 0 0 200 100 0 0",
+			want: 3.0,
+		},
+		{
 			name: "simple comm",
 			in:   "1234 (cat) S 1 1 1 0 0 0 0 0 0 0 50 50 0 0",
 			want: 1.0, // (50+50)/100
@@ -79,6 +87,13 @@ func TestParseProcStatStartTime(t *testing.T) {
 		{
 			name: "comm with spaces and parens",
 			in:   "1234 (weird (proc) name) S 1 1 1 0 0 0 0 0 0 0 200 100 0 0 20 0 1 0 42",
+			want: 42,
+		},
+		{
+			// The comm itself ends in ')': only a split around the LAST
+			// separator lands starttime at index 19.
+			name: "comm ending in a paren",
+			in:   "1234 (proc)) S 1 1 1 0 0 0 0 0 0 0 200 100 0 0 20 0 1 0 42",
 			want: 42,
 		},
 		{
@@ -326,21 +341,21 @@ func TestProcPresencePredicates_Boundaries(t *testing.T) {
 	}
 }
 
-// A single leading ')' makes strings.LastIndex return 0; the guard is `idx < 0`,
-// so idx == 0 must still parse.
-func TestParseProcStatCPU_LeadingParenIdxZero(t *testing.T) {
+// A stat line with no comm field starts at the separator, so CutLast's `before`
+// is empty while `found` is still true. The fields after it must parse.
+func TestParseProcStatCPU_NoCommField(t *testing.T) {
 	in := []byte(") 0 0 0 0 0 0 0 0 0 0 0 200 100")
 	if got := parseProcStatCPU(in, 100); got != 3.0 {
-		t.Errorf("parseProcStatCPU(%q) = %v, want 3.0 (idx == 0 must parse)", in, got)
+		t.Errorf("parseProcStatCPU(%q) = %v, want 3.0 (an empty comm must still parse)", in, got)
 	}
 }
 
-// A trailing ')' makes idx+2 exceed len(s); the bounds guard must return -1
-// rather than slicing out of range.
-func TestParseProcStatCPU_TrailingParenGuarded(t *testing.T) {
+// A line ending at the ')' leaves nothing after the comm, so the field-count
+// guard must return -1 rather than indexing an empty slice.
+func TestParseProcStatCPU_NothingAfterComm(t *testing.T) {
 	in := []byte("1234 (cat)")
 	if got := parseProcStatCPU(in, 100); got != -1 {
-		t.Errorf("parseProcStatCPU(%q) = %v, want -1 (trailing ')' guarded)", in, got)
+		t.Errorf("parseProcStatCPU(%q) = %v, want -1 (no fields after the comm)", in, got)
 	}
 }
 

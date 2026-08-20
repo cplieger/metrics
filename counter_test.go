@@ -366,16 +366,11 @@ func TestSortedLabelKeys_empty(t *testing.T) {
 
 func TestLabeledCounterConcurrent(t *testing.T) {
 	lc := NewLabeledCounter("conc_lc", "test", []string{"method", "status"})
-	done := make(chan struct{})
+	var wg sync.WaitGroup
 	for range 100 {
-		go func() {
-			lc.Inc("GET", "200")
-			done <- struct{}{}
-		}()
+		wg.Go(func() { lc.Inc("GET", "200") })
 	}
-	for range 100 {
-		<-done
-	}
+	wg.Wait()
 	key := labelKey{"GET", "200", "", ""}
 	if got := lc.vals[key].Load(); got != 100 {
 		t.Errorf("concurrent LabeledCounter = %d, want 100", got)
