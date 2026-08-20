@@ -269,13 +269,13 @@ func readProcCPUSeconds() float64 {
 // parseProcStatCPU parses /proc/self/stat content for utime+stime in seconds,
 // scaled by the given USER_HZ. Returns -1 on failure.
 func parseProcStatCPU(data []byte, hz float64) float64 {
-	// Fields after the comm (which may contain spaces/parens): find last ')'
-	s := string(data)
-	idx := strings.LastIndex(s, ")")
-	if idx < 0 || idx+2 >= len(s) {
+	// The comm field is parenthesized and may itself contain spaces and
+	// parens, so the fields after it start after the LAST ')'.
+	_, afterComm, ok := strings.CutLast(string(data), ")")
+	if !ok {
 		return -1
 	}
-	fields := strings.Fields(s[idx+2:])
+	fields := strings.Fields(afterComm)
 	// utime is field index 11, stime is 12 (0-indexed from after comm)
 	if len(fields) < 13 {
 		return -1
@@ -341,16 +341,16 @@ func readProcStartTime() float64 {
 
 // parseProcStatStartTime parses /proc/self/stat content for the process
 // starttime (field 22, 1-indexed), in clock ticks since boot. Returns -1 on
-// failure. Like parseProcStatCPU it locates the fields after the comm via the
-// final ')', since the comm may itself contain spaces and parens; counting from
-// field 3 (state) at slice index 0, starttime sits at index 22-3 = 19.
+// failure. Like parseProcStatCPU it locates the fields after the comm by
+// cutting around the final ')', since the comm may itself contain spaces and
+// parens; counting from field 3 (state) at slice index 0, starttime sits at
+// index 22-3 = 19.
 func parseProcStatStartTime(data []byte) int64 {
-	s := string(data)
-	idx := strings.LastIndex(s, ")")
-	if idx < 0 || idx+2 >= len(s) {
+	_, afterComm, ok := strings.CutLast(string(data), ")")
+	if !ok {
 		return -1
 	}
-	fields := strings.Fields(s[idx+2:])
+	fields := strings.Fields(afterComm)
 	const startTimeIdx = 19
 	if len(fields) <= startTimeIdx {
 		return -1
