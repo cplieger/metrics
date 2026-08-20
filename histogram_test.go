@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -402,16 +403,11 @@ func TestWriteHistogram_SumRendering(t *testing.T) {
 
 func TestHistogramConcurrent(t *testing.T) {
 	h := NewHistogram("conc_hist", "test")
-	done := make(chan struct{})
+	var wg sync.WaitGroup
 	for range 100 {
-		go func() {
-			h.Observe(0.01)
-			done <- struct{}{}
-		}()
+		wg.Go(func() { h.Observe(0.01) })
 	}
-	for range 100 {
-		<-done
-	}
+	wg.Wait()
 	if got := h.count.Load(); got != 100 {
 		t.Errorf("concurrent Histogram.count = %d, want 100", got)
 	}
@@ -556,17 +552,26 @@ func TestLabeledHistogram_Concurrent(t *testing.T) {
 	}
 }
 
+// TestTimer runs inside a synctest bubble so the elapsed duration is exact
+// rather than a lower bound: on the bubble's synthetic clock a 10ms
+// synctest.Sleep advances time.Since by exactly 10ms, which pins both the
+// duration Timer returns and the seconds it observes. On the real clock the
+// same test could only assert `d >= 10ms` and cost 10ms of wall time.
 func TestTimer(t *testing.T) {
-	h := NewHistogram("timer_test", "test")
-	timer := NewTimer(h)
-	time.Sleep(10 * time.Millisecond)
-	d := timer.ObserveDuration()
-	if d < 10*time.Millisecond {
-		t.Errorf("timer duration too short: %v", d)
-	}
-	if h.count.Load() != 1 {
-		t.Error("timer did not observe")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		h := NewHistogram("timer_test", "test")
+		timer := NewTimer(h)
+		synctest.Sleep(10 * time.Millisecond)
+		if d := timer.ObserveDuration(); d != 10*time.Millisecond {
+			t.Errorf("ObserveDuration() = %v, want exactly 10ms", d)
+		}
+		if got := h.count.Load(); got != 1 {
+			t.Errorf("histogram count = %d, want 1 (timer did not observe)", got)
+		}
+		if sum, _, _ := h.snapshot(); sum != 0.010 {
+			t.Errorf("observed sum = %v, want 0.010 (the elapsed duration in seconds)", sum)
+		}
+	})
 }
 
 func TestLabeledHistogramTimer(t *testing.T) {

@@ -117,6 +117,13 @@ func FuzzLabeledExposition_balanced(f *testing.F) {
 	f.Add("", 42.0)
 	f.Add(strings.Repeat("x", 500), 99.9)
 	f.Add("emoji🎉", 7.0)
+	// Braces are NOT escaped by the Prometheus text format (only backslash,
+	// double-quote and newline are), so a brace inside a label value appears
+	// raw within the brace group. These two seeds are the only inputs that
+	// exercise the balance checker's "first { to last }" span; without them a
+	// checker that cut around the FIRST '}' passed the whole suite.
+	f.Add("brace}close", 1.0)
+	f.Add("{both}", 2.0)
 
 	f.Fuzz(func(t *testing.T, val string, gaugeVal float64) {
 		// Invalid-UTF-8 label values are rewritten to U+FFFD at record time
