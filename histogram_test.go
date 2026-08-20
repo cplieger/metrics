@@ -641,8 +641,7 @@ func TestBucketAccessorsReturnFreshSlices(t *testing.T) {
 func BenchmarkHistogramObserve(b *testing.B) {
 	h := NewHistogram("bench_hist", "bench")
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		h.Observe(0.042)
 	}
 }
