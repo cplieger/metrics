@@ -9,7 +9,7 @@
 
 > Hand-rolled Prometheus text-format exposition library for Go
 
-A zero-dependency metrics library that exposes counters, gauges, labeled counters, histograms, and process metrics in Prometheus text format. Standard library only.
+A zero-dependency metrics library that exposes counters, gauges, histograms, their labeled variants, and process metrics in Prometheus text format. Standard library only.
 
 ## Install
 
@@ -113,12 +113,12 @@ Label values are caller-owned. Invalid UTF-8 never panics: the value is sanitize
 
 ### Registry
 
-- `NewRegistry(prefix) *Registry`: every registered metric name is prefixed with `<prefix>_` (process metrics excepted). Pass `""` for no prefix. Construction through `NewRegistry` is mandatory. An invalid prefix is captured and reported at the first `Register`/`MustRegister`, like a metric's own construction error — one error model, no exception, and a package-level registry built with a bad prefix still fails at init through `MustRegister`.
-- `Register(m Metric) error`: adds a metric (any of the six metric types) and reports what is wrong with it — the error captured at construction (invalid metric/label name, reserved or duplicate label, more than 8 labels, bad histogram buckets), an already-registered metric, a family-name collision (including the reserved `process_*` names), or a nil metric. On error the metric is not attached: after a name collision it stays registrable with a different registry, while a construction error is immutable — rebuild the metric with a valid name, label set, or buckets.
+- `NewRegistry(prefix) *Registry`: every registered metric name is prefixed with `<prefix>_` (process metrics excepted). Pass `""` for no prefix. Construction through `NewRegistry` is mandatory. An invalid prefix is captured and reported at the first `Register`/`MustRegister`, like a metric's own construction error.
+- `Register(m Metric) error`: adds a metric (any of the six metric types) and reports what is wrong with it: the error captured at construction (invalid metric/label name, reserved or duplicate label, more than 8 labels, bad histogram buckets), an already-registered metric, a family-name collision (including the reserved `process_*` names), or a nil metric. On error the metric is not attached: after a name collision it stays registrable with a different registry. A construction error is immutable, so rebuild the metric with a valid name, label set, or buckets.
 - `MustRegister(m ...Metric)`: variadic; registers in order and panics on the first error (the `client_golang` shape). Use it for package-level metric sets registered in `init`, where there is no caller to hand an error to.
 - `Handler()`: Prometheus text format 0.0.4.
 
-Constructors never panic on a bad name, label set, or bucket layout: the error is captured into the metric (the `client_golang` `Desc.err` shape) and surfaces when you register it. What happens on the record path is this library's own divergence from `client_golang`: upstream metrics keep recording regardless and the error surfaces at scrape time (promhttp answers the scrape with HTTP 500), while here a metric carrying an error records nothing — its `Inc`/`Add`/`Set`/`Observe` are no-ops that log a single warning on the first dropped record — and is never exposed.
+Constructors never panic on a bad name, label set, or bucket layout: the error is captured into the metric (the `client_golang` `Desc.err` shape) and surfaces when you register it. The record path diverges from `client_golang`: upstream metrics keep recording and the error surfaces at scrape time (promhttp answers the scrape with HTTP 500), while here a metric carrying an error records nothing and is never exposed. Its `Inc`/`Add`/`Set`/`Observe` become no-ops that log one warning on the first dropped record.
 
 ### Process metrics (emitted automatically)
 
@@ -139,27 +139,6 @@ The output is valid Prometheus text exposition format 0.0.4:
 - Histograms always include a `+Inf` bucket equal to `_count`.
 
 Numeric values render through a single canonical formatter: whole values as bare integers (e.g. `42`), other values in shortest round-trippable form, and `+Inf`/`-Inf`/`NaN` for non-finite.
-
-## Migrating v3 → v4
-
-| v3 | v4 |
-| --- | --- |
-| `r.RegisterCounter(c)`, `RegisterGauge`, `RegisterLabeledCounter`, `RegisterLabeledGauge`, `RegisterHistogram`, `RegisterLabeledHistogram` — six typed methods, panic on any problem | Two doors for all six types: `r.Register(m) error` when the caller can handle the error, `r.MustRegister(m ...)` (variadic) to keep fail-fast behavior |
-| Constructors panic on an invalid metric name, an invalid/reserved/duplicate label name, more than 8 labels, or bad histogram buckets | Constructors capture the error into the metric (the `client_golang` `Desc.err` shape). The metric records nothing and is never exposed; the error surfaces at `Register` (or as the `MustRegister` panic) |
-| Registration collisions and re-registration panic | `Register` returns the error; `MustRegister` keeps the panic |
-| `WriteProcessMetrics(b)` | `WriteProcess(b)` |
-
-Unchanged: label-arity mismatches on record paths (`Inc`/`Add`/`Set`/`Observe`/`Delete`, `NewTimer`) and a negative `Counter.Add`/`LabeledCounter.Add` still panic, matching `client_golang`. `NewRegistry` no longer panics on an invalid prefix: it captures the error and the registration door reports it, so construction validation has exactly one shape in this package.
-
-Package-level `var` metric sets (the knell / registry-stats pattern) keep their shape: constructors are safe in `var` initializers, and the `init` registration switches to `MustRegister`, which preserves v3's fail-fast behavior at process start:
-
-```go
-var tasks = metrics.NewCounter("tasks_total", "Total tasks")
-
-func init() {
-	registry.MustRegister(tasks) // panics at startup if the metric is invalid
-}
-```
 
 ## Unsupported by Design
 

@@ -34,9 +34,10 @@ not, and they are easy to break:
   `process.go`) remain as thin shims over the IR + encoder because they are
   public API.
 - **Label storage is a fixed-size key.** `labelKey` is `[8]string`, so a metric
-  supports **at most 8 labels**; constructors panic past that. Label values
-  are copied into the array and the rendered label string is always sorted by
-  label name (`buildLabelString`) for deterministic output.
+  supports **at most 8 labels**; a ninth is a captured construction error that
+  surfaces at registration (see the next bullet). Label values are copied into
+  the array and the rendered label string is always sorted by label name
+  (`buildLabelString`) for deterministic output.
 - **Validation is captured at construction and surfaces at registration; the
   record-path guards stay panics.** Metric/label names and histogram bucket
   bounds are validated at construction (`validate.go`, `checkBuckets`), but a
@@ -45,11 +46,11 @@ not, and they are easy to break:
   the metric, so a `MustRegister` panic over a package-level block identifies
   which declaration failed. The record path is this library's own divergence
   from `client_golang` (upstream keeps recording and surfaces the error at
-  scrape time): an errored metric records nothing — `Inc`/`Add`/`Set`/`Observe`
+  scrape time): an errored metric records nothing. `Inc`/`Add`/`Set`/`Observe`
   no-op, emitting one `slog` warning via `warnInertOnce` (`counter.go`) on the
   first dropped record so a constructed-but-never-registered metric is not
-  silently dead — and the `Write*` shims emit nothing for it. The error
-  surfaces through the registration doors — `(*Registry).Register(m) error`
+  silently dead, and the `Write*` shims emit nothing for it. The error
+  surfaces through the registration doors: `(*Registry).Register(m) error`
   returns it, `MustRegister(m ...)` panics on the first error. Name collisions
   (`reserveName`, including the pre-seeded `process_*` family names) and
   re-registration are registration errors on the same doors; a metric refused
@@ -65,7 +66,8 @@ not, and they are easy to break:
   that cannot make a valid name makes every metric under it invalid and the
   registration door is where this package reports construction errors. Tests
   assert both halves; don't soften the record-path panics to error returns, and
-  don't let an errored metric reach the exposition. Invalid UTF-8 is deliberately in neither set: label values
+  don't let an errored metric reach the exposition. Invalid UTF-8 is
+  deliberately in neither set: label values
   and help text are sanitized with the Unicode replacement character (U+FFFD)
   by the shared `sanitizeUTF8` engine (`validate.go`), with a one-time `slog`
   warning per newly created sanitized series (label path) and per constructor
@@ -131,7 +133,7 @@ golangci-lint fmt          # applies gofumpt (extra-rules) + gci import grouping
 
 `gofumpt` runs with `extra-rules` (groups adjacent same-type params, forbids
 naked returns) and `gci` orders imports as standard then third-party; match
-the existing files rather than fighting the formatter.
+the existing files and do not fight the formatter.
 
 Mutation testing is configured (`.gremlins.yaml`, run via `gremlins unleash`)
 but is a non-blocking weekly signal, not a PR gate.
