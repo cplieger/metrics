@@ -98,7 +98,11 @@ const (
 
 // Registry holds a collection of metrics to be served.
 type Registry struct {
-	names             map[string]string
+	names map[string]string
+	// err is a construction error captured by NewRegistry (an invalid
+	// prefix). Every registration reports it, so a registry that cannot
+	// produce a valid metric name refuses rather than emitting one.
+	err               error
 	prefix            string
 	counters          []*Counter
 	gauges            []*Gauge
@@ -106,11 +110,7 @@ type Registry struct {
 	labeledGauges     []*LabeledGauge
 	histograms        []*Histogram
 	labeledHistograms []*LabeledHistogram
-	// err is a construction error captured by NewRegistry (an invalid
-	// prefix). Every registration reports it, so a registry that cannot
-	// produce a valid metric name refuses rather than emitting one.
-	err error
-	mu  sync.RWMutex
+	mu                sync.RWMutex
 }
 
 // NewRegistry creates a new metrics registry. Construction through
