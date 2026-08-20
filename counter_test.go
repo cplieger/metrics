@@ -338,14 +338,14 @@ func TestLabelValueCarriageReturnPassthrough(t *testing.T) {
 }
 
 func TestSortedLabelKeys_returnsLexicographicOrder(t *testing.T) {
-	var mu sync.RWMutex
+	var s series
 	vals := map[labelKey]int{
 		{"b", "2", "", ""}: 1,
 		{"a", "9", "", ""}: 1,
 		{"a", "1", "", ""}: 1,
 		{"c", "0", "", ""}: 1,
 	}
-	got := sortedLabelKeys(&mu, vals)
+	got := s.sortedLabelKeys(vals)
 	want := []labelKey{
 		{"a", "1", "", ""},
 		{"a", "9", "", ""},
@@ -358,8 +358,8 @@ func TestSortedLabelKeys_returnsLexicographicOrder(t *testing.T) {
 }
 
 func TestSortedLabelKeys_empty(t *testing.T) {
-	var mu sync.RWMutex
-	if got := sortedLabelKeys(&mu, map[labelKey]int{}); len(got) != 0 {
+	var s series
+	if got := s.sortedLabelKeys(map[labelKey]int{}); len(got) != 0 {
 		t.Errorf("sortedLabelKeys(empty) = %v, want empty", got)
 	}
 }
@@ -430,8 +430,7 @@ func BenchmarkLabeledCounterInc(b *testing.B) {
 	lc := NewLabeledCounter("bench_lc", "bench", []string{"method", "path", "status"})
 	lc.Inc("GET", "/api", "200")
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		lc.Inc("GET", "/api", "200")
 	}
 }
@@ -439,8 +438,7 @@ func BenchmarkLabeledCounterInc(b *testing.B) {
 func BenchmarkLabeledCounterInc_NewKey(b *testing.B) {
 	lc := NewLabeledCounter("bench_lc_new", "bench", []string{"method", "path", "status"})
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := range b.N {
+	for i := 0; b.Loop(); i++ {
 		lc.Inc("GET", "/api/"+strings.Repeat("x", i%8), "200")
 	}
 }
@@ -465,15 +463,14 @@ func BenchmarkLabeledCounterInc_Parallel(b *testing.B) {
 // including the sanitize warning, which must not fire on the
 // double-check-found path).
 func TestStoreNewSeries_doubleCheckLoadsExistingWithoutWarn(t *testing.T) {
-	var mu sync.RWMutex
 	key := labelKey{"a"}
 	existing := new(int)
 	*existing = 7
 	m := map[labelKey]*int{key: existing}
-	name := "double_check_total"
+	s := series{name: "double_check_total"}
 
 	made := false
-	v, loaded, w := storeNewSeries(&mu, m, &name, &key, func() *int {
+	v, loaded, w := s.storeNewSeries(m, &key, func() *int {
 		made = true
 		return new(int)
 	})

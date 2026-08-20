@@ -3,7 +3,6 @@ package metrics
 import (
 	"math"
 	"strings"
-	"sync"
 	"sync/atomic"
 )
 
@@ -80,14 +79,13 @@ func WriteGauge(b *strings.Builder, g *Gauge) {
 
 // LabeledGauge tracks gauges per label combination.
 type LabeledGauge struct {
-	vals       map[labelKey]*atomic.Uint64
-	name       string
-	help       string
-	err        error // construction-time validation error; surfaces at registration
-	labels     []string
+	vals   map[labelKey]*atomic.Uint64
+	help   string
+	err    error // construction-time validation error; surfaces at registration
+	labels []string
+	series
 	registered atomic.Bool
 	warned     atomic.Bool // one-time inert-record warning emitted
-	mu         sync.RWMutex
 }
 
 // NewLabeledGauge creates a labeled gauge. Construction through
@@ -117,7 +115,7 @@ func (lg *LabeledGauge) Set(v float64, labelVals ...string) {
 		return
 	}
 	key := labelKeyFor(lg.labels, labelVals)
-	if ptr, loaded := loadOrStore(&lg.mu, lg.vals, &lg.name, &key,
+	if ptr, loaded := lg.loadOrStore(lg.vals, &key,
 		func() *atomic.Uint64 { u := &atomic.Uint64{}; u.Store(math.Float64bits(v)); return u }); loaded {
 		ptr.Store(math.Float64bits(v))
 	}
@@ -140,7 +138,7 @@ func (lg *LabeledGauge) Delete(labelVals ...string) {
 	if lg.err != nil {
 		return
 	}
-	deleteSeries(&lg.mu, lg.vals, lg.labels, labelVals)
+	lg.deleteSeries(lg.vals, lg.labels, labelVals)
 }
 
 // WriteLabeledGauge writes a labeled gauge in Prometheus text format (IR

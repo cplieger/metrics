@@ -60,7 +60,7 @@ func (c *Counter) family() metricFamily {
 // has been observed, matching the writers' "no keys, no output" behavior (no
 // "# TYPE"/"# HELP" block is emitted for an empty labeled metric).
 func (lc *LabeledCounter) family() (fam metricFamily, ok bool) {
-	keys := sortedLabelKeys(&lc.mu, lc.vals)
+	keys := lc.sortedLabelKeys(lc.vals)
 	if len(keys) == 0 {
 		return metricFamily{}, false
 	}
@@ -94,7 +94,7 @@ func (g *Gauge) family() metricFamily {
 // family materialises a labeled gauge. ok is false when no label combination
 // has been set.
 func (lg *LabeledGauge) family() (fam metricFamily, ok bool) {
-	keys := sortedLabelKeys(&lg.mu, lg.vals)
+	keys := lg.sortedLabelKeys(lg.vals)
 	if len(keys) == 0 {
 		return metricFamily{}, false
 	}
@@ -129,7 +129,7 @@ func (h *Histogram) family() metricFamily {
 // family materialises a labeled histogram. ok is false when no label
 // combination has been observed.
 func (lh *LabeledHistogram) family() (fam metricFamily, ok bool) {
-	keys := sortedLabelKeys(&lh.mu, lh.vals)
+	keys := lh.sortedLabelKeys(lh.vals)
 	if len(keys) == 0 {
 		return metricFamily{}, false
 	}

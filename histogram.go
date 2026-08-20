@@ -179,15 +179,14 @@ func WriteHistogram(b *strings.Builder, h *Histogram) {
 
 // LabeledHistogram tracks histograms per label combination.
 type LabeledHistogram struct {
-	vals       map[labelKey]*Histogram
-	name       string
-	help       string
-	err        error // construction-time validation error; surfaces at registration
-	bounds     []float64
-	labels     []string
+	vals   map[labelKey]*Histogram
+	help   string
+	err    error // construction-time validation error; surfaces at registration
+	bounds []float64
+	labels []string
+	series
 	registered atomic.Bool
 	warned     atomic.Bool // one-time inert-record warning emitted
-	mu         sync.RWMutex
 }
 
 // NewLabeledHistogram creates a labeled histogram with the given name, help, and label names.
@@ -227,7 +226,7 @@ func (lh *LabeledHistogram) Observe(seconds float64, labelVals ...string) {
 		return
 	}
 	key := labelKeyFor(lh.labels, labelVals)
-	h, _ := loadOrStore(&lh.mu, lh.vals, &lh.name, &key, func() *Histogram {
+	h, _ := lh.loadOrStore(lh.vals, &key, func() *Histogram {
 		return &Histogram{
 			name:    lh.name,
 			help:    lh.help,
@@ -255,7 +254,7 @@ func (lh *LabeledHistogram) Delete(labelVals ...string) {
 	if lh.err != nil {
 		return
 	}
-	deleteSeries(&lh.mu, lh.vals, lh.labels, labelVals)
+	lh.deleteSeries(lh.vals, lh.labels, labelVals)
 }
 
 // WriteLabeledHistogram writes all child histograms in Prometheus text format

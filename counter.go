@@ -90,6 +90,27 @@ func addSaturating(v *atomic.Int64, n int64) {
 // counts far below it).
 const maxLabels = 8
 
+// series carries the state every per-label-combination operation needs: the
+// lock guarding the series map and the metric name a warning reports. The three
+// labeled metric types embed it, so those operations are METHODS on the state
+// they mutate instead of package-level functions taking a mutex and a name
+// pointer.
+//
+// It is deliberately NOT generic: the map's value type arrives on each method
+// instead (Go 1.27 generic methods). A generic carrier — series[V] holding vals
+// — would drop one more argument per call, and it was measured and rejected,
+// twice over. Embedded, `go doc` renders `series[*atomic.Int64]` inside the
+// public body of LabeledCounter (an embedded unexported GENERIC instantiation
+// is printed, where an embedded plain unexported type and a named unexported
+// field are both folded into "Has unexported fields"), so all three exported
+// types would advertise a type no caller can name. Held as a named field
+// instead, godoc stays clean but 84 lc.name/lc.mu/lc.vals references gain a
+// level of indirection to save one argument at 9 call sites.
+type series struct {
+	name string
+	mu   sync.RWMutex
+}
+
 // labelKey is a fixed-size struct key for labeled metrics.
 type labelKey [maxLabels]string
 
@@ -105,14 +126,13 @@ func labelKeyFor(labels, labelVals []string) labelKey {
 
 // LabeledCounter tracks counts per label combination.
 type LabeledCounter struct {
-	vals       map[labelKey]*atomic.Int64
-	name       string
-	help       string
-	err        error // construction-time validation error; surfaces at registration
-	labels     []string
+	vals   map[labelKey]*atomic.Int64
+	help   string
+	err    error // construction-time validation error; surfaces at registration
+	labels []string
+	series
 	registered atomic.Bool
 	warned     atomic.Bool // one-time inert-record warning emitted
-	mu         sync.RWMutex
 }
 
 // NewLabeledCounter creates a labeled counter with the given label names. As
@@ -153,7 +173,7 @@ func (lc *LabeledCounter) Add(n int64, labelVals ...string) {
 		panic("metrics: LabeledCounter.Add called with negative value")
 	}
 	key := labelKeyFor(lc.labels, labelVals)
-	if v, loaded := loadOrStore(&lc.mu, lc.vals, &lc.name, &key,
+	if v, loaded := lc.loadOrStore(lc.vals, &key,
 		func() *atomic.Int64 { a := &atomic.Int64{}; a.Store(n); return a }); loaded {
 		addSaturating(v, n)
 	}
@@ -176,7 +196,7 @@ func (lc *LabeledCounter) Delete(labelVals ...string) {
 	if lc.err != nil {
 		return
 	}
-	deleteSeries(&lc.mu, lc.vals, lc.labels, labelVals)
+	lc.deleteSeries(lc.vals, lc.labels, labelVals)
 }
 
 // WriteCounter writes a counter in Prometheus text format. It is a thin shim
@@ -192,10 +212,9 @@ func WriteCounter(b *strings.Builder, c *Counter) {
 
 // loadOrStore returns the entry for key, creating it with makeV under the
 // write lock when absent. loaded reports whether the entry already existed.
-// name points at the owning metric's name field; it is taken by pointer so the
-// hot loaded-path never reads it. Label values carrying invalid UTF-8 are
-// sanitized with U+FFFD on the series-creation path (see storeNewSeries), and
-// when storing a new series pushes the map exactly to
+// The hot loaded-path never reads s.name. Label values carrying invalid UTF-8
+// are sanitized with U+FFFD on the series-creation path (see storeNewSeries),
+// and when storing a new series pushes the map exactly to
 // cardinalityWarnThreshold, a one-time warning names the metric so a
 // label-cardinality explosion is observable before it exhausts memory. All
 // warning captures (the metric name, the representative sanitized value)
@@ -203,15 +222,15 @@ func WriteCounter(b *strings.Builder, c *Counter) {
 // each event and the name read is synchronized with the mutex-guarded rename
 // in Register*; the warnings themselves are emitted AFTER the write lock is
 // released so arbitrary slog handler code never runs under the metric lock.
-func loadOrStore[V any](mu *sync.RWMutex, m map[labelKey]V, name *string, key *labelKey, makeV func() V) (v V, loaded bool) {
-	mu.RLock()
+func (s *series) loadOrStore[V any](m map[labelKey]V, key *labelKey, makeV func() V) (v V, loaded bool) {
+	s.mu.RLock()
 	v, loaded = m[*key]
-	mu.RUnlock()
+	s.mu.RUnlock()
 	if loaded {
 		return v, true
 	}
 	var w seriesWarnings
-	v, loaded, w = storeNewSeries(mu, m, name, key, makeV)
+	v, loaded, w = s.storeNewSeries(m, key, makeV)
 	if w.san {
 		slog.Warn("metrics: label value contained invalid UTF-8; sanitized with U+FFFD",
 			"metric", w.name, "value", w.sanValue)
@@ -263,10 +282,10 @@ func sanitizeLabelKey(key *labelKey) (rep string, changed bool) {
 // actually CREATED a new series (the double-check-found path never warns), and
 // w.card fires when this insert pushed the map exactly to
 // cardinalityWarnThreshold. The defer keeps the unlock on a makeV panic path.
-func storeNewSeries[V any](mu *sync.RWMutex, m map[labelKey]V, name *string, key *labelKey, makeV func() V) (v V, loaded bool, w seriesWarnings) {
+func (s *series) storeNewSeries[V any](m map[labelKey]V, key *labelKey, makeV func() V) (v V, loaded bool, w seriesWarnings) {
 	sanValue, sanitized := sanitizeLabelKey(key)
-	mu.Lock()
-	defer mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if v, loaded = m[*key]; loaded {
 		return v, true, seriesWarnings{}
 	}
@@ -280,7 +299,7 @@ func storeNewSeries[V any](mu *sync.RWMutex, m map[labelKey]V, name *string, key
 		w.card = true
 	}
 	if w.san || w.card {
-		w.name = *name
+		w.name = s.name
 	}
 	return v, false, w
 }
@@ -289,12 +308,12 @@ func storeNewSeries[V any](mu *sync.RWMutex, m map[labelKey]V, name *string, key
 // The lookup key is sanitized to valid UTF-8 exactly as recording sanitizes it
 // (sanitizeLabelKey), so Delete called with the original raw values removes
 // the series recording created. Shared by the three labeled Delete methods.
-func deleteSeries[V any](mu *sync.RWMutex, m map[labelKey]V, labels, labelVals []string) {
+func (s *series) deleteSeries[V any](m map[labelKey]V, labels, labelVals []string) {
 	key := labelKeyFor(labels, labelVals)
 	sanitizeLabelKey(&key)
-	mu.Lock()
+	s.mu.Lock()
 	delete(m, key)
-	mu.Unlock()
+	s.mu.Unlock()
 }
 
 // sortLabelKeys sorts label keys lexicographically.
@@ -302,15 +321,15 @@ func sortLabelKeys(keys []labelKey) {
 	slices.SortFunc(keys, func(a, b labelKey) int { return slices.Compare(a[:], b[:]) })
 }
 
-// sortedLabelKeys snapshots the keys of vals under mu.RLock and returns
-// them sorted lexicographically. Callers hold no lock on entry.
-func sortedLabelKeys[V any](mu *sync.RWMutex, vals map[labelKey]V) []labelKey {
-	mu.RLock()
+// sortedLabelKeys snapshots the keys of vals under the series read lock and
+// returns them sorted lexicographically. Callers hold no lock on entry.
+func (s *series) sortedLabelKeys[V any](vals map[labelKey]V) []labelKey {
+	s.mu.RLock()
 	keys := make([]labelKey, 0, len(vals))
 	for k := range vals {
 		keys = append(keys, k)
 	}
-	mu.RUnlock()
+	s.mu.RUnlock()
 	sortLabelKeys(keys)
 	return keys
 }
