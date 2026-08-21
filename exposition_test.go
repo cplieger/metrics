@@ -289,3 +289,93 @@ func TestHelpEscaping_Prometheus(t *testing.T) {
 		t.Errorf("Prometheus HELP escaping wrong:\n%s", out)
 	}
 }
+
+// TestExpositionCostDependsOnLabelValueContent measures what escaping costs at
+// scrape time. It is the only contract here whose answer turns on what the
+// input CONTAINS rather than on how much of it there is, and the answer is yes:
+// a label value carrying a character the text format must escape (`\`, `"` or a
+// newline) costs measurably MORE to expose than one that does not, and the
+// surcharge grows with the value's length.
+//
+// Both halves are worth pinning rather than only the flattering one. Label
+// values are caller-owned and the README already warns that they may carry
+// upstream text, so whoever supplies that text also chooses which of these two
+// paths a scrape takes. What the library owes is that the choice buys a bounded
+// surcharge: it must stay charged per VALUE and per output doubling, never per
+// byte. A per-byte escape cost would let a caller feeding a quoted 64 KiB
+// string into a label turn one series into thousands of allocations on every
+// scrape — an amplification vector reachable from ordinary input, since none of
+// this is on the record path where a cardinality warning would fire.
+//
+// Measured at 100 series: the escaped path costs about 3 allocations more per
+// series at 32 bytes and 11 at 2048 (3.3 and 11.1 under -race — the surcharge
+// is a difference between two counts, so the detector's overhead very nearly
+// cancels). Sixty-four times the bytes for under four times the surcharge is
+// the escaper's output buffer doubling, which is the shape a correct
+// implementation has; a per-byte one would have cost 64 times as much.
+func TestExpositionCostDependsOnLabelValueContent(t *testing.T) {
+	// maxSurchargePerSeries bounds the escaped path's extra allocations per
+	// series at the smallest value size, and maxSurchargeGrowth bounds how much
+	// that surcharge may grow when the value grows 64x. The growth bound is the
+	// load-bearing one: it is what separates "charged per doubling" (measured
+	// 3.6x) from "charged per byte" (which would be 64x).
+	const (
+		series                = 100
+		maxSurchargePerSeries = 4.0
+		maxSurchargeGrowth    = 6.0
+	)
+
+	// buildRegistry returns a registry holding one labeled counter with
+	// `series` series whose label value is valueLen bytes of fill. The fill is
+	// a quote on the escaped path, so EVERY byte needs escaping: that is the
+	// worst case the grammar allows and the one a caller cannot make worse.
+	//
+	// The measurement below goes through collect+encode rather than the
+	// handler: it is a difference between two counts, so the handler's fixed
+	// cost would cancel out of it anyway, and the encoder is where the escaping
+	// happens.
+	buildRegistry := func(fill string, valueLen int) *Registry {
+		r := NewRegistry("escapecost")
+		lc := NewLabeledCounter("content_total", "escaping cost contract", []string{"v"})
+		r.MustRegister(lc)
+		for i := range series {
+			lc.Inc(strings.Repeat(fill, valueLen) + strconv.Itoa(i))
+		}
+		return r
+	}
+
+	lengths := []int{32, 2048}
+	surcharge := make([]float64, len(lengths))
+	for i, n := range lengths {
+		plainRegistry := buildRegistry("a", n)
+		escapedRegistry := buildRegistry(`"`, n)
+
+		// The fixture asserts its own regime: if the escaped output ever stops
+		// being longer than the plain one, the escaper is no longer on this
+		// path and the surcharge below would be measuring nothing.
+		plainOut := encodePrometheus(plainRegistry.collect())
+		escapedOut := encodePrometheus(escapedRegistry.collect())
+		if len(escapedOut) <= len(plainOut) {
+			t.Fatalf("with %d-byte all-quote label values the exposition is %d bytes against %d for plain values, want longer: the fixture is meant to exercise the escaper",
+				n, len(escapedOut), len(plainOut))
+		}
+
+		plainAllocs := testing.AllocsPerRun(scrapeAllocRuns, func() { _ = encodePrometheus(plainRegistry.collect()) })
+		escapedAllocs := testing.AllocsPerRun(scrapeAllocRuns, func() { _ = encodePrometheus(escapedRegistry.collect()) })
+		surcharge[i] = (escapedAllocs - plainAllocs) / series
+		t.Logf("%d series of %d-byte label values: %v allocations per scrape plain, %v all-escaped, a surcharge of %.3f per series",
+			series, n, plainAllocs, escapedAllocs, surcharge[i])
+	}
+
+	if surcharge[0] > maxSurchargePerSeries {
+		t.Errorf("exposing %d series of %d-byte all-escaped label values cost %.3f extra allocations per series, want at most %v: escaping is charged per value, so this number multiplies by the series count on every scrape",
+			series, lengths[0], surcharge[0], maxSurchargePerSeries)
+	}
+	growth := surcharge[len(surcharge)-1] / surcharge[0]
+	factor := lengths[len(lengths)-1] / lengths[0]
+	if growth > maxSurchargeGrowth {
+		t.Errorf("growing an all-escaped label value %dx (from %d to %d bytes) grew the escape surcharge %.2fx (%.3f to %.3f allocations per series), want at most %vx: the escaper's cost must follow its output buffer's doublings, not the byte count, or a caller who supplies a large quoted value multiplies every scrape's cost",
+			factor, lengths[0], lengths[len(lengths)-1], growth, surcharge[0], surcharge[len(surcharge)-1], maxSurchargeGrowth)
+	}
+	t.Logf("a %dx longer all-escaped label value costs %.2fx the surcharge, not %dx", factor, growth, factor)
+}

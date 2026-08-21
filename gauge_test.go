@@ -357,3 +357,96 @@ func TestGauge_reservedSuffixNamesRenderVerbatim(t *testing.T) {
 		t.Errorf("gauge named _bucket mangled: %s", out)
 	}
 }
+
+// TestGaugeRecordPathIsAllocationFree pins the gauge's record path at zero.
+// Set stores a bit pattern and the arithmetic forms run a CAS loop, so none of
+// them has any reason to allocate; Get is included because a gauge read is on
+// the same call sites (a caller that reads-modify-writes calls both). The
+// labeled series is created in setup, so every run of that closure takes
+// loadOrStore's fast path.
+func TestGaugeRecordPathIsAllocationFree(t *testing.T) {
+	g := NewGauge("alloc_gauge", "allocation contract")
+	lg := NewLabeledGauge("alloc_labeled_gauge", "allocation contract", []string{"kind"})
+	lg.Set(1, "scan")
+
+	cases := []struct {
+		name string
+		call string
+		fn   func()
+	}{
+		{"set", "Gauge.Set(1.5)", func() { g.Set(1.5) }},
+		{"add", "Gauge.Add(1.5)", func() { g.Add(1.5) }},
+		{"sub", "Gauge.Sub(1.5)", func() { g.Sub(1.5) }},
+		{"inc", "Gauge.Inc()", func() { g.Inc() }},
+		{"dec", "Gauge.Dec()", func() { g.Dec() }},
+		{"get", "Gauge.Get()", func() { _ = g.Get() }},
+		{"labeled_set", `LabeledGauge.Set(1.5, "scan")`, func() { lg.Set(1.5, "scan") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := testing.AllocsPerRun(allocRuns, tc.fn); got != 0 {
+				t.Errorf("%s allocated %v times per run, want 0: gauges are set from request handlers and collect loops, so an allocation here recurs at that rate", tc.call, got)
+			}
+		})
+	}
+}
+
+// TestLabeledGaugeNewSeriesCostIsConstant is the gauge half of the
+// series-creation contract. LabeledGauge stores an *atomic.Uint64 where the
+// counter stores an *atomic.Int64, so the constant is its own measurement
+// rather than one inherited from the counter, and the two axes asserted here
+// are the ones a gauge is exposed to: caller-owned label values whose length
+// it does not choose, and a series map that only grows in a long-running
+// process. Arity independence is pinned once, on the counter.
+//
+// Each run creates a NEW series; the label values are pre-built.
+func TestLabeledGaugeNewSeriesCostIsConstant(t *testing.T) {
+	// The 20k-series pre-fill crosses cardinalityWarnThreshold; keep its
+	// warning out of the test output. The crossing is in setup.
+	captureDebugLogs(t)
+
+	t.Run("independent_of_value_length", func(t *testing.T) {
+		lengths := []int{8, 1024, 65536}
+		counts := make([]float64, len(lengths))
+		for i, n := range lengths {
+			keys := newSeriesLabelValues(allocRuns, 1, n)
+			lg := NewLabeledGauge("alloc_gauge_vallen", "allocation contract", []string{"k"})
+			next := 0
+			counts[i] = testing.AllocsPerRun(allocRuns, func() {
+				lg.Set(1, keys[next]...)
+				next++
+			})
+		}
+		for i, got := range counts {
+			if got != counts[0] {
+				t.Errorf("LabeledGauge.Set(a new series with %d-byte label values) allocated %v times per run, want %v (its count at %d bytes): label values are caller-owned, so a count that tracks their SIZE lets whoever supplies the text choose the cost",
+					lengths[i], got, counts[0], lengths[0])
+			}
+		}
+		t.Logf("a constant %v allocations per new series from %d- to %d-byte label values", counts[0], lengths[0], lengths[len(lengths)-1])
+	})
+
+	t.Run("independent_of_existing_series", func(t *testing.T) {
+		existing := []int{0, 1_000, 20_000}
+		counts := make([]float64, len(existing))
+		for i, n := range existing {
+			keys := newSeriesLabelValues(allocRuns, 1, 8)
+			lg := NewLabeledGauge("alloc_gauge_existing", "allocation contract", []string{"k"})
+			for k := range n {
+				lg.Set(1, "pre"+strconv.Itoa(k))
+			}
+			next := 0
+			counts[i] = testing.AllocsPerRun(allocRuns, func() {
+				lg.Set(1, keys[next]...)
+				next++
+			})
+		}
+		for i, got := range counts {
+			if got != counts[0] {
+				t.Errorf("LabeledGauge.Set(a new series into a metric already holding %d) allocated %v times per run, want %v (its count at %d existing): a per-existing-series cost makes series creation quadratic over a process's lifetime",
+					existing[i], got, counts[0], existing[0])
+			}
+		}
+		t.Logf("a constant %v allocations per new series with %d to %d series already present", counts[0], existing[0], existing[len(existing)-1])
+	})
+}

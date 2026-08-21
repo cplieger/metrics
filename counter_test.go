@@ -3,6 +3,7 @@ package metrics
 import (
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -517,4 +518,143 @@ func TestLabeledCounterDelete_SanitizesLabelValues(t *testing.T) {
 	if out := b.String(); strings.Contains(out, "\uFFFD") {
 		t.Errorf("exposition still contains sanitized series after Delete with raw values: %q", out)
 	}
+}
+
+// TestCounterRecordPathIsAllocationFree pins the free half of the counter cost
+// model: incrementing a counter, or a labeled counter's EXISTING series, costs
+// nothing. Every consuming app calls this per request, so an allocation added
+// here is charged to every request the fleet serves — and unlike the bounded
+// counts, this half is also the one the weekly tracker can see, because 0 to
+// anything is an infinite ratio. The contract is still worth its lines: it
+// fails at merge time and names the method, where the chart notices a week
+// later and names a benchmark.
+//
+// The label set is created in setup, so every run of the measured closure
+// takes loadOrStore's RLock fast path. Series CREATION is measured separately
+// by TestLabeledCounterNewSeriesCostIsConstant, and it is not free.
+func TestCounterRecordPathIsAllocationFree(t *testing.T) {
+	c := NewCounter("alloc_counter_total", "allocation contract")
+	lc := NewLabeledCounter("alloc_labeled_counter_total", "allocation contract",
+		[]string{"method", "path", "status"})
+	lc.Inc("GET", "/api", "200")
+
+	cases := []struct {
+		name string // subtest name: an identifier, no slashes
+		call string // how the call reads, for the failure message
+		fn   func()
+	}{
+		{"counter_inc", "Counter.Inc()", func() { c.Inc() }},
+		{"counter_add", "Counter.Add(7)", func() { c.Add(7) }},
+		{"labeled_counter_inc", `LabeledCounter.Inc("GET", "/api", "200")`, func() { lc.Inc("GET", "/api", "200") }},
+		{"labeled_counter_add", `LabeledCounter.Add(7, "GET", "/api", "200")`, func() { lc.Add(7, "GET", "/api", "200") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := testing.AllocsPerRun(allocRuns, tc.fn); got != 0 {
+				t.Errorf("%s allocated %v times per run, want 0: this is the per-request record path, so an allocation here is paid by every request every consuming app serves", tc.call, got)
+			}
+		})
+	}
+}
+
+// TestLabeledCounterNewSeriesCostIsConstant pins the bounded half of the cost
+// model, and this is the half the weekly tracker cannot police: a count that
+// drifts from 1 to 2 is a ratio of 2 and would alert, but one that starts
+// tracking a per-call quantity is a design change the chart reads as ordinary
+// growth. Creating a label set measures ONE allocation (the series' own
+// atomic.Int64) and the property that matters is what that number is
+// independent OF.
+//
+// Nor does anything else in this package measure the path:
+// BenchmarkLabeledCounterInc_NewKey cycles through eight label values, so from
+// its ninth iteration on every series already exists and what it charts is the
+// fixture's own string building against the loaded fast path (17 B/op, 1
+// alloc/op measured — the concatenation, not a series).
+//
+// Three axes, each a different regression class:
+//
+//   - label arity, because a per-label allocation would multiply by a metric's
+//     label count for every new series;
+//   - label value LENGTH, because label values are caller-owned and can carry
+//     upstream text, so a count that tracks bytes is an amplification vector
+//     in exactly the place the README already warns about cardinality;
+//   - how many series the metric ALREADY holds, which is the expensive one. A
+//     per-existing-key cost (a scan to check for a match, a re-sort, a
+//     rebuild) makes series creation quadratic over the life of a
+//     long-running process, and every consuming app is long-running.
+//
+// Each run of a measured closure creates a NEW series, which is the cold path
+// on purpose; the label-value slices come pre-built so the fixture's own
+// allocations are not counted as the library's.
+func TestLabeledCounterNewSeriesCostIsConstant(t *testing.T) {
+	// The 20k-series case crosses cardinalityWarnThreshold during its
+	// pre-fill; capture the warning so it stays out of the test output. The
+	// crossing is in setup, never inside a measured closure.
+	captureDebugLogs(t)
+
+	t.Run("independent_of_label_count", func(t *testing.T) {
+		arities := []int{1, 3, 8}
+		counts := make([]float64, len(arities))
+		for i, n := range arities {
+			keys := newSeriesLabelValues(allocRuns, n, 8)
+			lc := NewLabeledCounter("alloc_arity_total", "allocation contract", labelNames(n))
+			next := 0
+			counts[i] = testing.AllocsPerRun(allocRuns, func() {
+				lc.Inc(keys[next]...)
+				next++
+			})
+		}
+		for i, got := range counts {
+			if got != counts[0] {
+				t.Errorf("LabeledCounter.Inc(a new series on %d labels) allocated %v times per run, want %v (its count at %d label): series creation must not charge per label name, or a metric's label count multiplies the cost of every series it grows",
+					arities[i], got, counts[0], arities[0])
+			}
+		}
+		t.Logf("a constant %v allocations per new series from %d to %d labels", counts[0], arities[0], arities[len(arities)-1])
+	})
+
+	t.Run("independent_of_value_length", func(t *testing.T) {
+		lengths := []int{8, 1024, 65536}
+		counts := make([]float64, len(lengths))
+		for i, n := range lengths {
+			keys := newSeriesLabelValues(allocRuns, 3, n)
+			lc := NewLabeledCounter("alloc_vallen_total", "allocation contract", []string{"a", "b", "c"})
+			next := 0
+			counts[i] = testing.AllocsPerRun(allocRuns, func() {
+				lc.Inc(keys[next]...)
+				next++
+			})
+		}
+		for i, got := range counts {
+			if got != counts[0] {
+				t.Errorf("LabeledCounter.Inc(a new series with %d-byte label values) allocated %v times per run, want %v (its count at %d bytes): label values are caller-owned and may carry upstream text, so an allocation count that tracks their SIZE lets whoever supplies that text choose the cost",
+					lengths[i], got, counts[0], lengths[0])
+			}
+		}
+		t.Logf("a constant %v allocations per new series from %d- to %d-byte label values", counts[0], lengths[0], lengths[len(lengths)-1])
+	})
+
+	t.Run("independent_of_existing_series", func(t *testing.T) {
+		existing := []int{0, 1_000, 20_000}
+		counts := make([]float64, len(existing))
+		for i, n := range existing {
+			keys := newSeriesLabelValues(allocRuns, 3, 8)
+			lc := NewLabeledCounter("alloc_existing_total", "allocation contract", []string{"a", "b", "c"})
+			for k := range n {
+				lc.Inc("pre", strconv.Itoa(k), "x")
+			}
+			next := 0
+			counts[i] = testing.AllocsPerRun(allocRuns, func() {
+				lc.Inc(keys[next]...)
+				next++
+			})
+		}
+		for i, got := range counts {
+			if got != counts[0] {
+				t.Errorf("LabeledCounter.Inc(a new series into a metric already holding %d) allocated %v times per run, want %v (its count at %d existing): a per-existing-series cost makes series creation quadratic over the life of a process, and every consuming app runs for weeks",
+					existing[i], got, counts[0], existing[0])
+			}
+		}
+		t.Logf("a constant %v allocations per new series with %d to %d series already present", counts[0], existing[0], existing[len(existing)-1])
+	})
 }
