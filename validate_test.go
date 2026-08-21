@@ -447,31 +447,38 @@ func TestSanitizeLabelValues_LongInvalidUTF8LogTruncated(t *testing.T) {
 	straddle := strings.Repeat("a", maxLogValueLen-1) + "\u00e9\xff" + strings.Repeat("b", 64)
 	NewLabeledCounter("long_sanval_straddle_total", "test", []string{"m"}).Inc(straddle) // must not panic
 
-	var line string
-	for l := range strings.SplitSeq(buf.String(), "\n") {
-		if strings.Contains(l, "long_sanval_straddle_total") {
-			line = l
-			break
-		}
-	}
-	if line == "" {
-		t.Fatalf("logs = %q, want sanitize warning for straddle metric", buf.String())
-	}
-	_, attr, ok := strings.Cut(line, " value=")
-	if !ok {
-		t.Fatalf("log line %q, want value attribute", line)
-	}
-	if strings.HasPrefix(attr, `"`) {
-		// TextHandler quotes (and \x-escapes) values that are not plain
-		// printable strings; unquote to recover the raw logged attribute.
-		unquoted, err := strconv.Unquote(attr)
-		if err != nil {
-			t.Fatalf("unquote value attribute %q: %v", attr, err)
-		}
-		attr = unquoted
-	}
+	attr := loggedValueAttr(t, buf.String(), "long_sanval_straddle_total")
 	if !utf8.ValidString(attr) {
 		t.Errorf("logged value attribute %q is not valid UTF-8; truncation split a rune", attr)
+	}
+	// The straddling rune is DROPPED, not carried: the cut moves back to the
+	// boundary below the cap, so the marker follows the last whole 'a' and the
+	// U+00E9 spanning the cap never reaches the log.
+	want := strings.Repeat("a", maxLogValueLen-1) + "..."
+	if attr != want {
+		t.Errorf("logged value attribute = %q, want %q (cut backs off to the rune boundary below the cap)", attr, want)
+	}
+}
+
+// TestSanitizeLabelValues_ValueExactlyAtLogCapLoggedWhole pins the log-cap
+// boundary itself: a sanitized value of exactly maxLogValueLen bytes is within
+// the cap, so the warning carries it whole with no truncation marker. The input
+// is maxLogValueLen-3 ASCII bytes plus one invalid byte, which sanitizes to
+// maxLogValueLen-3 bytes plus the 3-byte U+FFFD — exactly the cap. Serial: it
+// captures slog.Default.
+func TestSanitizeLabelValues_ValueExactlyAtLogCapLoggedWhole(t *testing.T) {
+	buf := captureDebugLogs(t)
+	atCap := strings.Repeat("a", maxLogValueLen-3) + "\xff"
+
+	NewLabeledCounter("logcap_exact_total", "test", []string{"m"}).Inc(atCap) // must not panic
+
+	attr := loggedValueAttr(t, buf.String(), "logcap_exact_total")
+	want := strings.Repeat("a", maxLogValueLen-3) + "\uFFFD"
+	if attr != want {
+		t.Errorf("logged value attribute = %q, want the whole %d-byte value %q", attr, len(want), want)
+	}
+	if strings.Contains(attr, "...") {
+		t.Errorf("logged value attribute = %q, want no truncation marker for a value exactly at the cap", attr)
 	}
 }
 
