@@ -436,8 +436,21 @@ func BenchmarkLabeledCounterInc(b *testing.B) {
 	}
 }
 
-func BenchmarkLabeledCounterInc_NewKey(b *testing.B) {
-	lc := NewLabeledCounter("bench_lc_new", "bench", []string{"method", "path", "status"})
+// BenchmarkLabeledCounterInc_DynamicLabel measures Inc where the caller BUILDS
+// a label value per call, which is what a real request handler does. The value
+// cycles through eight paths, so after the eighth iteration every series
+// already exists and this charts the loaded path plus the caller's string
+// building.
+//
+// It was named _NewKey until 2026-08-21 and never measured a new key: eight
+// distinct values means eight series, created in the first eight iterations of
+// a run that does millions. The name is now what the code does. Creating a
+// series is covered instead by TestLabeledCounterNewSeriesCostIsConstant, which
+// can control the fixture, where a benchmark loop cannot: measuring the cold
+// path honestly means growing the series set without bound for as long as the
+// loop runs.
+func BenchmarkLabeledCounterInc_DynamicLabel(b *testing.B) {
+	lc := NewLabeledCounter("bench_lc_dynamic", "bench", []string{"method", "path", "status"})
 	b.ReportAllocs()
 	for i := 0; b.Loop(); i++ {
 		lc.Inc("GET", "/api/"+strings.Repeat("x", i%8), "200")
