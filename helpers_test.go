@@ -256,3 +256,35 @@ func newSeriesLabelValues(runs, nLabels, valueLen int) [][]string {
 	}
 	return out
 }
+
+// loggedValueAttr returns the raw "value" attribute of the captured log line
+// mentioning metric, unquoting it when the TextHandler quoted it (it quotes and
+// \x-escapes anything that is not a plain printable string, which includes any
+// value carrying U+FFFD). Used by the log-truncation tests, whose subject is the
+// exact bytes of that attribute. value is the last attribute the sanitization
+// warnings carry, so everything after " value=" belongs to it.
+func loggedValueAttr(t *testing.T, logs, metric string) string {
+	t.Helper()
+	var line string
+	for l := range strings.SplitSeq(logs, "\n") {
+		if strings.Contains(l, metric) {
+			line = l
+			break
+		}
+	}
+	if line == "" {
+		t.Fatalf("logs = %q, want a line mentioning metric %s", logs, metric)
+	}
+	_, attr, ok := strings.Cut(line, " value=")
+	if !ok {
+		t.Fatalf("log line %q, want a value attribute", line)
+	}
+	if !strings.HasPrefix(attr, `"`) {
+		return attr
+	}
+	unquoted, err := strconv.Unquote(attr)
+	if err != nil {
+		t.Fatalf("unquote value attribute %q: %v", attr, err)
+	}
+	return unquoted
+}

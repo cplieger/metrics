@@ -102,6 +102,27 @@ func TestParseProcStatStartTime(t *testing.T) {
 			want: -1,
 		},
 		{
+			// Exactly 19 fields after the comm: starttime sits at index 19, so
+			// the field set is one short and reading it would run off the end.
+			name: "one field short of starttime",
+			in:   "1234 (cat) S 1 1 1 0 0 0 0 0 0 0 200 100 0 0 20 0 1 0",
+			want: -1,
+		},
+		{
+			// A starttime of zero ticks is a reading, not a failure: the guard
+			// rejects only negatives, so zero is reported as collected.
+			name: "starttime zero",
+			in:   "1234 (cat) S 1 1 1 0 0 0 0 0 0 0 200 100 0 0 20 0 1 0 0",
+			want: 0,
+		},
+		{
+			// The kernel never reports a negative starttime; a file that does is
+			// malformed, and must not become a negative tick count downstream.
+			name: "negative starttime",
+			in:   "1234 (cat) S 1 1 1 0 0 0 0 0 0 0 200 100 0 0 20 0 1 0 -5",
+			want: -1,
+		},
+		{
 			name: "no closing paren",
 			in:   "1234 cat S 1 1",
 			want: -1,
@@ -396,6 +417,10 @@ func TestParseAuxvClkTck(t *testing.T) {
 			}{
 				{"clktck_present", buildAuxv(ws, [2]uint64{6, 4096}, [2]uint64{auxvClkTckTag, 100}, [2]uint64{0, 0}), 100},
 				{"clktck_first", buildAuxv(ws, [2]uint64{auxvClkTckTag, 250}, [2]uint64{0, 0}), 250},
+				// A vector that ends on a pair boundary carries no AT_NULL, so
+				// the final pair is only read if the scan admits the pair that
+				// ends exactly at len(data).
+				{"clktck_in_final_pair_unterminated", buildAuxv(ws, [2]uint64{6, 4096}, [2]uint64{auxvClkTckTag, 250}), 250},
 				{"terminated_before_clktck", buildAuxv(ws, [2]uint64{6, 4096}, [2]uint64{0, 0}, [2]uint64{auxvClkTckTag, 100}), -1},
 				{"absent", buildAuxv(ws, [2]uint64{6, 4096}, [2]uint64{0, 0}), -1},
 				{"zero_value_rejected", buildAuxv(ws, [2]uint64{auxvClkTckTag, 0}, [2]uint64{0, 0}), -1},
@@ -413,6 +438,31 @@ func TestParseAuxvClkTck(t *testing.T) {
 	}
 	if got := parseAuxvClkTck(buildAuxv(8, [2]uint64{auxvClkTckTag, 100}), 5); got != -1 {
 		t.Errorf("parseAuxvClkTck with unsupported word size = %d, want -1", got)
+	}
+}
+
+// TestParseAuxvClkTck_ValueRangeBoundary pins the int64 conversion boundary: a
+// tick value that is exactly representable as an int64 is reported, and only a
+// value ABOVE that is rejected as unusable. Both discriminating values need a
+// 64-bit word, so they sit outside the word-size loop above (a 4-byte word
+// cannot carry either).
+func TestParseAuxvClkTck_ValueRangeBoundary(t *testing.T) {
+	tests := []struct {
+		name string
+		val  uint64
+		want int64
+	}{
+		{"max_int64_reported", math.MaxInt64, math.MaxInt64},
+		{"one_above_max_int64_rejected", math.MaxInt64 + 1, -1},
+		{"max_uint64_rejected", math.MaxUint64, -1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := buildAuxv(8, [2]uint64{auxvClkTckTag, tc.val}, [2]uint64{0, 0})
+			if got := parseAuxvClkTck(data, 8); got != tc.want {
+				t.Errorf("parseAuxvClkTck(AT_CLKTCK=%d, 8) = %d, want %d", tc.val, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -550,6 +600,24 @@ func TestProcGCPauseSeconds_ScaledToSeconds(t *testing.T) {
 	// the two distinguishes the seconds-scaled value from an unscaled one.
 	if val < 0 || val > 1e6 {
 		t.Errorf("process_gc_pause_seconds_total = %v, want a small non-negative seconds value", val)
+	}
+}
+
+// TestReadProcStartTime_AgreesWithPackageInitAnchor pins the kernel start-time
+// composition against the only independent witness the process has: the
+// package-init instant, captured microseconds after exec. The boot time from
+// /proc/stat plus the process's tick offset from /proc/self/stat must therefore
+// land within a second or two of that anchor. A composition that drops either
+// term, or applies the offset in the wrong direction, lands seconds to days
+// away — the offset is the machine's uptime at exec.
+func TestReadProcStartTime_AgreesWithPackageInitAnchor(t *testing.T) {
+	if runtime.GOOS != goosLinux {
+		t.Skip("kernel-derived start time is Linux-only (/proc/self/stat, /proc/stat)")
+	}
+	got := readProcStartTime()
+	anchor := float64(processStartTime.Unix())
+	if got < anchor-2 || got > anchor+2 {
+		t.Errorf("readProcStartTime() = %.3f, want within 2s of the package-init anchor %.0f", got, anchor)
 	}
 }
 
@@ -701,5 +769,24 @@ func TestCollectProcessMetrics_StartTimeFallbackToPackageInit(t *testing.T) {
 	if diff := now - (d.startTime + d.uptime); diff < -2 || diff > 2 {
 		t.Errorf("start(%v) + uptime(%v) = %v, want ~= now(%v); diff=%v",
 			d.startTime, d.uptime, d.startTime+d.uptime, now, diff)
+	}
+}
+
+// TestCollectProcessMetrics_ZeroKernelStartTimeIsNotAFailure pins the polarity
+// of the fallback guard: only the negative read-failure sentinel sends
+// collectProcessMetrics to the package-init anchor, so a memoized kernel start
+// time of exactly zero is used as collected. Serial: it mutates the
+// package-level memoized procStartTimeVal.
+func TestCollectProcessMetrics_ZeroKernelStartTimeIsNotAFailure(t *testing.T) {
+	resolvedProcStartTime() // ensure the sync.Once has fired before overriding
+	prev := procStartTimeVal
+	t.Cleanup(func() { procStartTimeVal = prev })
+	procStartTimeVal = 0
+
+	var d processMetricsData
+	collectProcessMetrics(&d)
+
+	if d.startTime != 0 {
+		t.Errorf("startTime = %v, want 0 (a zero kernel start time is a reading, not the -1 failure sentinel)", d.startTime)
 	}
 }
