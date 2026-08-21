@@ -3,6 +3,7 @@ package metrics
 import (
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -676,4 +677,208 @@ func TestHistogram_nameEndingInCount(t *testing.T) {
 			t.Errorf("histogram named _count missing %q:\n%s", want, out)
 		}
 	}
+}
+
+// TestHistogramObserveIsAllocationFreeAtEveryBucketPosition pins Observe at
+// zero allocations wherever the observed value falls. Observe walks the bounds
+// to find the first bucket the value fits, then increments every bucket from
+// there up, so the branch it takes is chosen by the value: a value below the
+// first bound runs the longest bucket loop, one above the last bound skips the
+// loop entirely and touches only +Inf, and a value exactly ON a bound must
+// land in that bucket (the comparison is `seconds <= bound`) rather than
+// falling through to the next. Each of those is a different path and any of
+// them could start allocating on its own, which is why the positions are
+// listed rather than sampled.
+//
+// The two shape cases are there for a different reason: a histogram with only
+// the implicit +Inf bucket and one with 64 bounds bracket the loop, so a
+// regression that allocated per bucket visited would show up in the wide case
+// even if it hid in the default eight.
+func TestHistogramObserveIsAllocationFreeAtEveryBucketPosition(t *testing.T) {
+	// DefaultBuckets is 0.005 .. 1.0, so these positions are stated against
+	// it. Spelled out rather than derived, so a change to DefaultBuckets is a
+	// visible edit here instead of a silently relabelled case.
+	h := NewHistogram("alloc_histogram_seconds", "allocation contract")
+	wide := make([]float64, 64)
+	for i := range wide {
+		wide[i] = float64(i + 1)
+	}
+
+	cases := []struct {
+		name     string
+		position string
+		h        *Histogram
+		v        float64
+	}{
+		{"below_first_bound", "below the first bound (every bucket incremented)", h, 0.001},
+		{"on_first_bound", "exactly on the first bound", h, 0.005},
+		{"between_bounds", "between two bounds", h, 0.0075},
+		{"on_last_bound", "exactly on the last bound", h, 1.0},
+		{"above_last_bound", "above the last bound (+Inf only)", h, 2.0},
+		{"zero", "zero seconds", h, 0},
+		{"inf_only_histogram", "into a histogram with only the +Inf bucket", NewHistogram("alloc_histogram_inf", "allocation contract", WithBuckets(nil)), 1},
+		{"64_bounds", "above the last of 64 bounds", NewHistogram("alloc_histogram_wide", "allocation contract", WithBuckets(wide)), 100},
+		{"64_bounds_below_first", "below the first of 64 bounds (64 buckets incremented)", NewHistogram("alloc_histogram_wide2", "allocation contract", WithBuckets(wide)), 0.5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := testing.AllocsPerRun(allocRuns, func() { tc.h.Observe(tc.v) }); got != 0 {
+				t.Errorf("Histogram.Observe(%v), %s, allocated %v times per run, want 0: every instrumented request and every timer lands here, so an allocation on this path is charged per observation",
+					tc.v, tc.position, got)
+			}
+		})
+	}
+}
+
+// TestLabeledHistogramObserveIsAllocationFreeOnAnExistingSeries pins the
+// labeled Observe on the path a steady-state app takes: the label set exists,
+// so the call is a map read plus the child histogram's own free Observe. The
+// series is created in setup for exactly that reason — a closure observing a
+// fresh label set every run would measure series creation, which is a bounded
+// constant rather than zero (TestLabeledHistogramNewSeriesCostIsConstant).
+func TestLabeledHistogramObserveIsAllocationFreeOnAnExistingSeries(t *testing.T) {
+	lh := NewLabeledHistogram("alloc_labeled_histogram_seconds", "allocation contract", []string{"kind"})
+	lh.Observe(0.1, "scan")
+
+	if got := testing.AllocsPerRun(allocRuns, func() { lh.Observe(0.1, "scan") }); got != 0 {
+		t.Errorf(`LabeledHistogram.Observe(0.1, "scan") on an existing series allocated %v times per run, want 0: this is the per-request latency path in every consuming app`, got)
+	}
+}
+
+// TestLabeledHistogramNewSeriesCostIsConstant pins series creation for the
+// labeled histogram, whose new series is a whole child Histogram rather than
+// one atomic: it measures two allocations (the Histogram and its bucket slice)
+// where the counter and gauge measure one.
+//
+// The bucket-count axis is the one specific to this type. `make([]atomic.Int64,
+// len(bounds)+1)` is a single allocation whatever its length, so the constant
+// must not move between an 8-bound and a 32-bound histogram; if it ever does,
+// something started building per-bucket state and a metric's bucket layout
+// begins multiplying the cost of every label set a caller adds. The
+// existing-series axis is the quadratic guard, as on the counter.
+func TestLabeledHistogramNewSeriesCostIsConstant(t *testing.T) {
+	// The 20k-series pre-fill crosses cardinalityWarnThreshold; keep its
+	// warning out of the test output. The crossing is in setup.
+	captureDebugLogs(t)
+
+	t.Run("independent_of_bucket_count", func(t *testing.T) {
+		bounds := [][]float64{nil, DefaultBuckets(), make([]float64, 32)}
+		for i := range bounds[2] {
+			bounds[2][i] = float64(i + 1)
+		}
+		counts := make([]float64, len(bounds))
+		for i, bs := range bounds {
+			keys := newSeriesLabelValues(allocRuns, 1, 8)
+			lh := NewLabeledHistogram("alloc_hist_buckets", "allocation contract", []string{"k"}, WithBuckets(bs))
+			next := 0
+			counts[i] = testing.AllocsPerRun(allocRuns, func() {
+				lh.Observe(0.1, keys[next]...)
+				next++
+			})
+		}
+		for i, got := range counts {
+			if got != counts[0] {
+				t.Errorf("LabeledHistogram.Observe(a new series on a histogram with %d bounds) allocated %v times per run, want %v (its count at %d bounds): the bucket slice is one allocation at any length, so a count that tracks the bucket layout means every label set a caller adds now pays per bucket",
+					len(bounds[i]), got, counts[0], len(bounds[0]))
+			}
+		}
+		t.Logf("a constant %v allocations per new series from %d to %d bounds", counts[0], len(bounds[0]), len(bounds[len(bounds)-1]))
+	})
+
+	t.Run("independent_of_existing_series", func(t *testing.T) {
+		existing := []int{0, 1_000, 20_000}
+		counts := make([]float64, len(existing))
+		for i, n := range existing {
+			keys := newSeriesLabelValues(allocRuns, 1, 8)
+			lh := NewLabeledHistogram("alloc_hist_existing", "allocation contract", []string{"k"})
+			for k := range n {
+				lh.Observe(0.1, "pre"+strconv.Itoa(k))
+			}
+			next := 0
+			counts[i] = testing.AllocsPerRun(allocRuns, func() {
+				lh.Observe(0.1, keys[next]...)
+				next++
+			})
+		}
+		for i, got := range counts {
+			if got != counts[0] {
+				t.Errorf("LabeledHistogram.Observe(a new series into a metric already holding %d) allocated %v times per run, want %v (its count at %d existing): a per-existing-series cost makes series creation quadratic over a process's lifetime",
+					existing[i], got, counts[0], existing[0])
+			}
+		}
+		t.Logf("a constant %v allocations per new series with %d to %d series already present", counts[0], existing[0], existing[len(existing)-1])
+	})
+}
+
+// TestTimerAllocationCost pins the timer, which the README puts on the
+// `defer t.ObserveDuration()` path of a request handler, and it is the one
+// place in this file where the answer is not a uniform zero.
+//
+// Recording is free: ObserveDuration is time.Since plus a call through the
+// stored observe func, for both timer flavors. Construction is not, and the
+// two flavors differ for a reason worth stating. NewTimer stores the
+// histogram's Observe METHOD VALUE, which costs nothing while the timer stays
+// on the stack — the whole create-and-observe round measures 0 — but two
+// allocations (the Timer and the bound method) as soon as it escapes.
+// (*LabeledHistogram).NewTimer always costs three: it clones the caller's
+// label values and closes over them, and a closure the Timer holds escapes by
+// construction. That is the price of the label set, not of the timer, and what
+// matters is that it is a constant: it must not grow with the number of label
+// values, or a per-label-per-timer cost lands on every instrumented request.
+func TestTimerAllocationCost(t *testing.T) {
+	h := NewHistogram("alloc_timer_seconds", "allocation contract")
+
+	t.Run("observe_duration_is_free", func(t *testing.T) {
+		lh := NewLabeledHistogram("alloc_timer_labeled_seconds", "allocation contract", []string{"kind"})
+		lh.Observe(0.1, "scan")
+		plain := NewTimer(h)
+		labeled := lh.NewTimer("scan")
+
+		if got := testing.AllocsPerRun(allocRuns, func() { _ = plain.ObserveDuration() }); got != 0 {
+			t.Errorf("Timer.ObserveDuration() allocated %v times per run, want 0: it runs once per instrumented operation", got)
+		}
+		if got := testing.AllocsPerRun(allocRuns, func() { _ = labeled.ObserveDuration() }); got != 0 {
+			t.Errorf("Timer.ObserveDuration() on a LabeledHistogram timer allocated %v times per run, want 0: it runs once per instrumented operation", got)
+		}
+	})
+
+	t.Run("unlabeled_timer_end_to_end", func(t *testing.T) {
+		// The measured shape is the documented one: create the timer, defer
+		// the observation, return. It is 0 only because the Timer and its
+		// bound method stay on the stack, so this case is a statement about
+		// the shape and the compiler together — a non-zero result means the
+		// Timer started escaping, which turns two allocations per instrumented
+		// call back on.
+		if got := testing.AllocsPerRun(allocRuns, func() {
+			func() {
+				timer := NewTimer(h)
+				defer timer.ObserveDuration()
+			}()
+		}); got != 0 {
+			t.Errorf("NewTimer(h) with a deferred ObserveDuration allocated %v times per run, want 0: the timer is meant to stay on the caller's stack, and the README puts this shape in a request handler", got)
+		}
+	})
+
+	t.Run("labeled_timer_arity", func(t *testing.T) {
+		arities := []int{1, 4, 8}
+		counts := make([]float64, len(arities))
+		for i, n := range arities {
+			vals := make([]string, n)
+			for j := range vals {
+				vals[j] = "v"
+			}
+			lh := NewLabeledHistogram("alloc_timer_arity_seconds", "allocation contract", labelNames(n))
+			lh.Observe(0.1, vals...)
+			counts[i] = testing.AllocsPerRun(allocRuns, func() {
+				lh.NewTimer(vals...).ObserveDuration()
+			})
+		}
+		for i, got := range counts {
+			if got != counts[0] {
+				t.Errorf("(*LabeledHistogram).NewTimer(%d label values) plus ObserveDuration allocated %v times per run, want %v (its count at %d value): the clone and the closure are one allocation each at any arity, so a count that tracks the label count charges per label on every instrumented request",
+					arities[i], got, counts[0], arities[0])
+			}
+		}
+		t.Logf("a constant %v allocations per labeled timer from %d to %d label values", counts[0], arities[0], arities[len(arities)-1])
+	})
 }

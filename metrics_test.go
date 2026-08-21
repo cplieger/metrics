@@ -573,3 +573,178 @@ func TestNewRegistryCapturesAnInvalidPrefix(t *testing.T) {
 		t.Errorf("Register on a valid prefix = %v, want nil", err)
 	}
 }
+
+// TestRegistryHandlerAllocationsAreBoundedPerMetric is the contract the weekly
+// benchmark tracker cannot provide, and the reason this file has an allocation
+// test at all.
+//
+// A scrape renders the whole exposition, so its cost is legitimately
+// proportional to how many metrics the registry holds: the total is not a
+// constant and asserting one would be wrong. What must hold is that the
+// PER-METRIC rate is bounded — the cost is linear with a small slope, not
+// linear with a growing one, and not quadratic. The tracker compares a
+// benchmark's allocation count against the previous run and alerts above a
+// ratio, so a registry that goes from 260 to 380 allocations per scrape is a
+// ratio of 1.46 and stays silent; a fleet where every app carries a hundred
+// series pays that difference on every scrape of every app, forever. This is
+// the class the chart is structurally blind to.
+//
+// The rate is measured as a slope between two registry sizes, which cancels
+// the fixed cost of a scrape (the process-metric block, measured at about 114
+// allocations, plus the handler's two header writes). Only intervals spanning
+// at least minAllocSpan units are gated: the fixed cost varies by a few
+// allocations from run to run because collecting the process metrics reads
+// /proc, and over a 9-metric interval that noise lands on the rate at ±0.5 or
+// worse, while over 90 it disappears. The narrow intervals are still measured
+// and logged — the numbers are the useful half of a failure — just not gated.
+//
+// Gating every wide interval rather than only the widest is what makes this a
+// statement about linearity: a cost that grows per metric ALREADY registered
+// (a re-scan, a re-sort, a rebuilt name table) shows up as a rate that climbs
+// with the size of the interval, and would breach the bound at 100->1000 while
+// passing at 10->100.
+func TestRegistryHandlerAllocationsAreBoundedPerMetric(t *testing.T) {
+	// minAllocSpan is the smallest interval whose slope is gated (see above).
+	const minAllocSpan = 90
+
+	// The 1000-label-set shape crosses cardinalityWarnThreshold as it is
+	// built; capture the warning so it stays out of the test output. The
+	// crossing happens in setup, never inside a measured closure.
+	captureDebugLogs(t)
+
+	// histBounds is the bucket layout the histogram shapes use: eight bounds,
+	// so each family emits eight bucket samples plus +Inf, _sum and _count —
+	// eleven lines. It is spelled out rather than taken from DefaultBuckets so
+	// an edit to the shipped defaults cannot silently move the per-family
+	// number this contract pins.
+	histBounds := []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1}
+
+	shapes := []struct {
+		name  string
+		unit  string // one of what the sweep adds, for the failure message
+		units string // its plural, for the sizes
+		sizes []int
+		build func(n int) *Registry
+		// max is the per-unit ceiling for a plain build, maxRace for a -race
+		// build (the detector's instrumentation defeats some escape analysis
+		// here and costs a third more). Both are the highest rate MEASURED
+		// over four plain and three -race runs plus half an allocation, which
+		// is the rule that makes the contract do its job: one added allocation
+		// per unit breaches the bound, while drift of less than half an
+		// allocation — a toolchain bump moving fmt's internals, say — does
+		// not. A red result from such a bump is a re-measurement, not a
+		// mystery: every rate the sweep computes is logged, gated or not.
+		max     float64
+		maxRace float64
+	}{
+		{
+			name:  "counters",
+			unit:  "counter family",
+			units: "counter families",
+			sizes: []int{1, 10, 100, 1000},
+			build: func(n int) *Registry {
+				r := NewRegistry("alloc")
+				for i := range n {
+					c := NewCounter("scrape_c"+strconv.Itoa(i)+"_total", "allocation contract")
+					r.MustRegister(c)
+					c.Inc()
+				}
+				return r
+			},
+			max:     7.6,
+			maxRace: 9.8,
+		},
+		{
+			name:  "label_sets_on_one_labeled_counter",
+			unit:  "label set",
+			units: "label sets",
+			sizes: []int{1, 10, 100, 1000},
+			build: func(n int) *Registry {
+				r := NewRegistry("alloc")
+				lc := NewLabeledCounter("scrape_lc_total", "allocation contract", []string{"a", "b"})
+				r.MustRegister(lc)
+				for i := range n {
+					lc.Inc("v"+strconv.Itoa(i), "w")
+				}
+				return r
+			},
+			max:     7.5,
+			maxRace: 8.4,
+		},
+		{
+			name:  "histograms_of_8_bounds",
+			unit:  "histogram family (11 samples)",
+			units: "histogram families",
+			sizes: []int{1, 10, 100},
+			build: func(n int) *Registry {
+				r := NewRegistry("alloc")
+				for i := range n {
+					h := NewHistogram("scrape_h"+strconv.Itoa(i), "allocation contract", WithBuckets(histBounds))
+					r.MustRegister(h)
+					h.Observe(0.02)
+				}
+				return r
+			},
+			max:     65.6,
+			maxRace: 75.8,
+		},
+		{
+			name:  "label_sets_on_one_labeled_histogram",
+			unit:  "label set (11 samples)",
+			units: "label sets",
+			sizes: []int{1, 10, 100},
+			build: func(n int) *Registry {
+				r := NewRegistry("alloc")
+				lh := NewLabeledHistogram("scrape_lh", "allocation contract", []string{"a"}, WithBuckets(histBounds))
+				r.MustRegister(lh)
+				for i := range n {
+					lh.Observe(0.02, "v"+strconv.Itoa(i))
+				}
+				return r
+			},
+			max:     65.6,
+			maxRace: 74.1,
+		},
+	}
+
+	for _, sh := range shapes {
+		t.Run(sh.name, func(t *testing.T) {
+			// Everything the measurement needs is built here: the registry,
+			// its metrics, the request and the writer. Inside the closure they
+			// would be charged to the library.
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			w := &discardResponseWriter{}
+			totals := make([]float64, len(sh.sizes))
+			for i, n := range sh.sizes {
+				h := sh.build(n).Handler()
+				totals[i] = testing.AllocsPerRun(scrapeAllocRuns, func() { h.ServeHTTP(w, req) })
+			}
+
+			want := allocCeiling(sh.max, sh.maxRace)
+			gated := 0
+			for i := range sh.sizes {
+				for j := i + 1; j < len(sh.sizes); j++ {
+					span := sh.sizes[j] - sh.sizes[i]
+					rate := (totals[j] - totals[i]) / float64(span)
+					if span < minAllocSpan {
+						t.Logf("%d -> %d %s: %v -> %v allocations per scrape, %.4f per %s (interval too narrow to gate)",
+							sh.sizes[i], sh.sizes[j], sh.units, totals[i], totals[j], rate, sh.unit)
+						continue
+					}
+					gated++
+					if rate > want {
+						t.Errorf("Registry.Handler() allocated %v times per scrape at %d %s and %v at %d, a rate of %.4f per added %s, want at most %v: one extra allocation per metric is invisible to the weekly tracker (it compares ratios, and a 260 -> 380 drift is 1.46) and a large deployment pays it on every scrape of every app",
+							totals[i], sh.sizes[i], sh.units, totals[j], sh.sizes[j], rate, sh.unit, want)
+						continue
+					}
+					t.Logf("%d -> %d %s: %v -> %v allocations per scrape, %.4f per %s (want <= %v)",
+						sh.sizes[i], sh.sizes[j], sh.units, totals[i], totals[j], rate, sh.unit, want)
+				}
+			}
+			if gated == 0 {
+				t.Fatalf("no interval of the %s sweep spanned %d %s, so nothing was gated: the sizes %v cannot verify a per-%s rate",
+					sh.name, minAllocSpan, sh.units, sh.sizes, sh.unit)
+			}
+		})
+	}
+}

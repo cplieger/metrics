@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -126,4 +128,131 @@ func checkLabelQuoting(t *testing.T, inner string) {
 	if inQuote {
 		t.Fatalf("unbalanced quotes in label section: %q", inner)
 	}
+}
+
+// The shared machinery for this package's allocation contracts, which live in
+// counter_test.go, gauge_test.go, histogram_test.go, metrics_test.go and
+// exposition_test.go — each beside the source file whose cost it pins.
+//
+// The library's cost model has two halves and both are now measured: recording
+// into an EXISTING series allocates nothing, and creating a new series costs a
+// bounded constant. The weekly benchmark tracker cannot stand in for either.
+// It alerts on the ratio between consecutive runs, so it catches a 0 -> n
+// regression (an infinite ratio, at any threshold) but is structurally blind
+// to a bounded count drifting: 260 -> 380 allocations per scrape is a ratio of
+// 1.46, and 2 -> 3 is exactly 1.5. The bounded counts are therefore where
+// these contracts earn their keep, and the exposition ones bound a per-metric
+// RATE rather than a total, because a scrape's total cost is legitimately
+// proportional to how many metrics the registry holds.
+//
+// Three rules every contract here follows, each of which is a way to measure
+// the wrong thing:
+//
+//   - Fixtures are built OUTSIDE the measured closure. Registering a metric,
+//     constructing a registry and building a label-value slice all allocate,
+//     and inside the closure that cost is reported as the library's.
+//   - The closure is deliberate about which path it takes. A registry is
+//     stateful and [testing.AllocsPerRun] runs the closure runs+1 times, so a
+//     closure touching ONE label set measures the loaded fast path on every
+//     run after the first, while one touching a FRESH label set per run
+//     measures series creation. Each contract's comment says which it is.
+//   - No t.Parallel. AllocsPerRun reads process-wide malloc counters and
+//     panics outright when called from a parallel test.
+
+// allocRuns is the AllocsPerRun run count for the record-path contracts.
+// AllocsPerRun divides as integers, so the average of a path that allocates
+// nothing is exactly 0 and one stray allocation per hundred runs still floors
+// to 0; the count is high enough that a per-call allocation cannot hide and
+// low enough that the contracts stay instant under -race.
+const allocRuns = 100
+
+// scrapeAllocRuns is the run count for the exposition sweeps. It is lower
+// because one run of the largest fixture performs thousands of allocations, so
+// the average is already stable at this count, and because a sweep pays it once
+// per registry size at every shape it measures.
+const scrapeAllocRuns = 15
+
+// raceDetectorEnabled reports whether this test binary was built with -race.
+// The build settings carry it: `go test -race` records `-race=true`, and a
+// plain build records no such setting at all.
+func raceDetectorEnabled() bool {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return false
+	}
+	for _, s := range bi.Settings {
+		if s.Key == "-race" {
+			return s.Value == "true"
+		}
+	}
+	return false
+}
+
+// allocCeiling returns the allocation bound for the mode this binary was built
+// in. The two numbers are not a fudge factor: the race detector's
+// instrumentation defeats some of the compiler's escape analysis, so the
+// exposition path measures about a third more allocations per metric under
+// -race (7.0 plain against 9.4 per counter family, measured) while the record
+// paths stay at exactly 0 in both modes. CI runs the suite with -race, so a
+// contract carrying only the plain number would have to be loosened until it
+// passed there, which is the same as not gating the plain number; and skipping
+// it under -race would leave the contract gating nothing where CI runs it.
+func allocCeiling(plain, withRace float64) float64 {
+	if raceDetectorEnabled() {
+		return withRace
+	}
+	return plain
+}
+
+// discardResponseWriter is an http.ResponseWriter that keeps nothing, so a
+// scrape measurement is charged for the exposition and not for a recorder's
+// growing body buffer (httptest.ResponseRecorder's buffer doubles as the
+// output grows, which adds allocations that track the very thing being
+// measured). It implements io.StringWriter because net/http's own response
+// writer does: io.WriteString in Registry.Handler then takes the same branch
+// it takes in production, rather than the fallback that converts the whole
+// exposition to a []byte.
+type discardResponseWriter struct{ hdr http.Header }
+
+func (w *discardResponseWriter) Header() http.Header {
+	if w.hdr == nil {
+		w.hdr = make(http.Header)
+	}
+	return w.hdr
+}
+
+func (w *discardResponseWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+func (w *discardResponseWriter) WriteString(s string) (int, error) { return len(s), nil }
+
+func (w *discardResponseWriter) WriteHeader(int) {}
+
+// labelNames returns n label names ("l0", "l1", ...), for a contract that
+// varies a metric's label ARITY.
+func labelNames(n int) []string {
+	names := make([]string, n)
+	for i := range names {
+		names[i] = "l" + strconv.Itoa(i)
+	}
+	return names
+}
+
+// newSeriesLabelValues returns runs+2 distinct label-value slices, each
+// carrying nLabels values of at least valueLen bytes, for the contracts that
+// measure the SERIES-CREATION path. AllocsPerRun calls its closure runs+1
+// times and a label set is created once, so a closure reusing one slice would
+// measure the loaded fast path instead; one slice per run is the only way to
+// make every run take the cold path. They are built here, outside the measured
+// closure, because building one allocates and that cost belongs to the fixture.
+func newSeriesLabelValues(runs, nLabels, valueLen int) [][]string {
+	pad := strings.Repeat("x", valueLen)
+	out := make([][]string, runs+2)
+	for i := range out {
+		vals := make([]string, nLabels)
+		for j := range vals {
+			vals[j] = strconv.Itoa(i) + "-" + strconv.Itoa(j) + pad
+		}
+		out[i] = vals
+	}
+	return out
 }
