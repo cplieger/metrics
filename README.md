@@ -107,7 +107,9 @@ Labeled metrics support at most 8 label names; a ninth is a construction error t
 
 - `RecordHTTP(c *LabeledCounter, h *Histogram, d time.Duration, labelVals ...string)`: record one request into the caller-supplied counter/histogram (either may be `nil`). The caller owns the label set, ordering, and any path templating.
 
-Pair `RecordHTTP` with middleware that captures the response status, such as [webhttp](https://github.com/cplieger/webhttp) (its `StatusRecorder` plus `Logging`'s `WithRecordMetric`) or middleware of your own, and call it once the final status is known.
+`RecordHTTP` takes no request and no status, so middleware captures both and calls it once the response is complete. Its parameters are this package's own types, so middleware that does not import metrics cannot take `RecordHTTP` as its hook. The wiring is a small adapter that spreads the middleware's per-request values onto the label list.
+
+With [webhttp](https://github.com/cplieger/webhttp), adapt the access-log hook `WithRecordRouteMetric` registers. Its `(method, path)` pair is bounded by the route table rather than by traffic, and the access logger records the status itself. This library declares no dependencies, so it cannot ship a compiling example of that pairing. The hook contract is [webhttp's own reference for `WithRecordRouteMetric`](https://pkg.go.dev/github.com/cplieger/webhttp/v2#WithRecordRouteMetric).
 
 Label values are caller-owned. Invalid UTF-8 never panics: the value is sanitized with the Unicode replacement character (U+FFFD) at record time, and a warning naming the metric is logged when the sanitized series is first created (repeat records do not re-warn). Sanitizing merges distinct raw values that repair to the same string into one series, and every record carrying invalid UTF-8 takes the slower series-creation path, so validate values derived from untrusted input before use. Untrusted label values are also a cardinality risk: each distinct label combination allocates a series retained until `Delete`/`Reset`, so labeling by raw request path or header content grows memory and scrape size without bound. Template paths to a fixed route set.
 
