@@ -440,15 +440,8 @@ func BenchmarkLabeledCounterInc(b *testing.B) {
 // a label value per call, which is what a real request handler does. The value
 // cycles through eight paths, so after the eighth iteration every series
 // already exists and this charts the loaded path plus the caller's string
-// building.
-//
-// It was named _NewKey until 2026-08-21 and never measured a new key: eight
-// distinct values means eight series, created in the first eight iterations of
-// a run that does millions. The name is now what the code does. Creating a
-// series is covered instead by TestLabeledCounterNewSeriesCostIsConstant, which
-// can control the fixture, where a benchmark loop cannot: measuring the cold
-// path honestly means growing the series set without bound for as long as the
-// loop runs.
+// building, not series creation — that is TestLabeledCounterNewSeriesCostIsConstant,
+// which can control the fixture where a benchmark loop cannot.
 func BenchmarkLabeledCounterInc_DynamicLabel(b *testing.B) {
 	lc := NewLabeledCounter("bench_lc_dynamic", "bench", []string{"method", "path", "status"})
 	b.ReportAllocs()
@@ -579,9 +572,9 @@ func TestCounterRecordPathIsAllocationFree(t *testing.T) {
 // independent OF.
 //
 // Nor does anything else in this package measure the path:
-// BenchmarkLabeledCounterInc_NewKey cycles through eight label values, so from
-// its ninth iteration on every series already exists and what it charts is the
-// fixture's own string building against the loaded fast path (17 B/op, 1
+// BenchmarkLabeledCounterInc_DynamicLabel cycles through eight label values, so
+// from its ninth iteration on every series already exists and what it charts is
+// the fixture's own string building against the loaded fast path (17 B/op, 1
 // alloc/op measured — the concatenation, not a series).
 //
 // Three axes, each a different regression class:

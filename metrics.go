@@ -1,25 +1,23 @@
-// Package metrics provides a hand-rolled Prometheus text-format exposition library.
-// It requires only the Go standard library.
+// Package metrics is a hand-rolled Prometheus text-format exposition library
+// requiring only the Go standard library. Handler() serves Prometheus text
+// format 0.0.4.
 //
-// Metrics are exposed in Prometheus text format 0.0.4 via Handler().
-//
-// Construction validates metric names, label names, and histogram buckets,
-// but does not panic on a violation: the error is captured into the metric
-// value (the client_golang Desc.err shape) and surfaces at registration:
-// (*Registry).Register returns it, (*Registry).MustRegister panics on it.
-// The record path diverges from client_golang (whose metrics keep recording
-// and surface the error at scrape time): here a metric carrying a
-// construction error records nothing — its Inc/Add/Set/Observe methods are
-// no-ops that log one warning on the first dropped record — and the
-// low-level Write* functions emit nothing for it. Label-arity mismatches on
-// the record paths and a negative Counter.Add remain fail-fast panics.
+// Construction validates metric names, label names, and histogram buckets but
+// does not panic on a violation: the error is captured into the metric value
+// (the client_golang Desc.err shape) and surfaces at registration —
+// (*Registry).Register returns it, (*Registry).MustRegister panics on it. A
+// metric carrying a construction error then records nothing (Inc/Add/Set/Observe
+// are no-ops logging one warning on the first drop) and its Write* function
+// emits nothing for it — unlike client_golang, whose metrics keep recording and
+// surface the error at scrape time. Label-arity mismatches on the record paths
+// and a negative Counter.Add remain fail-fast panics.
 //
 // Registration order: complete all Register/MustRegister calls before serving
-// a custom handler built on the low-level Write* functions. Write* reads the
-// metric name without the registry lock, so it is not synchronized with a
-// concurrent registration rename of the same metric. The Registry handlers
-// (guarded by the registry lock) and the record paths (Inc/Add/Set/Observe,
-// guarded by the metric lock) are safe to run concurrently with registration.
+// a custom handler built on the low-level Write* functions, since Write* reads
+// the metric name without the registry lock and is not synchronized with a
+// concurrent registration rename of the same metric. The Registry handlers and
+// the record paths are each independently safe to run concurrently with
+// registration.
 //
 // Unsupported by design (SKIP list):
 //   - Summary metric type: Prometheus best practices recommend histograms
