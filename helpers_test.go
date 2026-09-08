@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"errors"
+	"log"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -81,14 +82,50 @@ func (w *failWriter) Write([]byte) (int, error) {
 func (w *failWriter) WriteHeader(int) {}
 
 // captureDebugLogs redirects the default slog logger to an in-memory buffer at
-// Debug level for the duration of the test and returns that buffer.
+// Debug level for the duration of the test and returns that buffer. Callers
+// must be serial (no t.Parallel): the default logger is a process global.
+//
+// slog.SetDefault also points the standard log package at the installed
+// handler, and it skips that redirect when the logger being installed carries
+// slog's own default handler. Reinstalling the previous logger therefore does
+// not undo the redirect, so the writer and flags are saved and restored
+// explicitly. slog goes back first: reinstalling a previous handler that is not
+// slog's default re-runs the redirect and would overwrite a log restore done
+// before it.
 func captureDebugLogs(t *testing.T) *strings.Builder {
 	t.Helper()
 	var buf strings.Builder
-	prev := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	prev, prevWriter, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	return &buf
+}
+
+// TestCaptureDebugLogsRestoresLogGlobals pins the restore in captureDebugLogs:
+// the swap redirects the standard log package's writer and zeroes its flags, and
+// the cleanup must put both back. Without it, one test silences slog for the
+// rest of the package, because slog's own default handler writes through
+// log.Output.
+func TestCaptureDebugLogsRestoresLogGlobals(t *testing.T) {
+	wantWriter, wantFlags := log.Writer(), log.Flags()
+
+	t.Run("swap", func(t *testing.T) {
+		captureDebugLogs(t)
+		if log.Writer() == wantWriter {
+			t.Fatal("captureDebugLogs did not redirect log.Writer(); the restore under test would guard nothing")
+		}
+	})
+
+	if got := log.Writer(); got != wantWriter {
+		t.Errorf("log.Writer() after captureDebugLogs cleanup = %#v, want the original %#v", got, wantWriter)
+	}
+	if got := log.Flags(); got != wantFlags {
+		t.Errorf("log.Flags() after captureDebugLogs cleanup = %d, want %d", got, wantFlags)
+	}
 }
 
 // assertExpositionLabelsBalanced verifies every labeled exposition line in out
