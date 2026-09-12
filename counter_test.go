@@ -425,6 +425,16 @@ func TestLabeledMetricCardinalityWarning(t *testing.T) {
 	if got := strings.Count(buf.String(), "possible label-cardinality explosion"); got != 1 {
 		t.Errorf("cardinality warnings after crossing threshold = %d, want 1", got)
 	}
+
+	// A Delete that dips the map below the threshold followed by a new series
+	// re-crosses it; the warning is one-time per metric, not per crossing.
+	lc.Delete("A")
+	lc.Delete("B")
+	lc.Inc("re-cross-1")
+	lc.Inc("re-cross-2")
+	if got := strings.Count(buf.String(), "possible label-cardinality explosion"); got != 1 {
+		t.Errorf("cardinality warnings after a dip and re-cross = %d, want 1", got)
+	}
 }
 
 func BenchmarkLabeledCounterInc(b *testing.B) {

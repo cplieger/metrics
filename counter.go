@@ -107,8 +107,9 @@ const maxLabels = 8
 // instead, godoc stays clean but 84 lc.name/lc.mu/lc.vals references gain a
 // level of indirection to save one argument at 9 call sites.
 type series struct {
-	name string
-	mu   sync.RWMutex
+	name       string
+	mu         sync.RWMutex
+	cardWarned bool // the one-time cardinality warning has fired; guarded by mu
 }
 
 // labelKey is a fixed-size struct key for labeled metrics.
@@ -249,7 +250,7 @@ type seriesWarnings struct {
 	name     string // metric name, captured under the lock when any warning fires
 	sanValue string // representative sanitized label value, truncated for logging
 	san      bool   // sanitization created a new series
-	card     bool   // this insert pushed the map exactly to cardinalityWarnThreshold
+	card     bool   // this insert was the metric's first crossing of cardinalityWarnThreshold
 }
 
 // sanitizeLabelKey runs sanitizeUTF8 over each of key's values, rewriting them
@@ -280,8 +281,10 @@ func sanitizeLabelKey(key *labelKey) (rep string, changed bool) {
 // captured under the lock (the metric name reads are synchronized with the
 // mutex-guarded rename in Register*): w.san fires only when a sanitization
 // actually CREATED a new series (the double-check-found path never warns), and
-// w.card fires when this insert pushed the map exactly to
-// cardinalityWarnThreshold. The defer keeps the unlock on a makeV panic path.
+// w.card fires the first time an insert pushes the map to
+// cardinalityWarnThreshold; the latch on the carrier keeps a later dip (a
+// Delete or Reset) and re-crossing from re-emitting it, so the warning is
+// one-time per metric. The defer keeps the unlock on a makeV panic path.
 func (s *series) storeNewSeries[V any](m map[labelKey]V, key *labelKey, makeV func() V) (v V, loaded bool, w seriesWarnings) {
 	sanValue, sanitized := sanitizeLabelKey(key)
 	s.mu.Lock()
@@ -295,7 +298,8 @@ func (s *series) storeNewSeries[V any](m map[labelKey]V, key *labelKey, makeV fu
 		w.san = true
 		w.sanValue = sanValue
 	}
-	if len(m) == cardinalityWarnThreshold {
+	if len(m) == cardinalityWarnThreshold && !s.cardWarned {
+		s.cardWarned = true
 		w.card = true
 	}
 	if w.san || w.card {
