@@ -1,6 +1,6 @@
 window.BENCHMARK_DATA = {
   "lastUpdate": 1789568453614,
-  "repoUrl": "https://github.com/cplieger/ci",
+  "repoUrl": "https://github.com/cplieger/metrics",
   "entries": {
     "Benchmark": [
       {
@@ -603,14 +603,14 @@ window.BENCHMARK_DATA = {
             "email": "917744+cplieger@users.noreply.github.com"
           },
           "committer": {
-            "name": "Christopher Plieger",
-            "username": "cplieger",
-            "email": "917744+cplieger@users.noreply.github.com"
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
           },
-          "id": "09cc4b840ea4287151c69cae879cdb185cc1b4da",
-          "message": "ci: correct the weekly-bench vibekit budget figure\n\nThe max-parallel comment claimed vibekit measured 36.5 minutes at\n-count=10. It never did: the shard needed about 77 minutes and was\ncancelled at the 60-minute job wall every week since enrolment, because\none benchmark's per-op cost grew with b.N. That benchmark is fixed and\nthe suite measures 25 minutes locally, so the comment now names the\nfigure it is and tells the reader to re-read it off the next run.",
-          "timestamp": "2026-09-16T12:01:07Z",
-          "url": "https://github.com/cplieger/ci/commit/09cc4b840ea4287151c69cae879cdb185cc1b4da"
+          "id": "b95bebdfdd8bacc59eb511a549f6a3d25cdd4007",
+          "message": "chore(sync): synced file(s) with cplieger/ci (#457)\n\nCo-authored-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>",
+          "timestamp": "2026-09-16T10:12:16Z",
+          "url": "https://github.com/cplieger/metrics/commit/b95bebdfdd8bacc59eb511a549f6a3d25cdd4007"
         },
         "date": 1789568453149,
         "tool": "customSmallerIsBetter",
