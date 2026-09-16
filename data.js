@@ -1,6 +1,6 @@
 window.BENCHMARK_DATA = {
   "lastUpdate": 1789518633446,
-  "repoUrl": "https://github.com/cplieger/ci",
+  "repoUrl": "https://github.com/cplieger/metrics",
   "entries": {
     "Benchmark": [
       {
@@ -459,10 +459,10 @@ window.BENCHMARK_DATA = {
             "username": "web-flow",
             "email": "noreply@github.com"
           },
-          "id": "d34f4d66d9b0502ee912cd650306671ec71ff3d9",
-          "message": "chore(deps): update benchmark-action/github-action-benchmark action to v1.22.2 (#615)",
-          "timestamp": "2026-09-15T11:02:29Z",
-          "url": "https://github.com/cplieger/ci/commit/d34f4d66d9b0502ee912cd650306671ec71ff3d9"
+          "id": "407bf60ae3f2c1d58a2c75ee6c313b0d706055dd",
+          "message": "chore(sync): synced file(s) with cplieger/ci (#456)\n\nCo-authored-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>",
+          "timestamp": "2026-09-15T11:11:23Z",
+          "url": "https://github.com/cplieger/metrics/commit/407bf60ae3f2c1d58a2c75ee6c313b0d706055dd"
         },
         "date": 1789518633139,
         "tool": "customSmallerIsBetter",
