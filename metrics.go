@@ -1,40 +1,17 @@
-// Package metrics is a hand-rolled Prometheus text-format exposition library
-// requiring only the Go standard library. Handler() serves Prometheus text
-// format 0.0.4.
+// Package metrics is a standard-library-only Prometheus exposition library;
+// Handler serves text format 0.0.4.
 //
-// Construction validates metric names, label names, and histogram buckets but
-// does not panic on a violation: the error is captured into the metric value
-// (the client_golang Desc.err shape) and surfaces at registration —
-// (*Registry).Register returns it, (*Registry).MustRegister panics on it. A
-// metric carrying a construction error then records nothing (Inc/Add/Set/Observe
-// are no-ops logging one warning on the first drop) and its Write* function
-// emits nothing for it — unlike client_golang, whose metrics keep recording and
-// surface the error at scrape time. Label-arity mismatches on the record paths
-// and a negative Counter.Add remain fail-fast panics.
+// Construction never panics on an invalid name, label or bucket set: the
+// error is captured into the metric and surfaces at registration, where
+// Register returns it and MustRegister panics. Such a metric records nothing
+// (one warning on the first dropped record) and its Write* function emits
+// nothing. A label-arity mismatch on a record path and a negative Counter.Add
+// panic.
 //
-// Registration order: complete all Register/MustRegister calls before serving
-// a custom handler built on the low-level Write* functions, since Write* reads
-// the metric name without the registry lock and is not synchronized with a
-// concurrent registration rename of the same metric. The Registry handlers and
-// the record paths are each independently safe to run concurrently with
-// registration.
-//
-// Unsupported by design (SKIP list):
-//   - Summary metric type: Prometheus best practices recommend histograms
-//   - OpenMetrics exposition format and content negotiation: removed in v3; no
-//     consumer ever negotiated it, and Prometheus text is the scrape default
-//   - Exemplars: niche; requires tracing integration and OpenMetrics or
-//     protobuf exposition
-//   - Push / remote-write: all consumers are pull-based
-//   - Protobuf exposition format: text format is default in Prometheus 3.0
-//   - Native histograms (exponential buckets): requires protobuf format
-//   - Unregister / dynamic metric lifecycle: all consumers have static metric sets
-//   - Third-party collectors: the Metric interface is sealed; registration
-//     accepts exactly the six built-in types, unlike client_golang's open
-//     Collector contract
-//   - Float64 counter: integer counters are sufficient
-//   - Gzip response compression: use standard HTTP middleware
-//   - Gauge.SetToCurrentTime(): trivial one-liner
+// Finish registration before serving a custom handler built on the Write*
+// functions, which read a metric's name without the registry lock. Registry
+// handlers and record paths are safe concurrently with registration. What is
+// left out by design is listed in the README.
 package metrics
 
 import (
