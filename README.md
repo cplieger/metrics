@@ -2,14 +2,27 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/metrics/v4.svg)](https://pkg.go.dev/github.com/cplieger/metrics/v4) [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/metrics)](https://github.com/cplieger/metrics/blob/main/go.mod) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/metrics/badges/mutation.json)](https://github.com/cplieger/metrics/issues?q=label%3Agremlins-tracker)
 
-> Hand-rolled Prometheus text-format exposition library for Go
+metrics gives your Go service a Prometheus `/metrics` endpoint with counters, gauges, histograms and process metrics, using only the standard library.
 
-A zero-dependency metrics library that exposes counters, gauges, histograms, their labeled variants, and process metrics in Prometheus text format. Standard library only.
+It uses only the standard library, so it brings no other modules into your build. It needs Go 1.27.1 or later and is licensed under Apache-2.0. It is a v4 module that follows semantic versioning.
+
+## Why use it
+
+metrics is built for Go services whose set of metrics is fixed when the program starts.
+
+- Counters, gauges and histograms each have a labeled variant, plus a timer and a `RecordHTTP` hook for middleware.
+- A bad name, label set or bucket layout never panics at construction. `Register` returns the error, and `MustRegister` panics at startup naming the metric.
+- The handler writes valid Prometheus text format 0.0.4, with invalid UTF-8 replaced by U+FFFD.
+- Every registry adds Go and process metrics. On Linux, it also adds CPU time, resident memory and file descriptors when their `/proc` reads succeed.
+- A labeled metric logs one warning when it reaches 1,000 series, so a runaway label shows in your logs.
+- Recording and scraping are safe from many goroutines at once.
+
+Consider [prometheus/client_golang](https://github.com/prometheus/client_golang), the Prometheus project's Go client, if you need summaries, custom collectors, exemplars or native histograms. Consider [VictoriaMetrics/metrics](https://github.com/VictoriaMetrics/metrics) if you push metrics to remote storage.
 
 ## Install
 
 ```sh
-go get github.com/cplieger/metrics/v4
+go get github.com/cplieger/metrics/v4@latest
 ```
 
 ## Usage
@@ -18,146 +31,122 @@ go get github.com/cplieger/metrics/v4
 package main
 
 import (
+	"log"
 	"net/http"
-	"strconv"
-	"time"
 
 	"github.com/cplieger/metrics/v4"
 )
 
+var (
+	reg  = metrics.NewRegistry("myapp")
+	reqs = metrics.NewLabeledCounter("http_requests_total", "Total HTTP requests", []string{"route", "status"})
+	dur  = metrics.NewHistogram("http_request_duration_seconds", "Request latency")
+)
+
 func main() {
-	// Registry prefix is applied to every registered metric name (myapp_*).
-	r := metrics.NewRegistry("myapp")
+	reg.MustRegister(reqs, dur) // panics here, at startup, on a bad metric
 
-	reqs := metrics.NewLabeledCounter(
-		"http_requests_total", "Total HTTP requests",
-		[]string{"method", "status"},
-	)
-	dur := metrics.NewHistogram(
-		"http_request_duration_seconds", "Request latency",
-	)
-	// Exposed as myapp_http_requests_total and myapp_http_request_duration_seconds.
-	// MustRegister panics on a bad metric (the init/main fail-fast door);
-	// Register returns the error instead.
-	r.MustRegister(reqs, dur)
+	reqs.Inc("/api/widget", "200")
+	dur.Observe(0.042)
 
-	// HTTP instrumentation: call RecordHTTP from middleware once the
-	// response status is known. Caller owns the label set.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/widget", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	instrumented := http.HandlerFunc(func(w http.ResponseWriter, rq *http.Request) {
-		start := time.Now()
-		status := http.StatusOK // in real code, capture via a status-recording writer
-		mux.ServeHTTP(w, rq)
-		metrics.RecordHTTP(reqs, dur, time.Since(start), rq.Method, strconv.Itoa(status))
-	})
-
-	// Or measure a code path with the labeled-histogram timer.
-	work := metrics.NewLabeledHistogram("op_seconds", "op", []string{"kind"})
-	r.MustRegister(work)
-	t := work.NewTimer("scan")
-	time.Sleep(50 * time.Millisecond)
-	t.ObserveDuration()
-
-	http.Handle("/metrics", r.Handler())
-	http.Handle("/", instrumented)
-	_ = http.ListenAndServe(":9090", nil)
+	http.Handle("/metrics", reg.Handler())
+	log.Fatal(http.ListenAndServe(":9090", nil))
 }
 ```
 
+The registry prefixes every name it registers, so Prometheus sees `myapp_http_requests_total` and `myapp_http_request_duration_seconds`. Pass `""` for no prefix. `Register` returns the error instead of panicking.
+
+To time a code path for one label set, start a timer from a labeled histogram. `APIBuckets` suits slow calls that the default buckets, which stop at 1 second, would put in `+Inf`:
+
+```go
+var scan = metrics.NewLabeledHistogram("scan_seconds", "Scan duration", []string{"kind"},
+	metrics.WithBuckets(metrics.APIBuckets()))
+
+func fullScan() {
+	t := scan.NewTimer("full")
+	defer t.ObserveDuration()
+	// ... the work being timed ...
+}
+```
+
+To record HTTP requests, call `RecordHTTP` from middleware once the status is known. `RecordHTTP` takes the elapsed time and the label values only, so your middleware measures the time and captures the status code to pass as a label:
+
+```go
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func instrument(route string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(sw, r)
+		metrics.RecordHTTP(reqs, dur, time.Since(start), route, strconv.Itoa(sw.status))
+	})
+}
+```
+
+Label by the route you registered, never by the raw request path. Each distinct label combination is a series kept until `Delete` or `Reset`. The [HTTP instrumentation](docs/how-it-works.md#http-instrumentation) section covers the adapter for [webhttp](https://github.com/cplieger/webhttp)'s route hook.
+
 ## API
 
-### Bucket presets
+- Metrics: `NewCounter`, `NewGauge`, `NewHistogram` and their labeled variants `NewLabeledCounter`, `NewLabeledGauge` and `NewLabeledHistogram`.
+- Buckets: `DefaultBuckets`, `APIBuckets` and the `WithBuckets` option.
+- Timing and HTTP: `NewTimer`, `(*LabeledHistogram).NewTimer` and `RecordHTTP`.
+- Registry: `NewRegistry`, `Register`, `MustRegister`, `Handler` and the `Metric` interface, which only this package can implement.
+- Custom handlers: `WriteCounter`, `WriteGauge`, `WriteHistogram`, their labeled variants and `WriteProcess`.
 
-- `DefaultBuckets() []float64`: HTTP-latency buckets (`0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0`). Returns a fresh slice on every call.
-- `APIBuckets() []float64`: coarse buckets for outbound API calls and slow collect/scan cycles (`0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30`); use when DefaultBuckets would saturate everything in `+Inf`. Returns a fresh slice on every call.
+The full reference is on [pkg.go.dev](https://pkg.go.dev/github.com/cplieger/metrics/v4). Its `Example` function is runnable, and `go test` keeps it true. [How metrics works](docs/how-it-works.md) gives the bucket values, the record and delete methods and the limits of each type.
 
-### Counters
+## Errors surface at registration
 
-- `NewCounter(name, help) *Counter`: monotonic counter; `Inc()`, `Add(n int64)`. Saturates at `math.MaxInt64` instead of wrapping negative.
-- `NewLabeledCounter(name, help, labels) *LabeledCounter`: `Inc(vals...)`, `Add(int64, vals...)`, `Delete(vals...)`, `Reset()`; panics on label-arity mismatch.
+A constructor never panics on an invalid metric name, an invalid, reserved or duplicate label name, more than 8 labels, or bad histogram buckets. It captures the error into the metric, and the error surfaces when you register it. `Register` returns it, and `MustRegister` panics on the first one. Use `MustRegister` for metrics declared at package level, where no caller can take an error.
 
-Labeled metrics support at most 8 label names; a ninth is a construction error that surfaces at registration.
+`Register` also rejects a metric that is already registered, a nil metric and a name that collides with another metric or with a process metric. When `Register` refuses a metric because its name collides, the metric stays unattached, and you can still register it with a different registry. A metric with a construction error stays broken, so build a new one with valid arguments. Every `Register` call reports an invalid registry prefix.
 
-### Gauges
+A metric that carries a construction error records nothing and never reaches the output. Its first dropped record logs one warning. Two mistakes panic at the call that makes them. A record on a labeled metric with the wrong number of label values panics, and so does a negative `Add` on a counter.
 
-- `NewGauge(name, help) *Gauge`: float64 gauge; `Set`, `Add`, `Sub`, `Inc`, `Dec`, `Get`.
-- `NewLabeledGauge(name, help, labels) *LabeledGauge`: `Set(float64, vals...)`, `Delete(vals...)`, `Reset()`.
+## Output follows the Prometheus text format
 
-### Histograms
+`Handler` serves Prometheus text exposition format 0.0.4, the plain-text format every Prometheus server can scrape.
 
-- `NewHistogram(name, help, opts ...Option) *Histogram`: `Observe(seconds)`; uses `DefaultBuckets` unless `WithBuckets` is provided.
-- `NewLabeledHistogram(name, help, labels, opts ...Option) *LabeledHistogram`: `Observe(seconds, vals...)`, `Delete(vals...)`, `Reset()`.
-- `WithBuckets([]float64) Option`: sets custom bucket boundaries. Bounds must be a strictly increasing sequence of finite values; the implicit `le="+Inf"` bucket is appended for you, so do not include `+Inf`. Non-finite, duplicate, or out-of-order bounds are a construction error that surfaces at registration. An empty slice yields a histogram with only the `+Inf` bucket.
+- Label values escape only `\`, `"` and newline. HELP text escapes only `\` and newline.
+- Invalid UTF-8 in a label value or HELP text is replaced with U+FFFD and never panics. A label value logs one warning per new series, and HELP text one warning per metric.
+- Every histogram has a `+Inf` bucket equal to its `_count`.
+- Whole numbers render as bare integers such as `42`, other values in the shortest form that reads back exactly, and non-finite values as `+Inf`, `-Inf` and `NaN`.
 
-### Timer
+The process metrics are `go_goroutines`, `go_memstats_heap_alloc_bytes`, `process_gc_pause_seconds_total`, `process_uptime_seconds` and `process_start_time_seconds`. On Linux, `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds` and `process_max_fds` are added when their `/proc` reads succeed. The goroutine and heap names match `client_golang`'s, so dashboards built on those two names keep working.
 
-- `NewTimer(*Histogram) *Timer`: starts a timer for an unlabeled histogram.
-- `(*LabeledHistogram).NewTimer(vals...) *Timer`: starts a timer for the given label set, so per-label latency can use `defer t.ObserveDuration()` ergonomics.
-- `(*Timer).ObserveDuration() time.Duration`: records elapsed time and returns it.
+## Unsupported by design
 
-### HTTP instrumentation
+metrics leaves these out on purpose. The [non-goals](docs/non-goals.md) page gives the reason for each.
 
-- `RecordHTTP(c *LabeledCounter, h *Histogram, d time.Duration, labelVals ...string)`: record one request into the caller-supplied counter/histogram (either may be `nil`). The caller owns the label set, ordering, and any path templating.
+- The summary metric type. Use a histogram.
+- OpenMetrics and protobuf exposition, and the content negotiation between formats.
+- Exemplars and native histograms.
+- Pushing metrics or remote write.
+- Removing a metric from a registry after it is registered.
+- Third-party collectors. Only this package's six metric types can be registered.
+- Float counters, gzip compression of the response and `Gauge.SetToCurrentTime`.
 
-`RecordHTTP` takes no request and no status, so middleware captures both and calls it once the response is complete. Its parameters are this package's own types, so middleware that does not import metrics cannot take `RecordHTTP` as its hook. The wiring is a small adapter that spreads the middleware's per-request values onto the label list.
+## Documentation
 
-With [webhttp](https://github.com/cplieger/webhttp), adapt the access-log hook `WithRecordRouteMetric` registers. Its `(method, path)` pair is bounded by the route table rather than by traffic, and the access logger records the status itself. This library declares no dependencies, so it cannot ship a compiling example of that pairing. The hook contract is [webhttp's own reference for `WithRecordRouteMetric`](https://pkg.go.dev/github.com/cplieger/webhttp/v3#WithRecordRouteMetric).
+- [How metrics works](docs/how-it-works.md) covers each metric type, the registry, label values, HTTP instrumentation, process metrics and the low-level writers.
+- [Non-goals](docs/non-goals.md) lists what the library leaves out and why.
 
-Label values are caller-owned. Invalid UTF-8 never panics: the value is sanitized with the Unicode replacement character (U+FFFD) at record time, and a warning naming the metric is logged when the sanitized series is first created (repeat records do not re-warn). Sanitizing merges distinct raw values that repair to the same string into one series, and every record carrying invalid UTF-8 takes the slower series-creation path, so validate values derived from untrusted input before use. Untrusted label values are also a cardinality risk: each distinct label combination allocates a series retained until `Delete`/`Reset`, so labeling by raw request path or header content grows memory and scrape size without bound. Template paths to a fixed route set.
+## Credits
 
-### Registry
-
-- `NewRegistry(prefix) *Registry`: every registered metric name is prefixed with `<prefix>_` (process metrics excepted). Pass `""` for no prefix. Construction through `NewRegistry` is mandatory. An invalid prefix is captured and reported at the first `Register`/`MustRegister`, like a metric's own construction error.
-- `Register(m Metric) error`: adds a metric (any of the six metric types) and reports what is wrong with it: the error captured at construction (invalid metric/label name, reserved or duplicate label, more than 8 labels, bad histogram buckets), an already-registered metric, a family-name collision (including the reserved `process_*` names), or a nil metric. On error the metric is not attached: after a name collision it stays registrable with a different registry. A construction error is immutable, so rebuild the metric with a valid name, label set, or buckets.
-- `MustRegister(m ...Metric)`: variadic; registers in order and panics on the first error (the `client_golang` shape). Use it for package-level metric sets registered in `init`, where there is no caller to hand an error to.
-- `Handler()`: Prometheus text format 0.0.4.
-
-Constructors never panic on a bad name, label set, or bucket layout: the error is captured into the metric (the `client_golang` `Desc.err` shape) and surfaces when you register it. The record path diverges from `client_golang`: upstream metrics keep recording and the error surfaces at scrape time (promhttp answers the scrape with HTTP 500), while here a metric carrying an error records nothing and is never exposed. Its `Inc`/`Add`/`Set`/`Observe` become no-ops that log one warning on the first dropped record.
-
-### Process metrics (emitted automatically)
-
-- `go_goroutines`, `go_memstats_heap_alloc_bytes`, `process_gc_pause_seconds_total`, `process_uptime_seconds`, `process_start_time_seconds` (the goroutine and heap-alloc names match `client_golang`).
-- Linux only: `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds`, `process_max_fds`.
-
-### Low-level writers
-
-`WriteCounter`, `WriteGauge`, `WriteLabeledCounter`, `WriteLabeledGauge`, `WriteHistogram`, `WriteLabeledHistogram`, `WriteProcess`: for callers building custom handlers. A metric carrying a construction error writes nothing: the direct write path never emits an invalid metric.
-
-## Spec conformance
-
-The output is valid Prometheus text exposition format 0.0.4:
-
-- Label values escape only `\`, `"`, and `\n` (as `\\`, `\"`, `\n`); HELP text escapes `\` and `\n`.
-- Metric names, label names, and histogram bucket bounds are validated at creation; a violation is captured into the metric, which then records nothing and writes nothing, and the error surfaces at registration (`Register` returns it, `MustRegister` panics). Duplicate metric family names (including the reserved `process_*` names) are registration errors on the same doors. Label arity on every record path and a negative `Counter.Add` remain fail-fast panics.
-- Label values and HELP text are always exposed as valid UTF-8: invalid input is sanitized with U+FFFD and warned once (label values when the degraded series is first created, HELP text at construction). Neither path panics.
-- Histograms always include a `+Inf` bucket equal to `_count`.
-
-Numeric values render through a single canonical formatter: whole values as bare integers (e.g. `42`), other values in shortest round-trippable form, and `+Inf`/`-Inf`/`NaN` for non-finite.
-
-## Unsupported by Design
-
-| Feature                                     | Reason                                                                                                                                              |
-| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Summary metric type**                     | Prometheus best practices recommend histograms; complex windowed-quantile implementation for no consumer benefit                                    |
-| **OpenMetrics exposition + negotiation**    | Removed in v3: no consumer ever negotiated it, and Prometheus text is the scrape default. The v2 line retains it                                    |
-| **Exemplars**                               | Niche; requires tracing integration and OpenMetrics or protobuf exposition                                                                          |
-| **Push / remote-write**                     | All consumers are pull-based                                                                                                                        |
-| **Protobuf exposition format**              | Text format is default in Prometheus 3.0; protobuf requires code generation                                                                         |
-| **Native histograms (exponential buckets)** | Requires protobuf format; large specialized implementation                                                                                          |
-| **Unregister / dynamic metric lifecycle**   | All consumers have static metric sets                                                                                                               |
-| **Third-party collectors**                  | `Metric` is sealed (its method is unexported): registration accepts exactly the six built-in types, unlike `client_golang`'s open `Collector`       |
-| **Image metrics**                           | Prior `EnableImageMetrics` / `SetImageMetrics` / `ImageMetric` API removed in v2; consumers that need per-image gauges layer them on `LabeledGauge` |
-| **Float64 counter**                         | Integer counters are sufficient for all consumers                                                                                                   |
-| **Gzip response compression**               | Use standard HTTP middleware                                                                                                                        |
-| **`Gauge.SetToCurrentTime()`**              | Trivial one-liner users can write themselves                                                                                                        |
+Two designs follow [prometheus/client_golang](https://github.com/prometheus/client_golang). A construction error is captured into the metric value, and `MustRegister` panics on the first registration error. No code is taken from it.
 
 ## Contributing
 
-Issues and PRs are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
-conventions and how to run the checks locally.
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the conventions and how to run the checks locally.
 
 ## Disclaimer
 
