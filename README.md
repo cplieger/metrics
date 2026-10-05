@@ -146,7 +146,7 @@ Two designs follow [prometheus/client_golang](https://github.com/prometheus/clie
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the conventions and how to run the checks locally.
+Issues and pull requests are welcome. The [shared contributing rules](https://github.com/cplieger/.github/blob/main/CONTRIBUTING.md) apply.
 
 ## Disclaimer
 
