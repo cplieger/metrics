@@ -574,35 +574,14 @@ func TestNewRegistryCapturesAnInvalidPrefix(t *testing.T) {
 	}
 }
 
-// TestRegistryHandlerAllocationsAreBoundedPerMetric is the contract the weekly
-// benchmark tracker cannot provide, and the reason this file has an allocation
-// test at all.
-//
-// A scrape renders the whole exposition, so its cost is legitimately
-// proportional to how many metrics the registry holds: the total is not a
-// constant and asserting one would be wrong. What must hold is that the
-// PER-METRIC rate is bounded — the cost is linear with a small slope, not
-// linear with a growing one, and not quadratic. The tracker compares a
-// benchmark's allocation count against the previous run and alerts above a
-// ratio, so a registry that goes from 260 to 380 allocations per scrape is a
-// ratio of 1.46 and stays silent; a fleet where every app carries a hundred
-// series pays that difference on every scrape of every app, forever. This is
-// the class the chart is structurally blind to.
-//
-// The rate is measured as a slope between two registry sizes, which cancels
-// the fixed cost of a scrape (the process-metric block, measured at about 114
-// allocations, plus the handler's two header writes). Only intervals spanning
-// at least minAllocSpan units are gated: the fixed cost varies by a few
-// allocations from run to run because collecting the process metrics reads
-// /proc, and over a 9-metric interval that noise lands on the rate at ±0.5 or
-// worse, while over 90 it disappears. The narrow intervals are still measured
-// and logged — the numbers are the useful half of a failure — just not gated.
-//
-// Gating every wide interval rather than only the widest is what makes this a
-// statement about linearity: a cost that grows per metric ALREADY registered
-// (a re-scan, a re-sort, a rebuilt name table) shows up as a rate that climbs
-// with the size of the interval, and would breach the bound at 100->1000 while
-// passing at 10->100.
+// TestRegistryHandlerAllocationsAreBoundedPerMetric gates what the weekly
+// benchmark tracker's ratio alert cannot see: a scrape's cost is legitimately
+// proportional to the metric count, so the PER-METRIC rate must stay bounded. A
+// rise from 260 to 380 allocations is a 1.46 ratio and stays silent, yet every
+// consumer with a hundred series pays it on every scrape. The rate is a slope
+// between two registry sizes, cancelling the fixed cost; only intervals of at
+// least minAllocSpan are gated, since /proc reads add noise. Gating every wide
+// interval makes it a linearity check: a per-metric re-scan breaches at 100->1000.
 func TestRegistryHandlerAllocationsAreBoundedPerMetric(t *testing.T) {
 	// minAllocSpan is the smallest interval whose slope is gated (see above).
 	const minAllocSpan = 90

@@ -538,16 +538,12 @@ func TestLabeledCounterDelete_SanitizesLabelValues(t *testing.T) {
 
 // TestCounterRecordPathIsAllocationFree pins the free half of the counter cost
 // model: incrementing a counter, or a labeled counter's EXISTING series, costs
-// nothing. Every consuming app calls this per request, so an allocation added
-// here is charged to every request the fleet serves — and unlike the bounded
-// counts, this half is also the one the weekly tracker can see, because 0 to
-// anything is an infinite ratio. The contract is still worth its lines: it
-// fails at merge time and names the method, where the chart notices a week
-// later and names a benchmark.
+// nothing. Every consuming app calls this per request, so an allocation here is
+// charged to every request every consumer serves. It fails at merge time and
+// names the method, where the weekly benchmark chart notices a week later.
 //
-// The label set is created in setup, so every run of the measured closure
-// takes loadOrStore's RLock fast path. Series CREATION is measured separately
-// by TestLabeledCounterNewSeriesCostIsConstant, and it is not free.
+// The label set is created in setup, so the measured closure takes loadOrStore's
+// RLock fast path. TestLabeledCounterNewSeriesCostIsConstant measures CREATION.
 func TestCounterRecordPathIsAllocationFree(t *testing.T) {
 	c := NewCounter("alloc_counter_total", "allocation contract")
 	lc := NewLabeledCounter("alloc_labeled_counter_total", "allocation contract",
