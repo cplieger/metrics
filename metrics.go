@@ -241,7 +241,6 @@ func (r *Registry) register(mErr error, registered *atomic.Bool, kind string, ba
 	return nil
 }
 
-//deadset:ignore DS1004 -- Called through the sealed Metric interface by Register, which consumers call with their own metric values.
 func (c *Counter) registerInto(r *Registry) error {
 	if c == nil {
 		return errNilMetric
@@ -252,7 +251,6 @@ func (c *Counter) registerInto(r *Registry) error {
 	})
 }
 
-//deadset:ignore DS1004 -- Called through the sealed Metric interface by Register, which consumers call with their own metric values.
 func (g *Gauge) registerInto(r *Registry) error {
 	if g == nil {
 		return errNilMetric
@@ -263,7 +261,6 @@ func (g *Gauge) registerInto(r *Registry) error {
 	})
 }
 
-//deadset:ignore DS1004 -- Called through the sealed Metric interface by Register, which consumers call with their own metric values.
 func (lc *LabeledCounter) registerInto(r *Registry) error {
 	if lc == nil {
 		return errNilMetric
@@ -276,7 +273,6 @@ func (lc *LabeledCounter) registerInto(r *Registry) error {
 	})
 }
 
-//deadset:ignore DS1004 -- Called through the sealed Metric interface by Register, which consumers call with their own metric values.
 func (lg *LabeledGauge) registerInto(r *Registry) error {
 	if lg == nil {
 		return errNilMetric
@@ -289,7 +285,6 @@ func (lg *LabeledGauge) registerInto(r *Registry) error {
 	})
 }
 
-//deadset:ignore DS1004 -- Called through the sealed Metric interface by Register, which consumers call with their own metric values.
 func (h *Histogram) registerInto(r *Registry) error {
 	if h == nil {
 		return errNilMetric
@@ -300,7 +295,6 @@ func (h *Histogram) registerInto(r *Registry) error {
 	})
 }
 
-//deadset:ignore DS1004 -- Called through the sealed Metric interface by Register, which consumers call with their own metric values.
 func (lh *LabeledHistogram) registerInto(r *Registry) error {
 	if lh == nil {
 		return errNilMetric
